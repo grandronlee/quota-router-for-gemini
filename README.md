@@ -14,6 +14,8 @@ limit, and stays within Google's published limits for your own single project an
 ## Important
 
 - You need your own Gemini API key. Run it only for yourself; don't host it for others.
+- Use it only from a region where the Gemini API is available
+  ([list](https://ai.google.dev/gemini-api/docs/available-regions)).
 - On the free tier, Google may use your prompts and responses to improve its products,
   and human reviewers may read them. Don't send confidential code or personal data.
 - This doesn't raise or get around any limit. It uses the separate quota each model already has.

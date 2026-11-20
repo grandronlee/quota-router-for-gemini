@@ -17,8 +17,47 @@ Goal: replace assumptions with recorded facts before writing the router.
   4. A daily (RPD) 429 can't be triggered cheaply. Capture it whenever one happens naturally.
 - Output: `docs/probe-results.md` (IDs, capabilities, 429 samples), with no secrets.
 
-Exit criteria: every model in the inventory has a confirmed ID or is dropped, and at
-least one recorded per-minute 429 body exists.
+Added after review (2026-11-20):
+
+- 5. Strict pass/fail. These count as FAIL: a truncated stream, any finish reason other
+  than `stop`/`tool_calls` (e.g. `length`), an empty reply, or tool arguments whose `city` isn't
+  the requested city. These count as UNAVAILABLE (untested, not incapable): 503s, 429s
+  and timeouts, including a read timeout after HTTP 200.
+- 6. Tool round trip on every model: send the tool result back with its thought signature.
+  It passes only if the reply quotes a value (`report_id`) that appears only in the tool result.
+- 7. Tool-loop handoff experiments (DESIGN §5.1): signature removed, handoff between the v1
+  pair with the signature as received and with the placeholder, and a 2.5 call into Gemini 3.
+  A trial is INCONCLUSIVE when the replayed call carried no signature. These are
+  single-step evidence only; v1 enables no handoff.
+- 8. The burst is sent in parallel (run 1's sequential burst spread over 104 s and got no 429).
+- 9. **Zoo Code check, by hand, before any router code** (no proxy involved): point a Zoo
+  Code "OpenAI Compatible" profile straight at
+  `https://generativelanguage.googleapis.com/v1beta/openai/` with `gemini-3.5-flash-lite`
+  and run a small task that needs at least two tool calls (for example "read README.md and
+  then list docs/"). Record:
+  - Does it execute a tool call when the stream ends with `finish_reason: "stop"`?
+  - Does the second tool step succeed? A 400 mentioning `thought_signature` means Zoo Code
+    drops `extra_content`, and DESIGN §5.1's fallback plan (the proxy re-attaches signatures) is needed.
+  - Zoo Code version, and the outcome, in `probe-results.md`.
+- `--rescore` rebuilds the report from the raw runs without sending requests.
+- Probe regression tests: `python3 -I -m unittest discover -s tests -v` (offline).
+
+Status (2026-11-20): runs at 04:43 PT (all models, 51 requests), 05:15 PT (v1 pair, 27
+requests) and 05:28 PT (v1 pair, tools only, 8 requests) are done, and so is the Zoo Code check.
+See [probe-results.md](probe-results.md). **Phase 0 is complete** under the revised exit criteria.
+
+Exit criteria (revised 2026-11-20):
+- [x] every model in the inventory has a confirmed ID or is dropped
+- [x] the v1 model (3.5 Flash Lite) passes the tool round trip
+- [x] Google is shown to enforce thought signatures on the v1 model (400 without one)
+- [x] the Zoo Code check (step 9) is recorded: PASS, signatures preserved
+- Replaced: "a recorded per-minute 429 body". Two bursts got none; the model returned
+  503s first, and forcing one harder would go against the compliance stance. The
+  classifier is built from mocked bodies, falls back to a 60 s cooldown for unknown
+  429s, and the proxy saves the first real one under `data/` for later.
+- Replaced: "both v1 models pass the round trip". v1 has one model; 3.1 Flash Lite is
+  re-tested (`--only "Gemini 3.1 Flash Lite" --checks tools,roundtrip --no-burst`)
+  before it joins the route.
 
 ## Phase 1: Core logic (no HTTP)
 
@@ -27,14 +66,30 @@ least one recorded per-minute 429 body exists.
 - `quota.py`: rolling windows, RPD counter, cooldown and exhausted state, reserve, refund
   and settle, SQLite persistence.
 - `classify.py`: 429 body → {rpm, tpm, rpd, unknown} + retry delay.
-- `router.py`: eligibility check and candidate selection.
+- `router.py`: eligibility check, context fit, candidate selection, tool-loop pinning
+  (DESIGN §5.1), attempt and deadline limits, final status (429 / 503 / 400).
 
 Tests (`pytest`, injected clock, no network):
 - PT midnight across both daylight-saving changes, and at 23:59:59 / 00:00:00 PT
 - reserve under parallel `asyncio.gather` never goes over RPM or RPD
-- TPM check skips a model whose free TPM is smaller than the request
+- TPM check counts input tokens only, and skips a model whose free TPM is smaller than the input
+- reported `prompt_tokens` replaces the estimate in the TPM window
+- a request too large for every candidate → 400 `context_length_exceeded`, no reservation
+- tool turn with known call IDs → only that model; model out → 429/503, no fallback
+- multi-step turn (two assistant tool calls after the last user message) → pinned to the
+  turn's model, not only the latest call's
+- affinity survives a simulated restart (SQLite) and expires after 24 h
+- unknown IDs → normal routing with `x-turn-affinity: unknown`; mixed IDs → latest call's
+  model with `x-turn-affinity: mixed`
+- a non-empty `handoffs:` in config is a startup error in v1
+- stop after `max_attempts` calls or at the deadline; skipped candidates don't count
+- final status table (DESIGN §5 step 5): all disabled → 503 `no_enabled_model` without
+  `Retry-After`; any too large and the rest disabled → 400; disabled + quota → 429;
+  quota + unavailable → 503; `Retry-After` comes only from candidates that can serve the
+  request, and accounts for TPM room for this request's input
 - RPD state survives a simulated restart; it resets on the next PT date
-- classifier against the recorded Phase 0 bodies, plus an unknown body
+- classifier against the recorded Phase 0 bodies, plus an unknown body, and error
+  bodies shaped as both an object and an array
 
 ## Phase 2: HTTP layer
 
@@ -57,9 +112,12 @@ Tests (`respx` mocking upstream):
 ## Phase 4: Review and live check
 
 - Deep code review (retries, reservations and parallel access are the risky areas). Fix the findings.
-- Live smoke test: one request per route, check `x-served-model`. Force fallback by
-  marking the first candidate exhausted. Run one real Zoo Code task (two profiles, modes mapped) and one Copilot Chat agent-mode task
-  (Custom Endpoint, Chat Completions).
+- Live smoke test: one request on `gemini-fast`, check `x-served-model`. Mark its only
+  candidate exhausted and check for a 429 with a `Retry-After` pointing at the next PT
+  midnight (with one model, fallback itself is covered by the mocked Phase 2 tests). Run one real Zoo Code task that uses tools
+  (one profile on `gemini-fast`), now through the proxy (the direct check was Phase 0 step 9).
+  Include a restart of the proxy in the middle of the task.
+  Copilot Chat and the second Zoo Code profile wait for `gemini-smart` after v1.
 - Pre-publish checklist (below).
 
 ## Validation commands (to be fixed in Phase 1)
@@ -70,6 +128,8 @@ Tests (`respx` mocking upstream):
 ## Pre-publish checklist
 
 - [ ] `git log -p | grep -iE 'AIza|api[_-]?key\s*='` finds nothing; `.env` and `data/` are ignored
+- [ ] The exact key and token values find nothing either. Not every key starts with `AIza`:
+  `set -a; . ./.env; set +a; git log -p --all | grep -cF -e "$GEMINI_API_KEY" -e "$PROXY_TOKEN"` prints 0
 - [ ] No screenshots or exported chats containing account details
 - [ ] README states it is not affiliated with Google, needs your own key, and makes no "bypass/unlimited" claims
 - [ ] LICENSE file present
@@ -81,3 +141,20 @@ Tests (`respx` mocking upstream):
 2. **License:** MIT.
 3. **Gemma:** probe in Phase 0; add the `gemma-small` route after v1 if tool calls and quality are good enough.
 4. **Robotics ER 2:** left out of all routes; probed in Phase 0 for information only.
+
+## Decisions after review (2026-11-20, approved)
+
+5. **v1 scope:** one route (`gemini-fast`: 3.5 Flash Lite only; 3.1 Flash Lite joins once
+   its tool call passes, see Phase 0), one uvicorn
+   worker, Zoo Code as the only tested client. `gemini-smart`, Copilot Chat and Gemma come after v1.
+6. **TPM is input tokens.** Output and reasoning tokens are not reserved against it; context
+   and output limits are checked separately.
+7. **Limits:** a request deadline of 180 s and at most 3 attempts. Final status: 429 for quota,
+   503 for outages, 400 `context_length_exceeded` when nothing can fit.
+8. **Tool turns are pinned** to the model that made their calls, with affinity kept in
+   SQLite for 24 h. No handoff in v1; one may be enabled per pair only after a multi-step
+   tool loop passes across that pair.
+10. **Zoo Code is checked against Google directly in Phase 0** (signature preservation and
+    `finish_reason: "stop"`), before router code is written.
+9. **Regions:** COMPLIANCE.md states the available-regions term; the project doesn't
+   address region restrictions.

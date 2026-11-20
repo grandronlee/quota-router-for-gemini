@@ -1,7 +1,8 @@
 # Terms of service notes
 
 This is **not legal advice**. These notes summarise the parts of Google's terms that
-shaped this design, as read on 2026-11-20. The terms change, so check the current text:
+shaped this design, as read on 2026-11-20 (Gemini API Additional Terms effective
+2026-03-23). The terms change, so check the current text:
 
 - Google APIs Terms of Service: https://developers.google.com/terms
 - Gemini API Additional Terms of Service: https://ai.google.dev/gemini-api/terms
@@ -38,6 +39,25 @@ Project wording: describe it as a "quota-aware router" or "automatic fallback". 
   own key**. The author doesn't run it as a service for anyone else.
 - Do **not** host a public instance, or share your instance or key with other people.
 - No credentials in the repository, in examples or in git history.
+
+**Open question.** Our reading is that publishing source code that each person runs
+privately with their own key is not "offering for use by third parties" an API client
+that "functions substantially the same as the APIs". The terms don't address this case
+directly, and Google hasn't confirmed this reading. It is an interpretation, not a settled
+answer. The proxy only forwards requests to Google and adds routing; it doesn't resell,
+pool or share access.
+
+## 2a. Available regions
+
+> "You may only access the Services (or make API Clients available to users) within an
+> available region." (Gemini API Additional Terms, Use Restrictions; regions listed at
+> https://ai.google.dev/gemini-api/docs/available-regions)
+
+- Each user is responsible for using the API only from an available region. The list
+  changes; check it before you start.
+- This project does nothing about region restrictions and gives no guidance on them.
+- In the European Economic Area, Switzerland and the UK, only Paid Services may be used
+  when making API Clients available to users (§3).
 
 ## 3. Free-tier data use
 
