@@ -6,7 +6,7 @@ Project name: `quota-router-for-gemini`. License: MIT.
 ## 1. Problem
 
 Google AI Studio's free tier sets limits for each model, in requests per minute (RPM),
-tokens per minute (TPM) and requests per day (RPD). Coding agents such as Cline make
+tokens per minute (TPM) and requests per day (RPD). Coding agents such as Zoo Code make
 many requests per task, so they use up a 20-RPD model within minutes. Most
 OpenAI-compatible clients don't switch models when Gemini returns `429 RESOURCE_EXHAUSTED`.
 
@@ -56,7 +56,7 @@ Quotas change. The registry lives in `config.yaml`, not in code.
 ## 3. Architecture
 
 ```
-client (Cline, scripts)
+client (Zoo Code, Copilot Chat, scripts)
    │  OpenAI Chat Completions, Authorization: Bearer <PROXY_TOKEN>
    ▼
 ┌──────────────────────── quota-router (127.0.0.1:4000) ───────────────────────┐
@@ -78,8 +78,8 @@ The client picks a virtual model. Order is set in config; the defaults are:
 
 | Route | Candidates in order | Intended use |
 |---|---|---|
-| `gemini-smart` | 4 Hydrogen → 3.8 Flash → 3.6 Flash → 3 Flash → 2.5 Flash → 3.5 Flash Lite → 3.1 Flash Lite → 2.5 Flash Lite | planning, debugging (Cline Plan mode) |
-| `gemini-fast` | 3.5 Flash Lite → 3.1 Flash Lite → 2.5 Flash Lite → 2.5 Flash → 3 Flash | edits, tool loops (Cline Act mode); never uses the top three smart models |
+| `gemini-smart` | 4 Hydrogen → 3.8 Flash → 3.6 Flash → 3 Flash → 2.5 Flash → 3.5 Flash Lite → 3.1 Flash Lite → 2.5 Flash Lite | planning, debugging (Zoo Code Architect/Debug) |
+| `gemini-fast` | 3.5 Flash Lite → 3.1 Flash Lite → 2.5 Flash Lite → 2.5 Flash → 3 Flash | edits, tool loops (Zoo Code Code/Ask); never uses the top three smart models |
 
 v1 has two routes. A `gemma-small` route for short prompts (Gemma 4 31B → 26B → `gemini-fast`)
 will be added after v1 if Phase 0 shows Gemma works well enough; it needs routes that can fall back into other routes.
@@ -88,6 +88,28 @@ Requesting a real model ID directly sends the request to that model alone, with 
 tracking but no fallback.
 
 ## 5. Request flow
+
+```mermaid
+flowchart TD
+    A[Request arrives] --> B{Bearer token valid?}
+    B -- no --> X401[401 Unauthorized]
+    B -- yes --> C[Resolve route to candidate list<br/>estimate token cost]
+    C --> D{Another candidate left?}
+    D -- no --> X429[429 with Retry-After<br/>earliest time a model frees up]
+    D -- yes --> E{Eligible?<br/>not cooling down or exhausted<br/>room in RPM, RPD and TPM}
+    E -- no --> D
+    E -- yes --> F[Reserve RPM, RPD and tokens<br/>under the lock]
+    F --> G[Call Google with the real model ID]
+    G --> H{Upstream result}
+    H -- 2xx --> OK[Record actual usage<br/>return response with x-served-model]
+    H -- 429 --> I[Classify per-minute or per-day<br/>set cooldown or exhausted<br/>refund RPD slot]
+    I --> D
+    H -- 5xx or timeout --> J[Cool down 30 s<br/>keep reservation]
+    J --> D
+    H -- 404 model not found --> K[Disable model for this run]
+    K --> D
+    H -- other 4xx --> R[Return error unchanged]
+```
 
 1. **Authenticate** the bearer token, using a constant-time comparison. Return 401 if it fails.
 2. **Resolve** the route to its candidate list.
@@ -131,6 +153,20 @@ real 429 bodies, and the classifier is built against those recordings. Planned b
 | input **tokens** per minute | TPM | same as RPM; also lower the model's free TPM space to zero for the window |
 | unrecognised | unknown | cooldown 60 s, and log the raw body with the key removed so the classifier can be extended |
 
+Each model moves between these states:
+
+```mermaid
+stateDiagram-v2
+    direction LR
+    [*] --> Available
+    Available --> CoolingDown: 429 per-minute / 5xx
+    CoolingDown --> Available: delay over
+    Available --> Exhausted: 429 per-day / RPD used
+    Exhausted --> Available: midnight PT
+    Available --> Disabled: 404 model
+    Disabled --> [*]: restart
+```
+
 The daily reset uses `zoneinfo("America/Los_Angeles")`, so daylight saving is handled.
 The day key is the PT calendar date.
 
@@ -147,6 +183,31 @@ The day key is the PT calendar date.
   reported and covered by the output reserve when they are not.
 
 ## 8. Streaming
+
+Example: Zoo Code asks `gemini-smart` for a streamed answer after Hydrogen has used up its daily quota.
+
+```mermaid
+sequenceDiagram
+    participant C as Zoo Code
+    participant P as Proxy
+    participant G as Gemini API
+    C->>P: POST /v1/chat/completions, model gemini-smart, stream
+    P->>P: reserve a slot on 4 Hydrogen
+    P->>G: request with Hydrogen's model ID
+    G-->>P: 429 per-day quota
+    P->>P: mark Hydrogen exhausted until midnight PT
+    P->>P: reserve a slot on 3.8 Flash
+    P->>G: request with 3.8 Flash's model ID
+    G-->>P: 200, stream starts
+    P-->>C: headers, x-served-model is 3.8 Flash
+    Note over C,P: first byte sent, no more fallback from here
+    loop each chunk
+        G-->>P: chunk
+        P-->>C: chunk
+    end
+    G-->>P: final chunk with usage
+    P->>P: record actual token usage
+```
 
 - The model can only be switched **before the first byte is sent to the client**.
   Rate-limit errors arrive before streaming starts, so this covers the main case.
@@ -225,7 +286,7 @@ formats, so the custom part is only the routing and quota logic (an estimated 40
 
 ## 15. Clients
 
-Both supported clients send OpenAI Chat Completions requests to `http://localhost:4000/v1`
+All supported clients send OpenAI Chat Completions requests to `http://localhost:4000/v1`
 and use `PROXY_TOKEN` as their API key.
 
 ### Zoo Code (primary client; continues Roo Code)
