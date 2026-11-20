@@ -1,0 +1,13 @@
+# secrets
+.env
+.env.*
+!.env.example
+
+# runtime state (quota DB, captured 429 bodies)
+data/
+
+# python
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
