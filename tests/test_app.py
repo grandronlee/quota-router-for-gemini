@@ -742,5 +742,7 @@ def test_disconnect_mid_stream_releases_the_body_budget():
         sent = _asgi_post(p, receive)
     assert sent[0]["status"] == 200
     assert '"reason": "client_disconnected"' in logs.getvalue()
-    assert held == [len(body)]  # held for the whole stream, not released when the handler returned
+    from quota_router.app import parsed_memory_estimate
+    # the parsed-size estimate, held for the whole stream, not released when the handler returned
+    assert held == [parsed_memory_estimate(body)]
     assert p.body_budget.used == 0

@@ -20,6 +20,23 @@ PAID_MESSAGE = ("billing: paid is not supported. The proxy only runs on a Gemini
                 "(DESIGN §19.1). Use a key from a project that shows 'Free tier' in AI Studio.")
 
 
+# Request-body memory estimate (DESIGN §20.3), used by app.parsed_memory_estimate: raw bytes,
+# parsed strings and the payload re-encoded for upstream, plus a fixed overhead.
+# Per raw byte, 3 + 3 × the widest character's width (1, 2 or 4 bytes): the bytes, the decoded
+# document, the parsed strings and the upstream payload (built as a str, then encoded) all
+# take memory at once. Fitted to tracemalloc peaks of 4.25×, 8× and 14× (2026-11-21).
+PARSED_WIDTH_FACTOR = 3
+PARSED_BASE_FACTOR = 3 + PARSED_WIDTH_FACTOR  # the ASCII and Latin-1 case
+PARSED_OVERHEAD = 1024
+MIN_CHAT_STRUCTURE = 4096  # keys of a plain chat body (system + user, stream options: ~2.2 KB as estimated)
+
+
+def min_parsed_estimate(size: int) -> int:
+    """The smallest estimate a chat body of `size` bytes can get (ASCII text), so a budget of
+    at least this always accepts the largest allowed plain-text request."""
+    return PARSED_BASE_FACTOR * size + PARSED_OVERHEAD + MIN_CHAT_STRUCTURE
+
+
 class ConfigError(ValueError):
     pass
 
@@ -49,8 +66,8 @@ class Config(_Strict):
     db_path: str = "data/quota.sqlite3"
     billing: Literal["free", "paid"] = "free"
     max_body_bytes: PositiveInt = 20 * 1024 * 1024
-    # Shared by all request bodies in use at once (DESIGN §20.3).
-    max_inflight_body_bytes: PositiveInt = 64 * 1024 * 1024
+    # Estimated memory of all request bodies in progress at once (DESIGN §20.3).
+    max_inflight_body_bytes: PositiveInt = 128 * 1024 * 1024
     models: dict[str, ModelConfig]
     routes: dict[str, list[str]]
     # Superseded by handoff_targets (DESIGN §16.8); still accepted when empty, so older
@@ -92,9 +109,12 @@ class Config(_Strict):
             raise ValueError(f"handoff_targets uses unknown model(s): {', '.join(unknown)}")
         if len(set(self.handoff_targets)) != len(self.handoff_targets):
             raise ValueError("handoff_targets lists a model twice")
-        if self.max_inflight_body_bytes < self.max_body_bytes:
-            raise ValueError("max_inflight_body_bytes must be at least max_body_bytes, or no "
-                             "request of the largest allowed size could ever be accepted")
+        if self.max_inflight_body_bytes < min_parsed_estimate(self.max_body_bytes):
+            raise ValueError(f"max_inflight_body_bytes must be at least "
+                             f"{min_parsed_estimate(self.max_body_bytes)} ({PARSED_BASE_FACTOR}× "
+                             f"max_body_bytes, plus {PARSED_OVERHEAD + MIN_CHAT_STRUCTURE}): it counts the memory a "
+                             f"body takes once parsed, so a smaller budget could never accept a "
+                             f"request of the largest allowed size (DESIGN §20.3)")
         ids: dict[str, str] = {}
         for key, m in self.models.items():
             # Two keys for one real model would each believe they had its full quota.

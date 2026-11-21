@@ -1000,18 +1000,35 @@ after the Phase 4 review; it used to need `rpm × 10 < rpd`).
   from arrival, so routing gets only the time the upload left.
 - **Body memory budget** (added 2026-11-21 in Phase 4). `max_body_bytes` limits one request,
   not many at once, and a body is held as bytes, parsed JSON and the upstream request. So
-  request bodies share a budget, `max_inflight_body_bytes` in `config.yaml` (default 64 MB; a
-  startup error if below `max_body_bytes`). A request takes its declared `Content-Length` up
+  request bodies share a budget, `max_inflight_body_bytes` in `config.yaml` (default 128 MB; a
+  startup error if below 6 × `max_body_bytes` + 5 KB, see below). A request takes its declared `Content-Length` up
   front, or else each chunk as it arrives. If that would go over the budget, the proxy answers
   503 `server_busy` with `Retry-After: 1` at once, before buffering more. Nothing is reserved
   and no upstream call is made. The bytes stay taken until the response ends: when a
   non-stream response is returned, or when a stream ends in any way (`[DONE]`, error,
   disconnect). They are released exactly once. Counted in `qr_requests_total` with reason `busy`.
-  The budget counts bytes on the wire, not memory. Agent traffic is mostly long strings (file
-  contents, base64 images), which peak at about 4× their size while held: 64 MB of it stays
-  inside the 512 MB container limit (§21.2). JSON made of many tiny objects can take 8–24× its
-  size once parsed, so a crafted body near `max_body_bytes` could still exhaust the container on
-  its own. That needs the proxy token, and Docker then restarts the proxy with its state intact.
+  **Parsed size (changed 2026-11-21, after two reviews).** Counting upload bytes alone left parsed
+  memory unbounded. Measured with tracemalloc (raw bytes, `json.loads`, and the upstream payload,
+  which is built as a str and then encoded), an ASCII body peaks at about 4.25× its size. Python
+  stores a string at the width of its widest character, and `json.loads` decodes the whole
+  document first, so one character above U+00FF makes that about 8×, and one emoji about 14×.
+  JSON made of many tiny values takes 10–21×. So once the whole body has arrived, and before it
+  is parsed, the request's share grows to an estimate:
+  (3 + 3 × width) × the raw size + 1 KB + 80 bytes per value + 160 per object + 64 per key.
+  - The width (1, 2 or 4) is found from UTF-8 lead bytes and `\u` escapes in the raw body.
+  - Values are counted on the structure outside strings, so commas in code don't count. String
+    contents are stripped with a regular expression that always matches from an opening quote
+    to its close or to the end of the body. A pattern that could fail at an unclosed string was
+    retried from every later quote: quadratic, and it blocked the event loop (second review).
+  - It covers every measured shape (estimate ÷ peak 1.07–2.0) and takes under 1 ms for
+    agent-sized bodies, about 0.5 s at 20 MB.
+  An estimate over the whole budget gets 413 `request_too_large`, because it could never fit;
+  one over what is left gets 503 `server_busy`, as above. `max_inflight_body_bytes` now counts
+  estimated memory: the default is 128 MB (was 64 MB of raw bytes). It must be at least
+  6 × `max_body_bytes` + 5 KB, so the largest plain-ASCII request (system and user messages,
+  stream options) is always accepted; a test checks it at exactly `max_body_bytes`. A body near
+  `max_body_bytes` that holds a wide character can get 413 at the default: at 20 MB with one emoji
+  it really would take about 280 MB. Raise both limits together if such bodies are expected.
   A client that declares a large `Content-Length` and uploads slowly holds that much of the
   budget until the request deadline.
 - The upstream request is the client's body with only two changes: `model` becomes the

@@ -12,6 +12,7 @@ import hmac
 import json
 import logging
 import math
+import re
 import sqlite3
 import time
 import uuid
@@ -30,7 +31,7 @@ from starlette.requests import ClientDisconnect
 from .affinity import AffinityStore
 from .classify import classify_429
 from .clock import Clock, SystemClock, next_pt_midnight
-from .config import Config, ModelConfig
+from .config import PARSED_BASE_FACTOR, PARSED_OVERHEAD, PARSED_WIDTH_FACTOR, Config, ModelConfig
 from .dashboard import SECURITY_HEADERS, add_dashboard, dashboard_request_ok, is_dashboard_path
 from .db import connect
 from .logs import REQUEST_LOGGER
@@ -491,6 +492,10 @@ class BodyLease:
         self.held = 0
         self.released = False
 
+    @property
+    def limit(self) -> int:
+        return self._budget.limit
+
     def grow_to(self, size: int) -> bool:
         """Hold at least `size` bytes. False (holding no more than before) if over the budget."""
         extra = size - self.held
@@ -507,6 +512,34 @@ class BodyLease:
             self.released = True
             self._budget.used -= self.held
             self.held = 0
+
+
+# A string, or an unterminated one running to the end. It always matches at the first quote,
+# so a body with an unclosed string is still one linear pass (a pattern that can fail there
+# is retried from every later quote: quadratic, found in review). re.S: `.` takes a raw newline.
+_JSON_STRING = re.compile(rb'"[^"\\]*(?:\\.[^"\\]*)*(?:"|\\?\Z)', re.S)
+# Python stores a string at its widest character's width; json.loads decodes the whole
+# document first, so one such character sets the width of that copy (found in review).
+_WIDTH_4 = re.compile(rb'[\xf0-\xf4]|\\u[dD][89abAB]')  # astral: UTF-8 lead or surrogate escape
+_WIDTH_2 = re.compile(rb'[\xc4-\xef]|\\u(?:0[1-9a-fA-F]|[1-9a-fA-F])')  # U+0100..U+FFFF
+
+
+def _char_width(raw: bytes) -> int:
+    if _WIDTH_4.search(raw):
+        return 4
+    return 2 if _WIDTH_2.search(raw) else 1
+
+
+def parsed_memory_estimate(raw: bytes) -> int:
+    """Upper estimate of the memory a body takes while its request is in progress (DESIGN
+    §20.3): (3 + 3 × character width) × its size, plus a per-value cost counted on the
+    structure outside strings, which is what makes JSON of many tiny values 10–20× its size
+    once parsed. Calibrated against tracemalloc (2026-11-21)."""
+    s = _JSON_STRING.sub(b'""', raw)  # commas and braces inside strings are not values
+    values = s.count(b",") + s.count(b"[") + s.count(b"{") + 1
+    factor = PARSED_BASE_FACTOR + PARSED_WIDTH_FACTOR * (_char_width(raw) - 1)
+    return (factor * len(raw) + PARSED_OVERHEAD
+            + 80 * values + 160 * s.count(b"{") + 64 * s.count(b":"))
 
 
 def _busy() -> JSONResponse:
@@ -532,8 +565,17 @@ async def _read_json(request: Request, limit: int, lease: BodyLease) -> dict | R
             chunks.append(chunk)
     except ClientDisconnect:  # gone while uploading; nothing was reserved
         return Response(status_code=499)
+    raw = b"".join(chunks)
+    del chunks
+    # Charged before parsing, since the parse is what can take many times the raw size.
+    need = parsed_memory_estimate(raw)
+    if need > lease.limit:  # could never fit, even with nothing else in progress
+        return openai_error(413, "request_too_large",
+                            "request body would take too much memory once parsed (DESIGN §20.3)")
+    if not lease.grow_to(need):
+        return _busy()
     try:
-        body = json.loads(b"".join(chunks))
+        body = json.loads(raw)
     except (ValueError, RecursionError):
         return openai_error(400, "invalid_json", "request body is not valid JSON")
     if not isinstance(body, dict):

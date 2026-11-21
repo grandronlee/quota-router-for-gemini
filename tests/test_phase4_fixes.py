@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+
 import httpx
 import pytest
 import respx
@@ -297,20 +299,20 @@ def test_a_user_message_after_an_assistant_reply_starts_a_new_turn():
 # ---- follow-up: request bodies share a memory budget (DESIGN §20.3) ----------
 
 def small_budget_proxy(**kw):
-    return make_proxy(max_body_bytes=1000, max_inflight_body_bytes=2000, **kw)
+    return make_proxy(max_body_bytes=1000, max_inflight_body_bytes=12_000, **kw)
 
 
 def test_request_over_the_shared_budget_gets_503_busy_before_buffering():
     up = Upstream()
     p = small_budget_proxy()
     with mocked(up), running(p) as c:
-        p.body_budget.used = 1500  # other requests in progress hold most of it
+        p.body_budget.used = 11_000  # other requests in progress hold most of it
         r = post(c, chat_body(content="x" * 500))
         held = p.body_budget.used
         status = c.get("/status", headers=AUTH).json()
     assert r.status_code == 503 and r.headers["retry-after"] == "1"
     assert r.json()["error"]["code"] == "server_busy"
-    assert up.requests == [] and held == 1500  # nothing called, nothing kept
+    assert up.requests == [] and held == 11_000  # nothing called, nothing kept
     assert status["requests"]["by_reason"] == {"busy": 1}
 
 
@@ -323,11 +325,11 @@ def test_chunked_body_over_the_budget_gets_503_busy():
         yield b'"}]}'
 
     with mocked(Upstream()), running(p) as c:
-        p.body_budget.used = 1500
+        p.body_budget.used = 11_000
         r = c.post("/v1/chat/completions", content=chunks(),
                    headers={**AUTH, "content-type": "application/json"})
         held = p.body_budget.used
-    assert r.status_code == 503 and held == 1500
+    assert r.status_code == 503 and held == 11_000
 
 
 @pytest.mark.parametrize("script", [
@@ -349,7 +351,7 @@ def test_budget_is_released_after_every_ending(script):
 def test_budget_below_max_body_bytes_is_a_config_error():
     from quota_router.config import ConfigError
     with pytest.raises((ConfigError, ValueError), match="max_inflight_body_bytes"):
-        make_config(max_body_bytes=1000, max_inflight_body_bytes=999)
+        make_config(max_body_bytes=1000, max_inflight_body_bytes=11_119)
 
 
 def test_release_removes_its_own_token_entry_not_an_equal_one():
@@ -372,3 +374,102 @@ def test_later_attempt_released_when_the_write_leaves_under_5_seconds():
     assert out.candidates[1].reason == "not_tried"
     snap = e.store.snapshot()["model-b"]
     assert snap["rpd_used"] == 0 and snap["rpm_used"] == 0 and snap["tpm_input_used"] == 0
+
+
+# ---- request bodies are charged their parsed-memory estimate (DESIGN §20.3) ----
+
+def test_estimate_covers_measured_shapes_and_ignores_structure_inside_strings():
+    import json as _json
+    from quota_router.app import parsed_memory_estimate
+    from quota_router.config import min_parsed_estimate
+    text = _json.dumps({"messages": [{"role": "user", "content": "a, b: {c}, [d]" * 10_000}]}).encode()
+    tiny = _json.dumps({"messages": [[0] for _ in range(10_000)]}).encode()
+    escaped = _json.dumps({"messages": [{"role": "user", "content": 'q"{,}\\' * 10_000}]}).encode()
+    # a long string costs the base factor only, however many commas or braces it holds
+    from quota_router.config import PARSED_BASE_FACTOR
+    assert parsed_memory_estimate(text) < PARSED_BASE_FACTOR * len(text) + 3_000
+    assert parsed_memory_estimate(escaped) < PARSED_BASE_FACTOR * len(escaped) + 3_000
+    # tiny values: measured at ~21× their size once parsed (tracemalloc, 2026-11-21)
+    assert parsed_memory_estimate(tiny) > 21 * len(tiny)
+    # the startup minimum allows for a chat body's own keys, so it is never below a plain one
+    assert min_parsed_estimate(len(text)) >= PARSED_BASE_FACTOR * len(text)
+
+
+def test_body_of_tiny_values_is_charged_more_than_its_bytes_and_gets_503_busy():
+    # Regression (review): the budget counted upload bytes, so a body of tiny values within it
+    # could take ~20× that in parsed memory.
+    p = make_proxy(max_body_bytes=40_000, max_inflight_body_bytes=4_000_000)
+    body = {"model": "fast", "messages": [{"role": "user", "content": "hi"}], "x": [[0]] * 6_000}
+    raw_len = len(json.dumps(body))
+    with mocked(Upstream()), running(p) as c:
+        p.body_budget.used = 4_000_000 - 10 * raw_len  # room for 10× the raw size, not ~20×
+        r = post(c, body)
+        held = p.body_budget.used
+    assert r.status_code == 503 and r.json()["error"]["code"] == "server_busy"
+    assert held == 4_000_000 - 10 * raw_len  # nothing kept
+
+
+def test_body_whose_estimate_exceeds_the_whole_budget_gets_413():
+    p = make_proxy(max_body_bytes=40_000, max_inflight_body_bytes=300_000)
+    body = {"model": "fast", "messages": [{"role": "user", "content": "hi"}], "x": [{}] * 6_000}
+    up = Upstream()
+    with mocked(up), running(p) as c:
+        r = post(c, body)
+        assert p.body_budget.used == 0
+    assert r.status_code == 413 and r.json()["error"]["code"] == "request_too_large"
+    assert up.requests == []
+
+
+def test_plain_body_of_the_largest_allowed_size_fits_the_minimum_budget():
+    from quota_router.config import min_parsed_estimate
+    p = make_proxy(max_body_bytes=20_000, max_inflight_body_bytes=min_parsed_estimate(20_000) + 2_000)
+    with mocked(Upstream()), running(p) as c:
+        r = post(c, chat_body(content="x" * 19_800))
+        assert p.body_budget.used == 0
+    assert r.status_code == 200
+
+
+def test_default_budget_is_128_mib():
+    assert make_config().max_inflight_body_bytes == 128 * 1024 * 1024
+
+
+def test_unterminated_string_full_of_escaped_quotes_is_estimated_in_linear_time():
+    # Regression (review): the string pattern could fail at an unclosed quote and was retried
+    # from every later quote, so this took about 1.9 s at 16K pairs and hours at 1 MB,
+    # blocking the event loop. A truncated tool-call `arguments` string has this shape.
+    import time
+    from quota_router.app import parsed_memory_estimate
+    for body in (b'"' + b'\\"' * 200_000, b'{"a": "' + b"x" * 1000 + b"\\", b'"\n\\\n'):
+        t = time.perf_counter()
+        parsed_memory_estimate(body)
+        assert time.perf_counter() - t < 0.5
+
+
+def test_one_wide_character_raises_the_whole_bodys_estimate():
+    # Regression (review): Python stores a string at its widest character's width, and
+    # json.loads decodes the whole document first: ASCII + one emoji peaks at ~14× its size.
+    from quota_router.app import parsed_memory_estimate
+    ascii_body = json.dumps({"messages": [{"role": "user", "content": "x" * 100_000}]}).encode()
+    # as UTF-8 bytes, or as the \u escapes json.dumps writes by default
+    for wide, factor in ((b"\xf0\x9f\x98\x80", 15), (rb"\u0100", 9), ("Ā".encode(), 9),
+                         (rb"\ud83d\ude00", 15), ("é".encode(), 6), (rb"\u00e9", 6)):
+        body = ascii_body.replace(b'xxxx"', wide + b'"')
+        assert parsed_memory_estimate(body) >= factor * len(body), wide
+    assert parsed_memory_estimate(ascii_body) < 7 * len(ascii_body)
+
+
+def test_body_of_exactly_max_body_bytes_fits_a_budget_of_exactly_the_minimum():
+    # Review nit: the startup minimum promised this, but a minimal chat body's own keys cost
+    # more than the allowance, so it got 413.
+    from quota_router.config import min_parsed_estimate
+    limit = 20_000
+    p = make_proxy(max_body_bytes=limit, max_inflight_body_bytes=min_parsed_estimate(limit))
+    shell = {"model": "fast", "stream": True, "stream_options": {"include_usage": True},
+             "messages": [{"role": "system", "content": "s"}, {"role": "user", "content": ""}]}
+    pad = limit - len(json.dumps(shell, separators=(",", ":")).encode())
+    shell["messages"][1]["content"] = "x" * pad
+    raw = json.dumps(shell, separators=(",", ":")).encode()
+    assert len(raw) == limit
+    with mocked(Upstream({"model-a": [streamed(sse(chunk("ok", finish="stop")))]})), running(p) as c:
+        r = c.post("/v1/chat/completions", content=raw, headers={**AUTH, "content-type": "application/json"})
+    assert r.status_code == 200
