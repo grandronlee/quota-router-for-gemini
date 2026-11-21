@@ -223,9 +223,11 @@ class GeminiUpstream:
     def bind(self, body: dict, stream: bool, handles: HandleSet) -> Callable:
         """The router's `Upstream` callable for one client request."""
 
-        async def call(model: ModelConfig, timeout_s: float) -> UpstreamResult:
+        async def call(model: ModelConfig, timeout_s: float, *,
+                       body: dict | None = None, _client_body: dict = body) -> UpstreamResult:
             handles.attempted.append(model.id)
-            result = await self._call(body, stream, handles, model, timeout_s)
+            sent = _client_body if body is None else body  # a handed-off turn (DESIGN §16.8)
+            result = await self._call(sent, stream, handles, model, timeout_s)
             if self._on_result:
                 try:
                     self._on_result(model, result)

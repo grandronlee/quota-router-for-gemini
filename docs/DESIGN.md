@@ -261,7 +261,8 @@ rule below.
     model of the **latest** tool call, and send `x-turn-affinity: mixed`.
   - A 400 from Google about a missing or invalid thought signature is returned to the
     client unchanged and is never retried on another model.
-- **No handoff in v1.** Moving a tool turn between models is off for every pair. It may be
+- **No handoff in v1.** (After v1, §16.8 replaced the per-pair setting below with `handoff_targets`,
+  placeholder signatures only.) Moving a tool turn between models is off for every pair. It may be
   enabled per pair (`handoffs:` in config, with `signature: keep|placeholder`) only after
   the probe shows a **multi-step** tool loop working across that pair: at least two tool calls in
   one turn, with the handoff between them, so that the earlier call's signature is
@@ -459,7 +460,8 @@ models:   # limits: copy your own project's values from AI Studio
               input_limit: 1048576, output_limit: 65536 }
 routes:
   gemini-fast: [lite-3-5]   # add lite-3-1 once its tool call passes the probe
-handoffs: []   # must stay empty in v1 (§5.1)
+handoff_targets: []   # models whose handoff probe passed (§16.8)
+handoff_after_s: 60
 ```
 
 The `input_limit`/`output_limit` values are the ones `models.list` reported in Phase 0
@@ -500,7 +502,7 @@ formats, so the custom part is only the routing and quota logic (an estimated 40
 | Every model exhausted | 429 with `Retry-After` set to the earliest reset |
 | Models overloaded (503 "high demand", common in Phase 0) | 30 s cooldown, next candidate; 503 when attempts or the deadline run out |
 | Request larger than every candidate's context | 400 `context_length_exceeded`, no upstream call |
-| Tool result arrives while its model is out of quota | 429/503, no fallback (no handoffs in v1, §5.1) |
+| Tool result arrives while its model is out of quota | handoff to a listed `handoff_targets` model if the owner is blocked over `handoff_after_s`; otherwise 429/503 (§16.8) |
 | Proxy restarts in the middle of a tool turn | affinity reloads from SQLite; the turn stays on its model |
 | Tool turn whose call IDs the proxy doesn't know | normal routing, `x-turn-affinity: unknown`, warning logged |
 | Every candidate disabled (all 404) | 503 `no_enabled_model`, no `Retry-After` |
@@ -706,6 +708,127 @@ is reconsidered only if the reports show stable patterns over weeks.
   user sets their own `timezone`.
 - Visibility and monitoring: §17. Hosting: §18.
 
+### 16.8 Step 1 in detail: `gemini-smart`, handoffs and the decision log — approved 2026-11-21
+
+**Why handoffs come first.** Phase 4 showed that a Zoo Code task stays on the model of its
+first tool call until the user's next message (§5.1). On `gemini-fast` that model has 500 RPD.
+On a smart model it has 20 RPD and 5 RPM, so one long Architect or Debug task can use up a
+model's whole day. The task then gets 429 until the PT midnight, even while the other smart
+models still have quota. Without handoffs, `gemini-smart` would only be useful for short
+tasks, so step 1 starts with the multi-step probe that §5.1 requires.
+
+**1a. Handoff probe** (`scripts/probe.py --handoffs`, run by hand, uses quota).
+
+- One experiment per target model B. The source is always 3.5 Flash Lite (500 RPD), so the
+  scarce models spend quota only as targets:
+  1. Send 3.5 Flash Lite a prompt with tools that needs two tool calls in sequence. It
+     answers with call 1.
+  2. Send B call 1 and its result. B must answer with call 2.
+  3. Send B both calls and both results. B must give a final answer.
+  - **Pass:** no 400 at step 2 or 3, and step 2 returns a tool call. Step 3 is where Google
+    checks a signature from another model in a turn that also holds B's own call, which is
+    the case that the single-step Phase 0 experiments didn't cover.
+- Each target is run with the **placeholder** signature (`skip_thought_signature_validator`
+  in `extra_content.google.thought_signature`), the form Google documents for history
+  "transferred from a different model". A run with the signature as received goes into
+  probe-results as information only.
+- Targets: every model planned for `gemini-smart` (4 Hydrogen, 3.8 Flash, 3.6 Flash, 3 Flash,
+  2.5 Flash, 3.5 Flash Lite, 2.5 Flash Lite). 3.1 Flash Lite is added once its tool call passes.
+- Cost per full run: at most 2 requests on each target for each signature mode (4 on each
+  smart model, out of its 20 RPD), plus about 14 on 3.5 Flash Lite. A 503 result is recorded
+  as `UNAVAILABLE`, not as a failure, and that target is run again on another day.
+
+**1b. Handoffs in the router.** This changes §5.1's "per pair, `keep|placeholder`" setting to
+**per target, placeholder only**. With the placeholder, the source model's signature is never
+sent to the target, so the source doesn't matter. Handoffs with the signature as received
+are not offered.
+
+- Config: `handoff_targets: [<model keys>]`. Only models that passed 1a may be listed. Config
+  validation rejects any other key, and an empty list keeps today's behaviour.
+- Pinned turn: the candidates are the owner first, then the route's other candidates that are
+  in `handoff_targets`, in route order. A request for a real model ID gets no handoff.
+- The owner is skipped for a handoff only if it can't take the request within
+  `handoff_after_s` (default 60 s): it is exhausted, in a cooldown, out of RPD, or answered
+  with 5xx or timed out on this request. If it is only out of RPM room for under 60 s, the
+  proxy returns 429 with that short `Retry-After`, as it does today. Handing off would spend
+  a scarce request elsewhere and lower the quality of the turn just to save a few seconds.
+- When B serves a handed-off turn, every tool call in the active turn that B didn't make
+  (from the affinity record) has its signature replaced with the placeholder in the body sent
+  upstream. B's own calls keep their real signatures. Unknown IDs also get the placeholder.
+  This is the only place the proxy changes a request body other than `model`.
+  - The same rewrite applies to a `mixed` turn served by its latest owner, since the client
+    still sends the earlier model's real signatures (settled in implementation, 2026-11-21).
+  - An owner serving a turn that holds only its own known calls sends the body unchanged,
+    unknown IDs included, as in v1: they are most likely its own calls whose record was lost.
+  - The handoff is decided once, from the owner's result, so a slow first target can't stop
+    the remaining targets from being tried.
+  - An owner that failed on this request or is in a 5xx cooldown hands off even when §5.2
+    reports it as `quota` because a quota limit is hit too (found in review: a 503 that used a
+    5-RPM model's last slot). The threshold is "at least `handoff_after_s`": a per-minute
+    window always frees within 60 s, and a fresh 60 s cooldown after a 429 hands off.
+  - A failed handoff (targets tried, none served) still sends `x-handoff-from`.
+  - The owner's wait is measured from when its state was read for this request, not from the
+    gate's own clock reading, so a 60 s cooldown set by this request's 429 counts in full.
+  - Each candidate's input estimate (context fit, TPM, reservation) comes from the body it is
+    sent. Placeholders are much shorter than real signatures (up to about 1 KB each in 1a).
+- New tool calls are recorded for B, so B owns the turn from then on. The existing `mixed`
+  rule (pin to the latest call's model) already covers this.
+- Headers: `x-turn-affinity: handoff` and `x-handoff-from: <owner id>`. Metric:
+  `qr_handoff_total{from,to,result}`, where `result` is `served`, `rejected` (a 4xx returned
+  unchanged) or `failed` (429, 5xx, timeout or 404, so the next target is tried). The log line
+  gets `handoff_from`.
+- A 400 about a thought signature after a handoff is still returned to the client unchanged
+  (§5.1) and logged as an error naming both models. That target should then be removed from
+  `handoff_targets`.
+
+**1c. `gemini-smart` route.** This is config only: the §4 order, limited to models whose tool
+call passed (3.8 Flash and 3.1 Flash Lite were 503 in Phase 0, so they are probed again
+first). `scripts/init_config.py` offers it commented out.
+
+**1d. Decision log.** One row per turn, metadata only (§16.1, §16.5):
+
+| Column | Value |
+|---|---|
+| `turn_id` | 128 random bits from the proxy, as hex (never derived from content) |
+| `day`, `hour` | PT date and hour of the turn start |
+| `route` | the requested route or model ID |
+| `first_model`, `last_model` | served the first and the latest request |
+| `reason` | step 1 values: `first` (first candidate), `spill`, `pinned`, `handoff`, `unknown`; later steps add §16.4's |
+| `tools` | number of tool definitions in the first request |
+| `input_tokens`, `output_tokens` | sums of reported usage |
+| `steps`, `errors`, `handoffs` | served requests, failed requests and handoffs in the turn |
+| `last_status` | HTTP status of the latest request |
+
+- A turn starts with a request whose active turn holds no tool calls. Later requests find
+  their turn through their tool-call IDs: migration 1→2 adds `turn_id` to `affinity` (§20.10,
+  keyed on `PRAGMA user_version`). A follow-up whose IDs are all unknown starts a new row
+  with `reason: unknown`, and the report counts these separately.
+- A client retry of a turn start (Zoo Code retries by itself after an error) makes a second
+  row, because requests can't be matched without reading content. The failed row has
+  `steps: 0`, so the report can leave it out.
+- Writes: one INSERT at turn start and one UPDATE per later request, done in the bookkeeping
+  after the response, where affinity is recorded. A failed write is logged and counted in
+  `state_errors`, and never fails the request (§5.2).
+- Rows older than 30 days are deleted during housekeeping. `/status` shows today's turn
+  count per route. The suggestion report is step 5 (§16.6).
+
+**1e. Validation.**
+
+- Offline tests: handoff order and the 60 s threshold; placeholder only on calls the target
+  didn't make; no handoff for direct model IDs or for targets not listed; migration 1→2 on a
+  version-1 file that has affinity rows; turn rows for new, continued, unknown and retried
+  turns; a failed log write doesn't fail the request.
+- Live, by hand: the 1a probe, then one Zoo Code Architect task on `gemini-smart`. A
+  handoff is forced by writing an `exhausted` row for the owner while the proxy is stopped
+  (as in Phase 4). The check is `x-turn-affinity: handoff`, no 400, and a finished task.
+
+**Approved with these choices (2026-11-21):**
+
+1. Placeholder-only handoffs per target, instead of per pair with `keep|placeholder`.
+2. `handoff_after_s: 60`. The alternative is to hand off whenever the owner can't take the
+   request now. That is simpler, but it uses smart quota on every RPM wait.
+3. The probe budget in 1a: about 4 requests on each smart model and about 14 on 3.5 Flash Lite.
+
 ## 17. Observability — layers 1–5 and local collection approved 2026-11-21 (§21); alerts and remote rows proposed
 
 ### 17.1 Principles
@@ -892,7 +1015,8 @@ after the Phase 4 review; it used to need `rpm × 10 < rpd`).
   A client that declares a large `Content-Length` and uploads slowly holds that much of the
   budget until the request deadline.
 - The upstream request is the client's body with only two changes: `model` becomes the
-  real ID, and streams get `stream_options.include_usage: true` (§7). None of the client's
+  real ID, and streams get `stream_options.include_usage: true` (§7). The one exception is a
+  handed-off tool turn, whose other models' calls get the placeholder signature (§16.8). None of the client's
   headers are forwarded; the proxy sends its own `Authorization: Bearer <GEMINI_API_KEY>`.
 - One shared `httpx.AsyncClient`: connect timeout 10 s; the router's per-attempt timeout
   for the first byte (§9); after that, 120 s between stream chunks.

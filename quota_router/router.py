@@ -14,7 +14,7 @@ import logging
 import math
 import sqlite3
 from dataclasses import dataclass, field
-from typing import Any, Literal, Mapping, Protocol
+from typing import Any, Callable, Literal, Mapping, Protocol
 
 from .affinity import AffinityStore
 from .classify import classify_429
@@ -34,7 +34,11 @@ MIN_ATTEMPT_S = 5.0  # a later attempt with less time left than this isn't start
 _FAILED = object()  # sentinel: a state read failed
 
 Reason = Literal["disabled", "too_large", "quota", "unavailable", "not_tried"]
-Affinity = Literal["pinned", "unknown", "mixed"]
+Affinity = Literal["pinned", "unknown", "mixed", "handoff"]
+
+# Google's documented signature for history "transferred from a different model" (DESIGN §16.8).
+PLACEHOLDER_SIGNATURE = "skip_thought_signature_validator"
+HandoffHook = Callable[[str, str, str], None]  # (from model ID, to model ID, result)
 
 
 # ---- upstream results (supplied by the HTTP layer) -----------------------
@@ -76,7 +80,10 @@ UpstreamResult = Served | RateLimited | Unavailable | ModelNotFound | Rejected
 
 
 class Upstream(Protocol):
-    async def __call__(self, model: ModelConfig, timeout_s: float) -> UpstreamResult: ...
+    """One upstream call. `body`, when given, replaces the client's request for this call
+    (a handed-off tool turn, DESIGN §16.8); it is passed only when it differs."""
+    async def __call__(self, model: ModelConfig, timeout_s: float, *,
+                       body: Mapping[str, Any] | None = None) -> UpstreamResult: ...
 
 
 # ---- route outcomes ------------------------------------------------------
@@ -87,6 +94,13 @@ class Candidate:
     reason: Reason | None = None
     ready_at: float | None = None
     detail: str = ""
+    # Failed on this request (5xx, timeout, state error) or in a 5xx cooldown, whatever
+    # `reason` says after merging with quota limits (DESIGN §5.2). Used by the handoff gate.
+    unhealthy: bool = False
+    # When its state was read for this request (before reserving or skipping). The handoff
+    # gate measures the wait from here, so a cooldown set by this request's own 429 counts in
+    # full however long the bookkeeping after it took.
+    checked_at: float | None = None
 
 
 @dataclass
@@ -96,6 +110,7 @@ class RouteServed:
     reservation: Reservation
     path: list[str]
     affinity: Affinity | None
+    handoff_from: str | None = None  # the turn's owner, when another model served it
 
 
 @dataclass
@@ -106,6 +121,8 @@ class RoutePassthrough:
     reservation: Reservation
     path: list[str]
     affinity: Affinity | None
+    handoff_from: str | None = None
+    rewritten: bool = False  # sent with placeholder signatures (DESIGN §16.8)
 
 
 @dataclass
@@ -117,6 +134,7 @@ class RouteFailed:
     path: list[str] = field(default_factory=list)
     affinity: Affinity | None = None
     candidates: list[Candidate] = field(default_factory=list)
+    handoff_from: str | None = None  # the owner, when a handoff target was tried and failed too
 
     def error_body(self) -> dict:
         etype = {400: "invalid_request_error", 404: "invalid_request_error",
@@ -165,13 +183,11 @@ def requested_output_tokens(request: Mapping[str, Any]) -> int | None:
     return None
 
 
-def active_turn_tool_call_ids(messages: Any) -> list[str]:
-    """IDs of assistant tool calls in the active turn, oldest first (DESIGN §5.1).
+def active_turn_start(messages: list) -> int:
+    """Index of the `user` message that starts the active turn, or -1 (DESIGN §5.1).
 
     The turn starts at the last `user` message that doesn't come straight after a `tool`
     message: Zoo Code sends its environment details that way after every tool result."""
-    if not isinstance(messages, list):
-        return []
     last_user = -1
     before_users = None  # role of the message before the current run of user messages
     prev_role = None
@@ -183,8 +199,49 @@ def active_turn_tool_call_ids(messages: Any) -> list[str]:
             if before_users != "tool":
                 last_user = i
         prev_role = role
+    return last_user
+
+
+def with_placeholder_signatures(request: Mapping[str, Any], serving_id: str,
+                                owners: Mapping[str, str]) -> Mapping[str, Any]:
+    """The request with every active-turn tool call that `serving_id` didn't make (by the
+    affinity record; unknown and ID-less calls included) carrying the placeholder signature
+    (DESIGN §16.8). Changed messages and calls are copied; the client's request is untouched.
+    Returns `request` itself when nothing needs changing."""
+    messages = request.get("messages")
+    if not isinstance(messages, list):
+        return request
+    new = list(messages)
+    changed = False
+    for i in range(active_turn_start(messages) + 1, len(messages)):
+        m = messages[i]
+        if not (isinstance(m, dict) and m.get("role") == "assistant" and isinstance(m.get("tool_calls"), list)):
+            continue
+        calls = []
+        for tc in m["tool_calls"]:
+            if isinstance(tc, dict):
+                tc_id = tc.get("id")
+                owner = owners.get(tc_id) if isinstance(tc_id, str) else None
+                if owner != serving_id:
+                    extra = tc.get("extra_content")
+                    extra = extra if isinstance(extra, dict) else {}
+                    google = extra.get("google")
+                    google = google if isinstance(google, dict) else {}
+                    tc = {**tc, "extra_content": {
+                        **extra, "google": {**google, "thought_signature": PLACEHOLDER_SIGNATURE}}}
+            calls.append(tc)
+        if calls != m["tool_calls"]:
+            new[i] = {**m, "tool_calls": calls}
+            changed = True
+    return {**request, "messages": new} if changed else request
+
+
+def active_turn_tool_call_ids(messages: Any) -> list[str]:
+    """IDs of assistant tool calls in the active turn, oldest first (DESIGN §5.1)."""
+    if not isinstance(messages, list):
+        return []
     ids: list[str] = []
-    for m in messages[last_user + 1:]:
+    for m in messages[active_turn_start(messages) + 1:]:
         if not (isinstance(m, dict) and m.get("role") == "assistant"):
             continue
         calls = m.get("tool_calls")
@@ -217,6 +274,7 @@ class Router:
         # For /metrics (DESIGN §17.2, §20.6): SQLite errors and tool-call IDs seen twice.
         self.state_errors = 0
         self.tool_call_ids_reused = 0
+        self.on_handoff: HandoffHook | None = None  # set by the HTTP layer for /metrics
 
     def resolve(self, name: Any) -> list[ModelConfig] | None:
         if not isinstance(name, str):
@@ -227,30 +285,62 @@ class Router:
         return [m] if m else None
 
     def _pin(self, request: Mapping[str, Any], candidates: list[ModelConfig]
-             ) -> tuple[list[ModelConfig], Affinity | None]:
+             ) -> tuple[list[ModelConfig], Affinity | None, dict[str, str]]:
+        """Candidates after pinning, the affinity label, and the known ID → model map
+        (empty unless the turn is pinned to an owner, which is then `candidates[0]`)."""
         ids = active_turn_tool_call_ids(request.get("messages"))
         if not ids:
-            return candidates, None
+            return candidates, None, {}
         try:
             known = self._affinity.lookup(ids)
         except sqlite3.Error:
             self.state_errors += 1
             log.exception("affinity lookup failed; routing the tool turn normally")
-            return candidates, "unknown"
+            return candidates, "unknown", {}
         owners = [known[i] for i in ids if i in known]
         if not owners:
             log.warning("tool turn with %d call ID(s), none known; routing normally", len(ids))
-            return candidates, "unknown"
+            return candidates, "unknown", {}
         owner_id = owners[-1]  # the latest known call's model
         model = self._config.model_by_id(owner_id)
         if model is None:
             log.warning("tool turn belongs to %s, which is no longer configured; routing normally", owner_id)
-            return candidates, "unknown"
+            return candidates, "unknown", {}
         if len(set(owners)) > 1:
-            log.warning("tool turn spans %d models; pinning to the latest call's model %s",
-                        len(set(owners)), owner_id)
-            return [model], "mixed"
-        return [model], "pinned"
+            # Expected after a handoff (DESIGN §16.8); without one it is worth a look.
+            log.info("tool turn spans %d models; pinning to the latest call's model %s",
+                     len(set(owners)), owner_id)
+            return [model], "mixed", known
+        return [model], "pinned", known
+
+    def _handoff_targets(self, name: Any, resolved: list[ModelConfig],
+                         owner: ModelConfig) -> list[ModelConfig]:
+        """The route's other models listed in `handoff_targets`, in route order. A request
+        for a real model ID gets none (DESIGN §16.8)."""
+        if not (isinstance(name, str) and name in self._config.routes and self._config.handoff_targets):
+            return []
+        allowed = set(self._config.handoff_targets)
+        return [m for m in resolved if m.key in allowed and m.id != owner.id]
+
+    def _may_hand_off(self, owner: Candidate) -> bool:
+        """Hand off only if the owner can't take the request within handoff_after_s: it
+        failed or is cooling down after a 5xx, can never serve it, or is blocked for longer
+        (DESIGN §16.8). A short RPM or TPM wait gets the owner's 429 instead. A per-minute
+        window always frees within 60 s; a fresh 60 s cooldown after a 429 reaches the default."""
+        if owner.unhealthy or owner.reason in ("unavailable", "disabled", "too_large"):
+            return True
+        if owner.reason == "quota":
+            since = self._clock.now() if owner.checked_at is None else owner.checked_at
+            return owner.ready_at is None or owner.ready_at - since >= self._config.handoff_after_s
+        return False  # not_tried: attempts or the deadline ran out
+
+    def _note_handoff(self, owner: ModelConfig | None, model: ModelConfig, result: str) -> None:
+        if owner is None or model.id == owner.id or self.on_handoff is None:
+            return
+        try:
+            self.on_handoff(owner.id, model.id, result)
+        except Exception:
+            log.exception("handoff hook failed")
 
     async def route(self, request: Mapping[str, Any], upstream: Upstream,
                     *, started_at: float | None = None) -> RouteOutcome:
@@ -260,40 +350,63 @@ class Router:
         resolved = self.resolve(name)
         if resolved is None:
             return RouteFailed(404, "model_not_found", f"unknown model or route: {name!r}", None)
-        candidates, affinity = self._pin(request, resolved)
+        candidates, affinity, known = self._pin(request, resolved)
+        owner = candidates[0] if known else None
+        if owner is not None:
+            candidates = [owner, *self._handoff_targets(name, resolved, owner)]
         input_tokens = estimate_input_tokens(request)
         output_tokens = requested_output_tokens(request)
 
         results: list[Candidate] = []
         path: list[str] = []
         attempts = 0
+        hand_off: bool | None = None  # decided once, from the owner's result
         for model in candidates:
+            if owner is not None and model is not owner:
+                if hand_off is None:
+                    hand_off = self._may_hand_off(results[0])
+                if not hand_off:
+                    break  # the owner's own result decides (DESIGN §16.8)
+            # Calls the serving model didn't make carry the placeholder: after a handoff, or in
+            # a mixed turn served by its latest owner. An owner serving its own turn sends the
+            # body unchanged, unknown IDs included (most likely its own calls).
+            foreign = owner is not None and (
+                model.id != owner.id or any(v != model.id for v in known.values()))
+            body = with_placeholder_signatures(request, model.id, known) if foreign else request
+            served_affinity = affinity if owner is None or model.id == owner.id else "handoff"
+            handoff_from = owner.id if owner is not None and model.id != owner.id else None
+            # Estimated from what this model is sent: placeholders are much shorter than real
+            # signatures, so the client's body would overstate a handoff's size.
+            tokens = input_tokens if body is request else estimate_input_tokens(body)
             c = Candidate(model)
             results.append(c)
             if self._store.is_disabled(model):
                 c.reason = "disabled"
                 continue
-            if not fits(model, input_tokens, output_tokens):
+            if not fits(model, tokens, output_tokens):
                 c.reason = "too_large"
                 continue
             async with self._lock:
-                left = deadline - self._clock.now()
+                c.checked_at = self._clock.now()
+                left = deadline - c.checked_at
                 # The first attempt runs while any time is left; a later one needs MIN_ATTEMPT_S,
                 # since a call that is sure to time out would only cost quota and a cooldown.
                 limits_left = attempts < self._config.max_attempts and \
                     (left > 0 if attempts == 0 else left >= MIN_ATTEMPT_S)
                 try:
-                    res = self._store.try_reserve(model, input_tokens) if limits_left \
-                        else self._store.check(model, input_tokens)
+                    res = self._store.try_reserve(model, tokens) if limits_left \
+                        else self._store.check(model, tokens)
                 except sqlite3.Error:
                     # Never call upstream without a reservation; this candidate is skipped.
                     self.state_errors += 1
                     log.exception("quota state error for %s; skipping it", model.id)
                     c.reason, c.detail = "unavailable", "quota state error"
                     c.ready_at = self._clock.now() + STATE_ERROR_RETRY_S
+                    c.unhealthy = True
                     continue
             if isinstance(res, Blocked):
                 c.reason, c.ready_at, c.detail = res.reason, res.ready_at, res.detail
+                c.unhealthy = res.cooling_down
                 continue
             if res is None:  # eligible, but no attempts or time left
                 c.reason, c.ready_at = "not_tried", self._clock.now()
@@ -315,15 +428,20 @@ class Router:
             # (the deadline counts from arrival, DESIGN §20.3): at least MIN_ATTEMPT_S less than usual.
             shortened = timeout <= full_timeout - MIN_ATTEMPT_S
             attempt_started = self._clock.now()
+            call = upstream(model, timeout) if body is request else upstream(model, timeout, body=body)
             try:
-                result = await asyncio.wait_for(upstream(model, timeout), timeout + 1.0)
+                result = await asyncio.wait_for(call, timeout + 1.0)
             except TimeoutError:
                 result = Unavailable("timeout")
 
             if isinstance(result, Served):
-                return RouteServed(model, result.payload, res, path, affinity)
+                self._note_handoff(owner, model, "served")
+                return RouteServed(model, result.payload, res, path, served_affinity, handoff_from)
             if isinstance(result, Rejected):
-                return RoutePassthrough(model, result.payload, res, path, affinity)
+                self._note_handoff(owner, model, "rejected")
+                return RoutePassthrough(model, result.payload, res, path, served_affinity, handoff_from,
+                                        rewritten=body is not request)
+            self._note_handoff(owner, model, "failed")
             if isinstance(result, RateLimited):
                 cls = classify_429(result.body, result.headers)
                 if cls.kind == "unknown":
@@ -333,6 +451,7 @@ class Router:
                 self._safely(self._store.refund_rpd, res)  # Google's 429 is the source of truth
             elif isinstance(result, Unavailable):
                 c.reason, c.detail = "unavailable", result.detail
+                c.unhealthy = True  # kept even if the merge below relabels it "quota"
                 # ...and the timeout is that budget running out, not an early network timeout.
                 ran_out = self._clock.now() - attempt_started >= timeout - 1.0
                 # A connect or pool timeout is an early network timeout, whatever its timing.
@@ -356,15 +475,20 @@ class Router:
                 raise TypeError(f"unexpected upstream result: {result!r}")
             # Its state now (DESIGN §5.2): a 5xx on a model that is also out of quota counts as quota.
             now = self._clock.now()
-            blocked = self._safely(self._store.check, model, input_tokens, failed=_FAILED)
+            blocked = self._safely(self._store.check, model, tokens, failed=_FAILED)
             if blocked is _FAILED:  # state unreadable: don't advertise "ready now"
                 c.ready_at = now + STATE_ERROR_RETRY_S
+                # Unhealthy only after a 5xx; a 429 with an unreadable state stays a short wait.
+                c.unhealthy = c.reason == "unavailable"
                 continue
             c.ready_at = blocked.ready_at if blocked else now
             if blocked and blocked.reason == "quota" and c.reason == "unavailable":
                 c.reason, c.detail = "quota", f"{c.detail}; {blocked.detail}"
 
-        return self._final(name, results, path, affinity)
+        out = self._final(name, results, path, affinity)
+        if owner is not None and any(m != owner.id for m in path):
+            out.handoff_from = owner.id  # a target was called and failed too
+        return out
 
     def _safely(self, fn, *args, failed: Any = None, **kwargs):
         """Run a state update after an upstream call; a SQLite error is logged, not raised,

@@ -59,6 +59,9 @@ class Blocked:
     reason: Literal["quota", "unavailable"]
     ready_at: float
     detail: str
+    # A 5xx cooldown is live, even if `reason` is "quota" because a quota limit is hit too
+    # (DESIGN §5.2). Handoffs need it: an unhealthy owner hands off (§16.8).
+    cooling_down: bool = False
 
 
 @dataclass
@@ -151,9 +154,9 @@ class QuotaStore:
             ready = max(ready, st.unavailable_cooldown_until)
 
         if quota:
-            return Blocked("quota", ready, ", ".join(quota))
+            return Blocked("quota", ready, ", ".join(quota), cooling_down=unavailable)
         if unavailable:
-            return Blocked("unavailable", ready, "5xx cooldown")
+            return Blocked("unavailable", ready, "5xx cooldown", cooling_down=True)
         return None
 
     @staticmethod

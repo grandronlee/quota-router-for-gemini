@@ -60,10 +60,13 @@ class ScriptedUpstream:
                  on_call: Callable[[ModelConfig, float], None] | None = None) -> None:
         self.script = script or {}
         self.calls: list[tuple[str, float]] = []
+        self.bodies: list[dict | None] = []  # the `body` passed for each call (None = the client's)
         self.on_call = on_call
 
-    async def __call__(self, model: ModelConfig, timeout_s: float) -> UpstreamResult:
+    async def __call__(self, model: ModelConfig, timeout_s: float, *,
+                       body: dict | None = None) -> UpstreamResult:
         self.calls.append((model.id, timeout_s))
+        self.bodies.append(body)
         if self.on_call:
             self.on_call(model, timeout_s)
         await asyncio.sleep(0)

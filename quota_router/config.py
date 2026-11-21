@@ -53,7 +53,13 @@ class Config(_Strict):
     max_inflight_body_bytes: PositiveInt = 64 * 1024 * 1024
     models: dict[str, ModelConfig]
     routes: dict[str, list[str]]
+    # Superseded by handoff_targets (DESIGN §16.8); still accepted when empty, so older
+    # config files keep loading.
     handoffs: list[Any] = Field(default_factory=list)
+    # Models that may take over a tool turn from another model, with placeholder signatures.
+    # List only models whose multi-step handoff probe passed (DESIGN §16.8 1a).
+    handoff_targets: list[str] = Field(default_factory=list)
+    handoff_after_s: float = Field(default=60, ge=0)
 
     @model_validator(mode="before")
     @classmethod
@@ -79,7 +85,13 @@ class Config(_Strict):
         if not self.routes:
             raise ValueError("no routes configured")
         if self.handoffs:
-            raise ValueError("handoffs must be empty in v1 (DESIGN §5.1)")
+            raise ValueError("handoffs must be empty: per-pair handoffs were replaced by "
+                             "handoff_targets (DESIGN §16.8)")
+        unknown = [k for k in self.handoff_targets if k not in self.models]
+        if unknown:
+            raise ValueError(f"handoff_targets uses unknown model(s): {', '.join(unknown)}")
+        if len(set(self.handoff_targets)) != len(self.handoff_targets):
+            raise ValueError("handoff_targets lists a model twice")
         if self.max_inflight_body_bytes < self.max_body_bytes:
             raise ValueError("max_inflight_body_bytes must be at least max_body_bytes, or no "
                              "request of the largest allowed size could ever be accepted")

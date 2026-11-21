@@ -142,7 +142,9 @@ def render(models: list[dict], chosen: list[str]) -> str:
         lines.append(f"  gemini-fast: [{', '.join(chosen)}]   # tried in this order")
     else:
         lines.append("  # gemini-fast: [model-key, other-model-key]   # tried in this order")
-    lines += ["", "handoffs: []                  # must stay empty in v1 (DESIGN §5.1)", ""]
+    lines += ["", "handoff_targets: []           # models whose handoff probe passed (DESIGN §16.8)",
+              "handoff_after_s: 60           # hand a tool turn off only if its model is blocked longer",
+              ""]
     return "\n".join(lines)
 
 

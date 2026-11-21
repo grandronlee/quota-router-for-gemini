@@ -26,6 +26,8 @@ HELP = {
     "qr_requests_total": ("counter", "Client requests by route, status and reason."),
     "qr_upstream_attempts_total": ("counter", "Upstream calls by model and outcome."),
     "qr_tokens_total": ("counter", "Reported tokens by model and kind (input, output)."),
+    "qr_handoff_total": ("counter", "Tool-turn handoff attempts by owner, target and result "
+                                    "(served, rejected, failed); DESIGN §16.8."),
     "qr_auth_failures_total": ("counter", "Requests rejected for a missing or wrong token."),
     "qr_state_errors_total": ("counter", "SQLite errors while reading or writing quota state."),
     "qr_tool_call_id_reused_total": ("counter", "Tool-call IDs recorded twice (DESIGN §20.6)."),
@@ -86,7 +88,8 @@ class Metrics:
             lines.append(f"# HELP {name} {text}")
             lines.append(f"# TYPE {name} {kind}")
 
-        for name in ("qr_requests_total", "qr_upstream_attempts_total", "qr_tokens_total"):
+        for name in ("qr_requests_total", "qr_upstream_attempts_total", "qr_tokens_total",
+                     "qr_handoff_total"):
             head(name)
             for labels, v in sorted(self._counters.get(name, {}).items()):
                 lines.append(f"{name}{_labels(labels)} {_num(v)}")

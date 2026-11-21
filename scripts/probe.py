@@ -9,6 +9,7 @@ Reads GEMINI_API_KEY from the environment (never from a file, never from argv):
     python -I scripts/probe.py                        # full probe
     python -I scripts/probe.py --only "Gemini 3 Flash" --checks tools,roundtrip
     python -I scripts/probe.py --rescore              # rebuild the report offline, no requests
+    python -I scripts/probe.py --handoffs             # multi-step handoffs only (DESIGN §16.8)
 
 Writes:
     data/probe/<timestamp>.json   raw results (git-ignored); key, project IDs and
@@ -76,6 +77,14 @@ EXPERIMENTS = [
 # Documented for "transferring a trace from a different model" (thought-signatures FAQ).
 DUMMY_SIGNATURE = "skip_thought_signature_validator"
 
+# Multi-step handoffs (DESIGN §16.8 1a, `--handoffs`). The source makes call 1; each
+# target gets call 1 and its result, must make call 2 itself, then answer from both.
+HANDOFF_SOURCE = "Gemini 3.5 Flash Lite"
+HANDOFF_TARGETS = ["Gemini 4 Hydrogen", "Gemini 3.8 Flash", "Gemini 3.6 Flash", "Gemini 3 Flash",
+                   "Gemini 2.5 Flash", "Gemini 3.5 Flash Lite", "Gemini 3.1 Flash Lite",
+                   "Gemini 2.5 Flash Lite"]
+HANDOFF_SIGNATURES = ("dummy", "keep")  # placeholder decides; as received is information only
+
 # Extra words a display name may carry and still count as the same model.
 SUFFIX_OK = {"preview", "experimental", "exp", "latest", "it", "instruct"}
 
@@ -99,6 +108,28 @@ TOOL_PROMPT = (f"What is the weather in {TOOL_CITY} right now? Use the tool, the
                "answer in one sentence that quotes the report_id it returns.")
 TOOL_RESULT = {"city": TOOL_CITY, "temp_c": 17.3, "condition": "light drizzle",
                "report_id": TOOL_MARKER}
+
+# The second call needs a value from the first call's result, so a model can't make
+# both at once: the turn must have two assistant tool calls in sequence.
+FORECAST_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "get_forecast",
+        "description": "Get tomorrow's forecast for a weather report.",
+        "parameters": {
+            "type": "object",
+            "properties": {"report_id": {"type": "string",
+                                         "description": "report_id from get_weather"}},
+            "required": ["report_id"],
+        },
+    },
+}
+FORECAST_MARKER = "FC-9032-LM"  # only in the second tool result
+FORECAST_RESULT = {"report_id": TOOL_MARKER, "tomorrow": "sunny, 21 °C",
+                   "forecast_id": FORECAST_MARKER}
+HANDOFF_PROMPT = (f"Call get_weather for {TOOL_CITY}. Then call get_forecast with the "
+                  "report_id it returns. Then answer in one sentence that quotes the "
+                  "forecast_id. Make one tool call at a time.")
 
 MANUAL_HEADING = "## Manual checks"
 
@@ -509,6 +540,148 @@ def run_experiments(client: Client, mapping: list[dict], probes: dict) -> list[d
     return results
 
 
+def _wire_call(c: dict, signature: str) -> dict:
+    """An assistant tool call as sent back upstream, with its signature treated as asked."""
+    tc = {"id": c["id"], "type": "function",
+          "function": {"name": c["name"], "arguments": c["arguments"]}}
+    if signature == "keep" and c.get("_extra"):
+        tc["extra_content"] = c["_extra"]
+    elif signature == "dummy":
+        tc["extra_content"] = {"google": {"thought_signature": DUMMY_SIGNATURE}}
+    return tc
+
+
+def handoff_messages(source: dict, signature: str, own: dict | None = None) -> list:
+    """The handed-off turn: the source's call 1 (signature as asked) and its result; with
+    `own`, also the target's call 2, signature as received, and its result."""
+    msgs = [
+        {"role": "user", "content": HANDOFF_PROMPT},
+        {"role": "assistant", "content": source["_text"] or None,
+         "tool_calls": [_wire_call(c, signature) for c in source["_calls"]]},
+        *({"role": "tool", "tool_call_id": c["id"], "content": json.dumps(TOOL_RESULT)}
+          for c in source["_calls"]),
+    ]
+    if own is not None:
+        msgs.append({"role": "assistant", "content": own["_text"] or None,
+                     "tool_calls": [_wire_call(c, "keep") for c in own["_calls"]]})
+        msgs += [{"role": "tool", "tool_call_id": c["id"], "content": json.dumps(FORECAST_RESULT)}
+                 for c in own["_calls"]]
+    return msgs
+
+
+def _call_problems(r: dict, name: str, arg: str, value: str) -> list[str]:
+    calls = r.get("tool_calls") or []
+    if len(calls) != 1:
+        return [f"{len(calls)} tool calls, expected 1"]
+    t = calls[0]
+    out = []
+    if not t.get("has_id"):
+        out.append("tool call has no id")
+    if t.get("name") != name:
+        out.append(f"called {t.get('name')!r}, expected {name!r}")
+    try:
+        args = json.loads(t.get("arguments") or "")
+    except ValueError:
+        args = None
+    got = args.get(arg) if isinstance(args, dict) else None
+    if not isinstance(got, str) or got.strip().lower() != value.lower():
+        out.append(f"{arg!r} is not {value!r}")
+    return out
+
+
+def _http_fail(r: dict, step: str) -> tuple[str, str]:
+    body = r.get("body")
+    err = body[0] if isinstance(body, list) and body else body
+    msg = err.get("error", {}).get("message", "") if isinstance(err, dict) else str(err or "")
+    return "FAIL", f"{step}: HTTP {r.get('status')}" + (f": {msg[:160]}" if msg else "")
+
+
+def _call_stream_verdict(r: dict | None) -> tuple[str, str]:
+    """verdict("stream") for a reply that should be a tool call, which may carry no text."""
+    v = verdict("stream", r)
+    return ("PASS", "") if v == ("FAIL", "empty reply") else v
+
+
+def handoff_source_verdict(r: dict | None) -> tuple[str, str]:
+    v = _call_stream_verdict(r)  # not "tools": it checks get_weather's city the same way below
+    if v[0] != "PASS":
+        return v
+    problems = _call_problems(r, "get_weather", "city", TOOL_CITY)
+    return ("FAIL", "; ".join(problems)) if problems else ("PASS", "")
+
+
+def handoff_verdict(e: dict) -> tuple[str, str]:
+    """PASS: no 400, the target made call 2 itself (step 2), then answered from both
+    results without another call (step 3)."""
+    if e.get("skipped"):
+        return "NOT RUN", e["skipped"]
+    for step, key in (("step 2", "step2"), ("step 3", "step3")):
+        r = e.get(key)
+        if r is None:
+            return "NOT RUN", f"{step} not sent"
+        v = _call_stream_verdict(r) if key == "step2" else verdict("stream", r)
+        if v[0] == "UNAVAILABLE":
+            return "UNAVAILABLE", f"{step}: {v[1]}"
+        if not r.get("ok") and r.get("status"):
+            return _http_fail(r, step)
+        if v[0] != "PASS":
+            return "FAIL", f"{step}: {v[1]}"
+        if key == "step2":
+            problems = _call_problems(r, "get_forecast", "report_id", TOOL_MARKER)
+            if problems:
+                return "FAIL", "step 2: " + "; ".join(problems)
+    r3 = e["step3"]
+    if r3.get("tool_calls"):
+        return "FAIL", "step 3: called a tool again"
+    if not e.get("step3_has_marker"):
+        return "FAIL", f"step 3: reply doesn't quote {FORECAST_MARKER}"
+    return "PASS", ""
+
+
+def run_handoffs(client: Client, mapping: list[dict], wanted: set[str],
+                 signatures: tuple[str, ...], run: dict, save) -> None:
+    """One source call, then for each target and signature mode at most two requests."""
+    ids = {key_of(m["display"]): m["id"] for m in mapping}
+    source_id = ids.get(key_of(HANDOFF_SOURCE))
+    if not source_id:
+        print(f"  {HANDOFF_SOURCE} has no confirmed ID; nothing sent")
+        return
+    tools = [TOOL, FORECAST_TOOL]
+    source = client.chat(f"handoff source {source_id}", stream_body(
+        source_id, [{"role": "user", "content": HANDOFF_PROMPT}], tools=tools, tool_choice="auto"))
+    sv = handoff_source_verdict(source)
+    calls = source.get("tool_calls") or []
+    run["handoff_source"] = {"model": source_id, "result": source, "verdict": list(sv),
+                             "signature_chars": calls[0].get("thought_signature_chars", 0)
+                             if calls else 0}
+    print(f"    source {source_id}: {short(sv)}")
+    save()
+    if sv[0] != "PASS":
+        return
+    for disp in HANDOFF_TARGETS:
+        if wanted and key_of(disp) not in wanted:
+            continue
+        target = ids.get(key_of(disp))
+        for sig in signatures:
+            entry: dict = {"target": target, "display": disp, "signature": sig,
+                           "source_model": source_id}
+            run["handoffs"].append(entry)
+            if not target:
+                entry["skipped"] = "no confirmed model ID"
+                continue
+            label = f"handoff {sig} -> {target}"
+            entry["step2"] = client.chat(label + " step 2", stream_body(
+                target, handoff_messages(source, sig), tools=tools))
+            s2 = entry["step2"]
+            if (_call_stream_verdict(s2)[0] == "PASS"
+                    and not _call_problems(s2, "get_forecast", "report_id", TOOL_MARKER)):
+                entry["step3"] = client.chat(label + " step 3", stream_body(
+                    target, handoff_messages(source, sig, own=s2), tools=tools))
+                entry["step3_has_marker"] = FORECAST_MARKER in (entry["step3"].get("_text") or "")
+            print(f"    {disp} ({sig}): {short(handoff_verdict(entry))}", flush=True)
+            save()
+
+
 def burst(client: Client, model_id: str) -> dict:
     """Send BURST_COUNT tiny calls at once. Sent once; nothing is retried."""
     body = {"model": model_id, "max_tokens": 8,
@@ -640,6 +813,27 @@ def write_report(path: Path, runs: list[dict]) -> None:
             L.append(f"| {t[11:16]} | {e['name']} | `{e['call_model']}` | `{e['reply_model']}` "
                      f"| {names.get(e['signature'], e['signature'])} | {v} |")
 
+    hand = [(r["started_pt"], r) for r in runs if r.get("handoff_source")]
+    if hand:
+        L.append("\n## Multi-step handoffs (DESIGN §16.8)\n")
+        L.append("The source makes tool call 1. The target gets call 1 and its result (signature "
+                 "as shown), must make call 2 itself (step 2), then answer from both results "
+                 f"(step 3, quoting `{FORECAST_MARKER}`). Step 3 is where Google checks the "
+                 "source's signature in a turn that also holds the target's own call. Only the "
+                 "placeholder decides `handoff_targets`; as received is information only.\n")
+        L.append("| Run | Source | Target | Signature | Verdict |")
+        L.append("|---|---|---|---|---|")
+        names = {"keep": "as received", "dummy": "placeholder"}
+        for t, r in hand:
+            src = r["handoff_source"]
+            if src["verdict"][0] != "PASS":
+                L.append(f"| {t[11:16]} | `{src['model']}` | (none sent) | | "
+                         f"source {short(tuple(src['verdict']))} |")
+            for e in r.get("handoffs") or []:
+                L.append(f"| {t[11:16]} | `{e['source_model']}` | `{e['target']}` "
+                         f"| {names.get(e['signature'], e['signature'])} "
+                         f"| {short(handoff_verdict(e))} |")
+
     L.append("\n## Per-minute burst\n")
     bursts = [(r["started_pt"], r["burst"]) for r in runs if r.get("burst")]
     if not bursts:
@@ -699,7 +893,7 @@ def load_runs() -> list[dict]:
     runs = []
     for f in sorted(DATA_DIR.glob("*.json")):
         r = json.loads(f.read_text())
-        if r.get("probes") or r.get("burst"):  # skip list-only runs
+        if r.get("probes") or r.get("burst") or r.get("handoff_source"):  # skip list-only runs
             runs.append(r)
     return runs
 
@@ -724,6 +918,11 @@ def main() -> int:
                     help="rebuild the report from data/probe/*.json; sends no requests")
     ap.add_argument("--no-burst", action="store_true", help="skip the per-minute 429 burst")
     ap.add_argument("--no-experiments", action="store_true", help="skip tool-loop handoffs")
+    ap.add_argument("--handoffs", action="store_true",
+                    help="run only the multi-step handoff probe (DESIGN §16.8); --only limits "
+                         "the targets")
+    ap.add_argument("--signatures", default=",".join(HANDOFF_SIGNATURES),
+                    help="with --handoffs: dummy (placeholder), keep (as received), or both")
     ap.add_argument("--only", action="append", default=[], metavar="DISPLAY_NAME",
                     help="probe only these inventory entries (repeatable)")
     ap.add_argument("--checks", default=",".join(CHECKS),
@@ -740,6 +939,9 @@ def main() -> int:
     wanted = {key_of(n) for n in args.only}
     if wanted - known:
         sys.exit(f"--only: not in the inventory: {sorted(wanted - known)}")
+    signatures = tuple(s.strip() for s in args.signatures.split(",") if s.strip())
+    if not signatures or not set(signatures) <= set(HANDOFF_SIGNATURES):
+        sys.exit(f"--signatures: use a subset of {','.join(HANDOFF_SIGNATURES)}")
 
     if args.rescore:
         runs = load_runs()
@@ -790,7 +992,7 @@ def main() -> int:
            "native_models": [{k: m.get(k) for k in ("name", "displayName", "version",
                               "inputTokenLimit", "outputTokenLimit",
                               "supportedGenerationMethods")} for m in native],
-           "probes": {}, "experiments": [], "burst": None}
+           "probes": {}, "experiments": [], "burst": None, "handoffs": []}
 
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     raw_path = DATA_DIR / (started.strftime("%Y%m%dT%H%M%S") + ".json")
@@ -808,6 +1010,14 @@ def main() -> int:
         print("\nAll generateContent models (display name -> id):")
         for m in sorted(gen, key=lambda m: m.get("displayName", "")):
             print(f"  {m.get('displayName', ''):40} {m['name'].removeprefix('models/')}")
+    elif args.handoffs:
+        try:
+            print("multi-step handoffs ...", flush=True)
+            run_handoffs(client, mapping, wanted, signatures, run, save)
+        finally:
+            run["interrupted"] = sys.exc_info()[0] is not None
+            save()
+            print(f"\nraw: {raw_path}" + (" (partial)" if run["interrupted"] else ""))
     else:
         try:
             for m in mapping:

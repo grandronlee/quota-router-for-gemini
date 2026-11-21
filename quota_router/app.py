@@ -135,6 +135,8 @@ class Proxy:
         self.store = QuotaStore(config.models.values(), self.conn, self.clock)
         self.affinity = AffinityStore(self.conn, self.clock)
         self.router = Router(config, self.store, self.affinity, self.clock)
+        self.router.on_handoff = lambda src, dst, result: self.metrics.inc(
+            "qr_handoff_total", **{"from": src, "to": dst, "result": result})
         self.scrubber = Scrubber([settings.gemini_api_key, settings.proxy_token])
         self.metrics = Metrics()
         self.stats = RequestStats(self.clock.now())
@@ -182,7 +184,8 @@ class Proxy:
                started: float, served_model: str | None = None, path: list[str] | None = None,
                affinity: str | None = None, input_estimate: int | None = None,
                prompt_tokens: int | None = None, output_tokens: int | None = None,
-               first_byte_s: float | None = None, http_path: str | None = None) -> None:
+               first_byte_s: float | None = None, http_path: str | None = None,
+               handoff_from: str | None = None) -> None:
         """One request's metrics, /status counts and its JSON log line (DESIGN §17.2)."""
         now = self.clock.now()
         self.metrics.inc("qr_requests_total", route=route, status=bounded(status, STATUSES), reason=reason)
@@ -204,6 +207,8 @@ class Proxy:
         }
         if http_path is not None:
             fields["path"] = http_path[:200]
+        if handoff_from is not None:
+            fields["handoff_from"] = handoff_from
         request_log.info("request", extra={"fields": fields})
 
     def prune_once(self) -> None:
@@ -411,7 +416,8 @@ class StreamSession:
                       stream=True, started=self.started, served_model=self.served.model.id,
                       path=self.served.path, affinity=self.served.affinity,
                       input_estimate=self.input_estimate, prompt_tokens=self.prompt_tokens,
-                      output_tokens=self.output_tokens, first_byte_s=self.first_byte_s)
+                      output_tokens=self.output_tokens, first_byte_s=self.first_byte_s,
+                      handoff_from=self.served.handoff_from)
 
 
 class ManagedStream(StreamingResponse):
@@ -443,7 +449,7 @@ class ManagedStream(StreamingResponse):
 
 
 def _response_headers(request_id: str, path: list[str], affinity: str | None,
-                      served_model: str | None = None) -> dict[str, str]:
+                      served_model: str | None = None, handoff_from: str | None = None) -> dict[str, str]:
     h = {"x-request-id": request_id}
     if served_model:
         h["x-served-model"] = served_model
@@ -451,6 +457,8 @@ def _response_headers(request_id: str, path: list[str], affinity: str | None,
         h["x-fallback-path"] = ",".join(path)
     if affinity:
         h["x-turn-affinity"] = affinity
+    if handoff_from:
+        h["x-handoff-from"] = handoff_from
     return h
 
 
@@ -669,7 +677,8 @@ def create_app(proxy: Proxy) -> FastAPI:
         await handles.close_except(served_payload)
 
         if isinstance(outcome, RouteFailed):
-            headers = _response_headers(request_id, outcome.path, outcome.affinity)
+            headers = _response_headers(request_id, outcome.path, outcome.affinity,
+                                        handoff_from=outcome.handoff_from)
             if outcome.retry_after_s is not None:
                 headers["Retry-After"] = str(outcome.retry_after_s)
             reason = {429: "quota", 400: "context_length_exceeded", 404: "model_not_found"}.get(outcome.status)
@@ -677,21 +686,32 @@ def create_app(proxy: Proxy) -> FastAPI:
                 reason = "no_enabled_model"
             reason = reason or "unavailable"
             p.record(request_id=request_id, route=route, status=outcome.status, reason=reason, stream=stream,
-                     started=started, path=outcome.path, affinity=outcome.affinity, input_estimate=estimate)
+                     started=started, path=outcome.path, affinity=outcome.affinity, input_estimate=estimate,
+                     handoff_from=outcome.handoff_from)
             return JSONResponse(p.scrubber.obj(outcome.error_body()),
                                 status_code=outcome.status, headers=headers)
 
         if isinstance(outcome, RoutePassthrough):
             b: Body = outcome.payload
-            headers = _response_headers(request_id, outcome.path, outcome.affinity, outcome.model.id)
+            headers = _response_headers(request_id, outcome.path, outcome.affinity, outcome.model.id,
+                                        outcome.handoff_from)
+            if outcome.rewritten and b.status == 400:
+                # Likely a placeholder signature the model won't accept (DESIGN §16.8): returned
+                # unchanged, never retried elsewhere. The fix is to remove it from handoff_targets.
+                log.error("HTTP 400 from %s on a tool turn sent with placeholder signatures (%s); "
+                          "if it is about a thought signature, remove %s from handoff_targets",
+                          outcome.model.id,
+                          f"handed off from {outcome.handoff_from}" if outcome.handoff_from
+                          else "mixed turn", outcome.model.key)
             p.record(request_id=request_id, route=route, status=b.status, reason="passthrough", stream=stream,
                      started=started, served_model=outcome.model.id, path=outcome.path,
-                     affinity=outcome.affinity, input_estimate=estimate)
+                     affinity=outcome.affinity, input_estimate=estimate, handoff_from=outcome.handoff_from)
             headers["content-type"] = b.content_type
             return Response(b.content, status_code=b.status, headers=headers)
 
         assert isinstance(outcome, RouteServed)
-        headers = _response_headers(request_id, outcome.path, outcome.affinity, outcome.model.id)
+        headers = _response_headers(request_id, outcome.path, outcome.affinity, outcome.model.id,
+                                    outcome.handoff_from)
         payload = outcome.payload
         if isinstance(payload, Stream):
             session = StreamSession(p, outcome, payload, request_id=request_id, route=route,
@@ -714,7 +734,7 @@ def create_app(proxy: Proxy) -> FastAPI:
         p.record(request_id=request_id, route=route, status=b.status, reason="served", stream=stream,
                  started=started, served_model=outcome.model.id, path=outcome.path,
                  affinity=outcome.affinity, input_estimate=estimate, prompt_tokens=prompt_tokens,
-                 output_tokens=output_tokens, first_byte_s=first_byte)
+                 output_tokens=output_tokens, first_byte_s=first_byte, handoff_from=outcome.handoff_from)
         headers["content-type"] = b.content_type
         return Response(b.content, status_code=b.status, headers=headers)
 

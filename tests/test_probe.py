@@ -178,5 +178,129 @@ class ReportTests(unittest.TestCase):
         self.assertEqual(text.count("# Phase 0 probe results"), 1)
 
 
+def stream_call(name: str, args: dict, sig: str = "SIG-REAL", text: str = "") -> dict:
+    """A passing streamed tool-call result, with the in-memory parts a real read keeps."""
+    raw = {"id": f"call_{name}", "name": name, "arguments": json.dumps(args),
+           "_extra": {"google": {"thought_signature": sig}}}
+    return {**OK_STREAM, "content_chars": len(text), "has_marker": False,
+            "tool_calls": [p.summarize_tool_call(raw)], "_text": text, "_calls": [raw]}
+
+
+def answer(text: str) -> dict:
+    return {**OK_STREAM, "content_chars": len(text), "tool_calls": [], "_text": text, "_calls": []}
+
+
+SOURCE = stream_call("get_weather", {"city": "Paris"}, sig="SIG-SOURCE")
+STEP2 = stream_call("get_forecast", {"report_id": p.TOOL_MARKER}, sig="SIG-TARGET")
+
+
+class HandoffVerdictTests(unittest.TestCase):
+    def v(self, **over):
+        e = {"target": "t", "signature": "dummy", "source_model": "s", "step2": STEP2,
+             "step3": answer(f"It will be sunny ({p.FORECAST_MARKER})."), "step3_has_marker": True}
+        return p.handoff_verdict({**e, **over})
+
+    def test_pass(self):
+        self.assertEqual(self.v(), ("PASS", ""))
+
+    def test_400_at_step_3_is_a_signature_failure(self):
+        r = {"ok": False, "status": 400, "body": [{"error": {"message": "thought_signature bad"}}]}
+        self.assertEqual(self.v(step3=r)[0], "FAIL")
+        self.assertIn("step 3: HTTP 400: thought_signature", self.v(step3=r)[1])
+
+    def test_503_or_timeout_is_unavailable_not_fail(self):
+        for r in ({"ok": False, "status": 503}, {"ok": False, "status": None,
+                                                  "error": "TimeoutError: timed out"}):
+            with self.subTest(r=r):
+                self.assertEqual(self.v(step2=r, step3=None)[0], "UNAVAILABLE")
+
+    def test_step_2_must_be_its_own_get_forecast_call(self):
+        for bad in (answer("no call"), stream_call("get_weather", {"city": "Paris"}),
+                    stream_call("get_forecast", {"report_id": "other"})):
+            with self.subTest(bad=bad["tool_calls"]):
+                self.assertEqual(self.v(step2=bad, step3=None)[0], "FAIL")
+
+    def test_step_3_must_quote_the_second_result_without_calling_again(self):
+        self.assertEqual(self.v(step3_has_marker=False)[0], "FAIL")
+        self.assertEqual(self.v(step3=STEP2)[0], "FAIL")
+
+    def test_skipped(self):
+        self.assertEqual(self.v(skipped="no confirmed model ID")[0], "NOT RUN")
+
+
+class HandoffMessageTests(unittest.TestCase):
+    def sigs(self, msgs):
+        return [tc.get("extra_content", {}).get("google", {}).get("thought_signature")
+                for m in msgs for tc in m.get("tool_calls") or []]
+
+    def test_placeholder_replaces_only_the_source_call(self):
+        msgs = p.handoff_messages(SOURCE, "dummy", own=STEP2)
+        self.assertEqual(self.sigs(msgs), [p.DUMMY_SIGNATURE, "SIG-TARGET"])
+        self.assertEqual([m["role"] for m in msgs], ["user", "assistant", "tool", "assistant", "tool"])
+        self.assertIn(p.TOOL_MARKER, msgs[2]["content"])
+        self.assertIn(p.FORECAST_MARKER, msgs[4]["content"])
+        self.assertEqual(msgs[4]["tool_call_id"], "call_get_forecast")
+
+    def test_keep_sends_the_source_signature(self):
+        self.assertEqual(self.sigs(p.handoff_messages(SOURCE, "keep")), ["SIG-SOURCE"])
+
+
+class FakeClient:
+    def __init__(self, replies):
+        self.replies = list(replies)
+        self.sent = []
+
+    def chat(self, label, body):
+        self.sent.append((label, body))
+        return self.replies.pop(0)
+
+
+MAPPING = [{"display": d, "id": d.lower().replace(" ", "-")} for d in
+           (p.HANDOFF_SOURCE, "Gemini 4 Hydrogen", "Gemini 3 Flash")]
+
+
+class RunHandoffTests(unittest.TestCase):
+    def run_it(self, replies, wanted=frozenset(), sigs=("dummy",)):
+        client = FakeClient(replies)
+        run = {"handoffs": []}
+        p.run_handoffs(client, MAPPING, set(wanted), sigs, run, lambda: None)
+        return client, run
+
+    def test_one_source_call_then_two_per_target(self):
+        good = [STEP2, answer(f"ok {p.FORECAST_MARKER}")]
+        client, run = self.run_it([SOURCE, *good, *good],
+                                  wanted={p.key_of("Gemini 4 Hydrogen"), p.key_of("Gemini 3 Flash")})
+        self.assertEqual(len(client.sent), 5)
+        self.assertEqual([p.handoff_verdict(e)[0] for e in run["handoffs"]], ["PASS", "PASS"])
+        self.assertEqual(client.sent[1][1]["model"], "gemini-4-hydrogen")
+
+    def test_failed_step_2_skips_step_3(self):
+        client, run = self.run_it([SOURCE, {"ok": False, "status": 503}],
+                                  wanted={p.key_of("Gemini 4 Hydrogen")})
+        self.assertEqual(len(client.sent), 2)
+        self.assertEqual(p.handoff_verdict(run["handoffs"][0])[0], "UNAVAILABLE")
+
+    def test_failed_source_sends_nothing_else(self):
+        client, run = self.run_it([{"ok": False, "status": 503}])
+        self.assertEqual(len(client.sent), 1)
+        self.assertEqual(run["handoffs"], [])
+
+    def test_unconfirmed_target_is_skipped_without_a_request(self):
+        client, run = self.run_it([SOURCE], wanted={p.key_of("Gemini 2.5 Flash")})
+        self.assertEqual(len(client.sent), 1)
+        self.assertEqual(p.handoff_verdict(run["handoffs"][0])[0], "NOT RUN")
+
+    def test_saved_run_has_no_signatures_and_renders(self):
+        import tempfile
+        _, run = self.run_it([SOURCE, STEP2, answer(f"ok {p.FORECAST_MARKER}")],
+                             wanted={p.key_of("Gemini 4 Hydrogen")})
+        saved = json.dumps(p.strip_private(run))
+        self.assertNotIn("SIG-", saved)
+        full = {**ReportTests.RUN, **json.loads(saved)}
+        path = Path(tempfile.mkdtemp()) / "r.md"
+        p.write_report(path, [full])
+        self.assertIn("| `gemini-4-hydrogen` | placeholder | PASS |", path.read_text())
+
+
 if __name__ == "__main__":
     unittest.main()

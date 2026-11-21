@@ -170,6 +170,16 @@ then tiers with spill and pacing, then rules (after a probe of the signals Zoo C
 then automatic adaptations, then a suggestion report. Each step gets its own plan entry,
 approved before code.
 
+Step 1 (DESIGN §16.8, approved 2026-11-21), in order:
+
+1. Handoff probe (`scripts/probe.py --handoffs`), run by hand. It also probes 3.8 Flash and
+   3.1 Flash Lite tool calls again. Results go into probe-results.md.
+2. Router handoffs (`handoff_targets`, `handoff_after_s`, placeholder rewrite, headers, metric)
+   with offline tests.
+3. Schema migration 1→2 (`affinity.turn_id`, `turns` table) and the decision log.
+4. `gemini-smart` in config and `init_config.py`. README profile for Zoo Code Architect/Debug.
+5. Live check: one Zoo Code Architect task on `gemini-smart` with a forced handoff.
+
 Also after v1: alerts (DESIGN §17.2 layer 6), a remote-hosting design (DESIGN §18)
 if the proxy is to run somewhere other than the user's machine.
 
