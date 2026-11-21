@@ -591,6 +591,7 @@ class BodyEstimate:
         self._tail = b""  # last bytes seen, for a \u escape split across chunks
         self._width = 1
         self._commas = self._opens = self._objects = self._colons = 0
+        self.head = b""  # the first 4 bytes, which decide the encoding json.loads would use
 
     @property
     def value(self) -> int:
@@ -602,6 +603,8 @@ class BodyEstimate:
     def feed(self, chunk: bytes) -> None:
         n = len(chunk)
         self.size += n
+        if len(self.head) < 4:
+            self.head = (self.head + chunk[:4])[:4]
         if self._width < 4:  # the patterns need at most 4 bytes, so 5 of carry is enough
             self._width = max(self._width, _char_width(self._tail + chunk[:6]), _char_width(chunk))
         self._tail = (self._tail + chunk[-5:])[-5:]
@@ -643,40 +646,103 @@ def parsed_memory_estimate(raw: bytes) -> int:
     return estimate.value
 
 
+class BodyBuffer:
+    """The body as it arrives, in blocks of at least BLOCK bytes, so a client that sends it a
+    few bytes at a time can't make the per-chunk objects outweigh what is charged (found in
+    review). Small chunks are gathered in one bytearray and moved into a block once it holds
+    BLOCK bytes; larger chunks are kept as they are. `bound(size)` is an upper bound on the
+    memory the buffer keeps for `size` bytes, so it can be charged before they are kept."""
+
+    BLOCK = 65536
+    PER_BLOCK = 64  # a bytes object's header and its list slot, with room to spare
+
+    def __init__(self) -> None:
+        self._blocks: list[bytes] = []
+        self._pending = bytearray()
+
+    @classmethod
+    def bound(cls, size: int) -> int:
+        # A block holds at least BLOCK bytes, except a short one flushed just before a large
+        # chunk, which is itself a block of at least BLOCK: so at most 2 × (size // BLOCK) + 1
+        # blocks (found in review: alternating 1-byte and 64 KB chunks). The bytearray holds
+        # under 2 × BLOCK and grows by at most 1/8 + 7 bytes of spare room. 512: the buffer's
+        # own objects (instance, list, bytearray), about 350 bytes measured.
+        return (size + min(size // 8, cls.BLOCK // 4) + 7
+                + cls.PER_BLOCK * (2 * (size // cls.BLOCK) + 1) + 512)
+
+    def add(self, chunk: bytes) -> None:
+        if len(chunk) >= self.BLOCK:
+            self._flush()
+            self._blocks.append(chunk)
+            return
+        self._pending += chunk
+        if len(self._pending) >= self.BLOCK:
+            self._flush()
+
+    def _flush(self) -> None:
+        if self._pending:
+            self._blocks.append(bytes(self._pending))
+            self._pending = bytearray()
+
+    def take(self) -> bytes:
+        """The whole body. With one block that is the block itself; otherwise a joined copy,
+        which with the blocks is 2× the size, covered by the estimate (at least 6×)."""
+        self._flush()
+        blocks, self._blocks = self._blocks, []
+        return b"".join(blocks)
+
+
+def _not_utf8(head: bytes) -> bool:
+    # json.loads also accepts UTF-16 and UTF-32, but the estimate reads the body as UTF-8
+    # bytes: a UTF-16 character can hold a quote byte, hiding structure (found in review).
+    return json.detect_encoding(head) not in ("utf-8", "utf-8-sig")
+
+
 def _busy() -> JSONResponse:
     return openai_error(503, "server_busy", "too many large requests in progress; retry shortly",
                         "server_error", {"Retry-After": "1"})
+
+
+def _not_utf8_error() -> JSONResponse:
+    return openai_error(400, "invalid_json", "request body must be UTF-8 JSON")
 
 
 async def _read_json(request: Request, limit: int, lease: BodyLease) -> dict | Response:
     declared = request.headers.get("content-length")
     if declared and declared.isdigit() and int(declared) > limit:
         return openai_error(413, "request_too_large", f"request body over {limit} bytes")
-    if declared and declared.isdigit() and not lease.grow_to(int(declared)):
+    if declared and declared.isdigit() and not lease.grow_to(BodyBuffer.bound(int(declared))):
         return _busy()  # before buffering anything
-    chunks: list[bytes] = []
+    buffer = BodyBuffer()
     estimate = BodyEstimate()
+    encoding_checked = False
     try:
         async for chunk in request.stream():
             if estimate.size + len(chunk) > limit:
                 return openai_error(413, "request_too_large", f"request body over {limit} bytes")
             estimate.feed(chunk)
+            if not encoding_checked and len(estimate.head) == 4:
+                if _not_utf8(estimate.head):
+                    return _not_utf8_error()
+                encoding_checked = True
             # The estimate only grows, so once over the whole budget the body could never fit:
-            # 413 before any 503, whatever the load (DESIGN §20.3).
+            # 413 before any 503 (DESIGN §20.3).
             if estimate.value > lease.limit:
                 return openai_error(413, "request_too_large",
                                     "request body would take too much memory once parsed (DESIGN §20.3)")
-            if not lease.grow_to(estimate.size):
+            if not lease.grow_to(BodyBuffer.bound(estimate.size)):  # before the chunk is kept
                 return _busy()
-            chunks.append(chunk)
+            buffer.add(chunk)
     except ClientDisconnect:  # gone while uploading; the caller releases the bytes held so far
         return Response(status_code=499)
+    if not encoding_checked and _not_utf8(estimate.head):  # a body under 4 bytes
+        return _not_utf8_error()
     # Charged before joining and parsing. The estimate is at least 6× the size, so it also
-    # covers the join, which holds the chunks and the joined copy at once (found in review).
+    # covers the join, which holds the blocks and the joined copy at once (found in review).
     if not lease.grow_to(estimate.value):
         return _busy()
-    raw = b"".join(chunks)
-    del chunks
+    raw = buffer.take()
+    del buffer
     try:
         body = json.loads(raw)
     except (ValueError, RecursionError):

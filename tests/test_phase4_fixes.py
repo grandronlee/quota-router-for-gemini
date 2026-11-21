@@ -475,6 +475,33 @@ def test_config_from_the_old_example_still_starts_and_warns(caplog):
     assert p.body_budget.limit == 128 * 1024 * 1024
 
 
+def test_old_config_with_larger_bodies_still_starts_with_a_derived_budget(caplog):
+    # Review finding: with max_body_bytes of 32 MiB and the old key, the default 128 MiB
+    # budget was below the minimum (~192 MiB), so the proxy refused to start, while the
+    # warning only said to remove the old line.
+    import logging
+    from quota_router.config import min_parsed_estimate
+    big = 32 * 1024 * 1024
+    with caplog.at_level(logging.WARNING, logger="quota_router"):
+        cfg = make_config(max_body_bytes=big, max_inflight_body_bytes=96 * 1024 * 1024)
+    assert cfg.max_inflight_parsed_bytes == min_parsed_estimate(big)
+    assert f"max_inflight_parsed_bytes: {min_parsed_estimate(big)}" in caplog.text
+    # an explicit new value is kept, and still checked
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="quota_router"):
+        cfg = make_config(max_body_bytes=big, max_inflight_body_bytes=1, max_inflight_parsed_bytes=1 << 30)
+    assert cfg.max_inflight_parsed_bytes == 1 << 30
+    assert "Remove the old line" in caplog.text and "Replace" not in caplog.text
+
+
+def test_budget_below_the_minimum_names_the_line_to_set():
+    from quota_router.config import ConfigError, min_parsed_estimate
+    big = 32 * 1024 * 1024
+    with pytest.raises((ConfigError, ValueError)) as e:
+        make_config(max_body_bytes=big)
+    assert f"'max_inflight_parsed_bytes: {min_parsed_estimate(big)}'" in str(e.value)
+
+
 def test_unterminated_string_full_of_escaped_quotes_is_estimated_in_linear_time():
     # Regression (review): the string pattern could fail at an unclosed quote and was retried
     # from every later quote, so this took about 1.9 s at 16K pairs and hours at 1 MB,
@@ -608,13 +635,79 @@ def _read_body_measured(raw: bytes, chunk_size: int, budget: int = 1 << 30):
 
 @pytest.mark.parametrize("shape,size,chunk_size", [
     ("tiny strings", 1_000_000, 65536), ("code", 1_000_000, 65536),
+    ("code", 100_000, 2),  # a client sending a few bytes at a time (found in review)
 ])
 def test_reading_a_body_uses_no_more_memory_than_its_lease_holds(shape, size, chunk_size):
     # Regression: the peak while the body is received, estimated, joined and parsed stays
-    # within what the request holds, plus the estimate's fixed scratch (DESIGN §20.3).
+    # within what the request holds, plus the estimate's fixed scratch (DESIGN §20.3). Kept
+    # as a list, 2-byte chunks took ~43 bytes each, far above the ~6× charged for this body.
     body, lease, peak = _read_body_measured(_big_bodies(size)[shape], chunk_size)
     assert isinstance(body, dict)
     assert peak <= lease.held + 512 * 1024, (peak, lease.held)
+
+
+def test_body_buffer_keeps_no_more_than_its_bound_however_the_body_arrives():
+    import tracemalloc
+    from quota_router.app import BodyBuffer
+    for chunk_size in (1, 2, 7, 100, 4096, 65535, 65536, 200_000):
+        tracemalloc.start()
+        try:
+            before = tracemalloc.get_traced_memory()[0]
+            buf, size = BodyBuffer(), 0
+            while size < 500_000:
+                piece = (b"%0*d" % (chunk_size, size))[-chunk_size:]  # a new object, as received
+                buf.add(piece)
+                size += len(piece)
+            del piece  # the caller's reference to the last chunk; only the buffer's counts
+            kept = tracemalloc.get_traced_memory()[0] - before
+        finally:
+            tracemalloc.stop()
+        assert kept <= BodyBuffer.bound(size), (chunk_size, kept, BodyBuffer.bound(size))
+        assert len(buf.take()) == size
+
+
+def test_body_buffer_bound_covers_alternating_small_and_large_chunks():
+    # Review finding: a large chunk flushes the pending bytes first, however few, so 1-byte
+    # and 64 KB chunks in turn made a short block per pair, twice what the bound allowed.
+    import tracemalloc
+    from quota_router.app import BodyBuffer
+    tracemalloc.start()
+    try:
+        before = tracemalloc.get_traced_memory()[0]
+        buf, size = BodyBuffer(), 0
+        for i in range(40):
+            for piece in (b"%d" % (i % 10), b"%065536d" % i):
+                buf.add(piece)
+                size += len(piece)
+        del piece
+        kept = tracemalloc.get_traced_memory()[0] - before
+        blocks = len(buf._blocks)
+    finally:
+        tracemalloc.stop()
+    assert blocks == 80 and blocks <= 2 * (size // BodyBuffer.BLOCK) + 1
+    assert kept <= BodyBuffer.bound(size)
+    # each part of the bound covers its own worst case, not only with the others' slack
+    slack = min(size // 8, BodyBuffer.BLOCK // 4) + 7 + 512
+    assert BodyBuffer.bound(size) >= size + slack + BodyBuffer.PER_BLOCK * blocks
+
+
+@pytest.mark.parametrize("encoding", ["utf-16", "utf-16-le", "utf-16-be", "utf-32", "utf-32-le"])
+def test_body_not_in_utf8_gets_400(encoding):
+    # Regression (review): json.loads accepts UTF-16 and UTF-32, but the estimate reads bytes
+    # as UTF-8. U+2200 is the bytes 22 00 in UTF-16-LE: a quote to the scanner, so the
+    # structure after it was counted as one string, and [{}, …] was estimated at 6× but
+    # parsed at 13× its size.
+    text = '{"model": "fast", "s": "\u2200", "x": [' + ", ".join(["{}"] * 2_000) + "]}"
+    result, lease, _ = _read_body_measured(text.encode(encoding), 4096)
+    assert result.status_code == 400 and b"UTF-8" in result.body
+    assert lease.held <= 4096 * 2  # refused at the first chunk, before the rest was charged
+
+
+def test_short_body_not_in_utf8_gets_400_and_utf8_with_a_bom_is_accepted():
+    result, _, _ = _read_body_measured("1".encode("utf-16-le"), 1)  # 2 bytes: the end-of-body check
+    assert result.status_code == 400 and b"UTF-8" in result.body
+    body, _, _ = _read_body_measured('{"model": "fast"}'.encode("utf-8-sig"), 3)
+    assert body == {"model": "fast"}
 
 
 def test_body_that_can_never_fit_gets_413_even_under_load():

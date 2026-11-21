@@ -1077,15 +1077,43 @@ after the Phase 4 review; it used to need `rpm × 10 < rpd`).
       `""` repeated), instead of 0.8–1.3 s for a 20 MB body at once. Total time is up to 1.4×
       the old pass: 0.75–1.43 s for 20 MB, depending on shape, against 0.79–1.29 s.
   - **Order of checks (approved with the above).** For each chunk: over `max_body_bytes` → 413.
-    Then the running estimate over the whole budget → 413 `request_too_large`. The estimate
-    only grows as chunks arrive, so such a body could never fit. Then the request's share grows
-    to the bytes received, or the request gets 503 `server_busy`. During the upload the share
-    stays at the bytes received, not the running estimate, so slow uploads don't reserve parsed
-    memory early.
+    Then, once 4 bytes are in, a body that isn't UTF-8 → 400 `invalid_json`. Then the running
+    estimate over the whole budget → 413 `request_too_large`. The estimate only grows as
+    chunks arrive, so such a body could never fit. Then the request's share grows to the
+    received bytes' storage (below), or the request gets 503 `server_busy`. That happens
+    before the chunk is kept. During the upload the share stays at that storage, not the
+    running estimate, so slow uploads don't reserve parsed memory early.
   - Once the whole body has arrived, the share grows to the estimate, or the request gets
-    503. Only then are the chunks joined and parsed. The estimate is always at least 6× the
-    size, so it covers the join, which holds the chunks and the joined copy at once (2×, found
+    503. Only then is the body joined and parsed. The estimate is always at least 6× the
+    size, so it covers the join, which holds the blocks and the joined copy at once (2×, found
     in review). The separate 2× charge goes.
+  - **Storage while uploading (approved 2026-11-21, after a third review).** Chunks were kept
+    in a list, and each one costs a bytes object and a list slot: about 43 bytes for a 2-byte
+    chunk. A client that sends a few bytes per packet gets one chunk per packet, because the
+    server only merges data that arrives while the app isn't reading. So the received bytes
+    are kept in blocks of at least 64 KB. Chunks that size or larger are kept as they are.
+    Smaller ones are gathered in one `bytearray` and moved into a block once it holds 64 KB.
+    The share is a bound on that storage, computed from the size alone:
+    - the size;
+    - the bytearray's spare room, at most 1/8 of the size and at most 16 KB;
+    - 64 bytes per block, for at most 2 × (size ÷ 64 KB) + 1 blocks: a short block is only
+      flushed just before a large chunk, which is a block of its own (found in review, with
+      1-byte and 64 KB chunks in turn);
+    - 512 bytes for the buffer's own objects.
+
+    That is about 1.003× the size for large bodies. Measured storage stays within it: at
+    worst 99.6% over chunk sizes of 1 B–200 KB, and also with alternating chunk sizes. A declared `Content-Length` is charged at
+    the same bound, so once that up-front charge succeeds, no later grow during the upload can
+    fail. Moving 64 KB into a block copies it once. That copy is synchronous and part of the
+    fixed process overhead, like the estimate's scratch.
+  - **UTF-8 only (approved with the above).** `json.loads` also accepts UTF-16 and UTF-32,
+    found from the first 4 bytes, but the estimate scans UTF-8 bytes. In UTF-16 a character
+    can contain a quote byte: U+2200 is `22 00`. The scanner then reads the structure after it
+    as one string, so `[{}, …]` was estimated at 6× but took 13× its size (found in review).
+    Bodies whose encoding, as `json.detect_encoding` (the check `json.loads` itself uses) finds
+    it, isn't UTF-8 get 400 `invalid_json`. That is checked at the first 4 bytes, or at the end
+    for shorter bodies. UTF-8 with a byte-order mark is still accepted. JSON exchanged between
+    systems must be UTF-8 (RFC 8259 §8.1), and the OpenAI SDK and httpx send UTF-8.
   - So a body that can never fit gets 413 as soon as the bytes received prove it, whatever the
     load. Before that, it can still get 503 under load (found in review), in two cases:
     - A declared `Content-Length` is charged before any of the body is read. Most clients,
@@ -1098,11 +1126,21 @@ after the Phase 4 review; it used to need `rpm × 10 < rpd`).
 
   The budget now counts estimated memory, under a new key, `max_inflight_parsed_bytes`: the
   default is 128 MB. The old key, `max_inflight_body_bytes` (64 MB of raw bytes in the old
-  example), is still accepted but ignored, with a startup warning naming the new key. Read as
-  parsed memory, the old example's value was below the minimum, so a copied config stopped the
-  proxy (found in review). It must be at least 6 × `max_body_bytes` + 5 KB, so the largest
-  plain-ASCII request (system and user messages, stream options) is always accepted; a test
-  checks it at exactly `max_body_bytes`. A body near
+  example), is still accepted but ignored. Read as parsed memory, the old example's value was
+  below the minimum, so a copied config stopped the proxy (found in review).
+  - **Migration (changed 2026-11-21, after a third review).** If a config sets the old key and
+    not the new one, the budget is the larger of 128 MB and the minimum for its
+    `max_body_bytes`. The startup warning names the exact line to use instead, for example
+    `max_inflight_parsed_bytes: 201331712` for 32 MiB bodies.
+  - Before this change, such a config (32 MiB bodies, for example) still stopped the proxy:
+    the default 128 MB is below its minimum of about 192 MiB, and the warning only said to
+    remove the old line.
+  - A new key set below the minimum is still a startup error, and the error names the line to
+    set.
+
+  The budget must be at least 6 × `max_body_bytes` + 5 KB, so the largest plain-ASCII request
+  (system and user messages, stream options) is always accepted; a test checks it at exactly
+  `max_body_bytes`. A body near
   `max_body_bytes` that holds a wide character can get 413 at the default: at 20 MB with one emoji
   it really would take about 280 MB. Raise both limits together if such bodies are expected.
   A client that declares a large `Content-Length` and uploads slowly holds that much of the
