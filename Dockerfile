@@ -27,7 +27,7 @@ RUN python -m compileall -q quota_router scripts
 FROM base AS test
 COPY requirements-dev.txt ./
 RUN pip install --require-hashes --no-deps -r requirements-dev.txt
-COPY pyproject.toml ./
+COPY pyproject.toml config.example.yaml ./
 COPY tests/ tests/
 USER app
 CMD ["python", "-m", "pytest", "-q", "-p", "no:cacheprovider"]

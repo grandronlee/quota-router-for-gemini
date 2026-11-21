@@ -198,3 +198,33 @@ Run by hand through the Docker proxy (`docker compose up -d --build`), one model
 - `gemini-3.1-flash-lite`: with the placeholder, step 2 **passed**, its first passing tool call in
   any run (220-character signature), but step 3 got a 503. As received, step 2 got a 503. Not
   yet a handoff target. Its tool call needs one more clean pass before it joins `gemini-fast` (§0).
+
+### Live handoff check on `gemini-smart` (PLAN after-v1 step 5), 2026-11-21 03:39–03:44 PT
+
+Run by hand through the Docker proxy, rebuilt at `e837414`. `config.yaml` had the
+`gemini-smart` route and `handoff_targets` from `config.example.yaml` (keys named by model ID).
+Zoo Code profile "OpenAI Compatible", model `gemini-smart`, Architect mode, auto-approve off.
+Task (read-only): read README.md, list docs/, read DESIGN §16.8, summarise handoffs in five bullets.
+
+- Turn start: `gemini-4-hydrogen` and `gemini-3.6-flash` both answered 5xx, and
+  `gemini-3-flash-preview` served it (`reason: spill`, first byte after 35 s). It made the
+  turn's first tool calls.
+- Forced handoff: with the task paused at the first read approval, the proxy was stopped, an
+  `exhausted` row for `gemini-3-flash-preview` (until 00:00 PT) was written, and the proxy started again.
+- Next request: served by `gemini-2.5-flash`, HTTP 200, log `affinity: handoff`,
+  `handoff_from: gemini-3-flash-preview`, and `qr_handoff_total{from="gemini-3-flash-preview",
+  to="gemini-2.5-flash",result="served"} 1`. **No 400**: Google accepted the placeholder for
+  3 Flash's calls. The response header itself wasn't captured; the log field comes from the same value.
+- The next six requests were `mixed` turns served by `gemini-2.5-flash`, all 200: 3 Flash's
+  calls kept getting the placeholder while 2.5 Flash's own calls kept theirs.
+- One 429 (2 ms, no upstream call) once 2.5 Flash's 5 RPM was used up. The owner was only
+  short of RPM room, so there was no handoff, as designed (§16.8, choice 2). Zoo Code retried
+  by itself 46 s later and got a 200.
+- A later turn start fell back past Hydrogen and 3.6 Flash again (both 5xx, first byte after
+  95 s), and 2.5 Flash served it and its pinned follow-up.
+- Result: **PASS**. The task finished with a correct five-bullet summary. Decision log: the main
+  turn row has `reason: spill`, `first_model: gemini-3-flash-preview`, `last_model: gemini-2.5-flash`,
+  `steps: 9`, `errors: 1`, `handoffs: 1`. Zoo Code's separate non-streamed request got its own row.
+- The `exhausted` row was removed afterwards, with the proxy stopped.
+- Observed: while Hydrogen and 3.6 Flash return 503, every `gemini-smart` turn start waits for
+  both to fail (35–95 s here) before a model that works.

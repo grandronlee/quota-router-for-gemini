@@ -4,10 +4,9 @@ A local, OpenAI-compatible router that sends each request to a Gemini API model 
 has free-tier quota. It switches models automatically when one hits its rate limit, and stays
 within Google's published limits for your own single project and key.
 
-**Status: in development.** Two routes: `gemini-fast`, tested live with Zoo Code, and
-`gemini-smart`, which can hand a tool turn to another model when its own runs out. `gemini-smart`
-hasn't had its live Zoo Code check yet. Automatic routing and more clients come later
-([plan](docs/PLAN.md)).
+**Status: in development.** Two routes, both tested live with Zoo Code: `gemini-fast`, and
+`gemini-smart`, which can hand a tool turn to another model when its own runs out. Automatic
+routing and more clients come later ([plan](docs/PLAN.md)).
 
 - [Design](docs/DESIGN.md) · [Implementation plan](docs/PLAN.md) · [Terms of service notes](docs/COMPLIANCE.md)
 - License: [MIT](LICENSE)
@@ -107,7 +106,9 @@ and your `PROXY_TOKEN` as the API key. Set the context window to about **200000*
    Architect, Debug and Orchestrator on `gemini-smart`; Code and Ask on `gemini-fast`.
 
 Zoo Code 3.98.0 keeps Gemini's thought signatures across tool calls, which tool loops need.
-The `gemini-fast` steps were checked live; the `gemini-smart` profile hasn't been yet.
+Both profiles were checked live. For `gemini-smart` that was one read-only Architect task with
+a forced handoff from 3 Flash to 2.5 Flash; the later tool turns stayed on 2.5 Flash with no
+error ([probe results](docs/probe-results.md)). Debug and Orchestrator modes weren't tried.
 
 The smart models allow about 20 requests a day each, and a tool turn stays on the model that
 started it. When that model runs out, or is blocked for longer than `handoff_after_s`
