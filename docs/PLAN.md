@@ -187,6 +187,28 @@ found in the step 5 live check: per-model failure streak and epoch, cooldown 30 
 Offline validation used `.venv/bin/python -m pytest -q` and `docker compose run --build --rm test`.
 Live validation is pending. During the next observed overload, use `attempts` in the request log
 to distinguish an upstream 503 from a timeout and check that later requests follow the cooldown.
+Partial evidence (2026-11-21, during the first Copilot Chat live test on `gemini-smart`):
+`gemini-4-hydrogen` answered one request with a 503 after 17 s and hung on another until the
+120 s timeout. `attempts` told the two apart, both counted, and the cooldown held it at streak 2
+(2 min). Still open: seeing later requests skip it during the cooldown and its recovery.
+
+Approved 2026-11-21, not yet implemented: restoring thought signatures that clients drop
+(DESIGN §23), found in the first Copilot Chat live test (every `gemini-smart` tool turn got a
+400 for a missing signature). In order:
+
+1. Schema migration 2→3 (`affinity.signature`), the limits (16,384 characters each, 16 MiB in
+   total), database file `0600`.
+2. Capture: non-streamed in `app.py`; streamed in `StreamSession` by `(choice, tool_call)`
+   index, with the settling write before the stream's last bytes.
+3. Restore in the router: one copy-on-write rewrite that replaces `with_placeholder_signatures`
+   (stored signature for the serving model's own calls, placeholder otherwise), with the
+   estimate from the body sent.
+4. `qr_thought_signatures_total{model, action}`, `signatures` in `attempts` and `/status`.
+5. Offline tests from DESIGN §23.7, including the Copilot-shaped regression test.
+6. Validation: `.venv/bin/python -m pytest -q`, `docker compose run --build --rm test`, then
+   `code-reviewer-deep` (two-step stream write, ID reuse).
+7. Live check: the Copilot agent-mode request on `gemini-smart` from DESIGN §23.7, then a short
+   Zoo Code task. Results go into probe-results.md.
 
 Also after v1: alerts (DESIGN §17.2 layer 6), a remote-hosting design (DESIGN §18)
 if the proxy is to run somewhere other than the user's machine.

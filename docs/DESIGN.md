@@ -1574,3 +1574,237 @@ busy healthy model still gets today's 30 s cooldown from a 503 that arrives afte
    failures that don't count keep today's 30 s; a stream cut off without `[DONE]` is neutral;
    400/401/403/422 end a streak; the one-at-a-time rule also applies after the cooldown ends;
    the send phase comes from httpx's `trace` extension, and an unknown phase doesn't count.
+
+## 23. Restoring thought signatures that clients drop — approved 2026-11-21
+
+**Problem** (live check, 2026-11-21). VS Code Copilot Chat (custom endpoint, Chat Completions,
+route `gemini-smart`) fails every tool turn. Copilot read a file with its `read_file` tool and
+sent the history back, and Google answered 400 `INVALID_ARGUMENT`: "Function call is missing a
+thought_signature in functionCall parts … position 5". The log line was `400 passthrough
+served=gemini-3-flash-preview aff=pinned`, `attempts: rejected/400`. The turn's owner served it
+with the client's body unchanged, so Copilot had dropped `extra_content.google.thought_signature`
+from the assistant tool calls it sent back. Zoo Code keeps signatures (Phase 0), and Copilot chat
+without tools works. §5.1 planned this case: "the proxy stores each signature with its affinity
+record and re-attaches it".
+
+**Change.** As a response passes through, the proxy stores each tool call's signature with
+the call's affinity record. When a later request carries that call in its active turn without a
+signature, the proxy puts the stored one back in the body it sends upstream, but only when the
+model that made the call is the one being called. If nothing is stored, the call gets
+Google's placeholder (`skip_thought_signature_validator`, §16.8). The placeholder alone was
+rejected as the main fix, because Google warns that a missing signature may degrade the
+model's answers, and the placeholder only skips the check.
+
+### 23.1 Capture
+
+What is stored for each call is its **signature state**:
+
+| Value | Means | Restored as |
+|---|---|---|
+| the signature | the response carried one for this call | that signature |
+| `''` (empty) | the response is known to carry none for this call | nothing (the call is sent as received) |
+| `NULL` | not known: not seen yet, not stored (§23.2), cleared, or a record from before version 3 | the placeholder |
+
+The empty state matters. The 2.5 models return no signatures, and when Gemini makes several
+calls in one response only the first carries one (Google's docs on parallel calls). Clients send
+those calls without a signature today and Google accepts them, so the proxy leaves them alone.
+
+- **Where:** `extra_content.google.thought_signature` on each tool call: a string that passes
+  §23.2's checks. Anything else (a missing key, null, an empty string, a non-string) means no
+  signature.
+- **Non-streamed** (`app.py`, where `tool_call_ids(obj, "message")` runs today): the ID and the
+  signature are read together from `choices[].message.tool_calls[]`. A call with no signature is
+  stored as `''`. Written by the existing `Router.complete()` → `AffinityStore.record()`, in the
+  same row and the same transaction as the affinity record, before the response is returned.
+- **Streamed** (`StreamSession`): tool-call deltas are matched by `(choice index, tool_call
+  index)`, since in the OpenAI format only a call's first delta has to carry its `id`. In Phase 2
+  the whole call, signature included, came in one delta (probe-results). Rules:
+  - When `complete()` records a call's ID (at the usage chunk, or later for IDs that came after
+    it, §20.5), the signature seen so far is written with it, or `NULL` if none yet.
+  - Before the stream's last bytes go to the client (`[DONE]`, an error event, or the cut-off
+    error event, where `_complete_if_needed()` runs today), one more write settles every
+    recorded call still at `NULL`: the signature if one arrived late, `''` if none did. It runs
+    only if such a call exists, which in Gemini's case means calls with no signature.
+  - A call whose deltas carry two different signatures is stored as `NULL` (not resolvable, so
+    it gets the placeholder) and counted as `conflict`. Repeating the same value is fine. The
+    proxy doesn't join fragments: Google sends the signature whole.
+  - A client that disconnects first still gets the settling write in `finish()`. If that write
+    fails or the process stops, the calls stay `NULL`, the safe state.
+- The settling write is an `UPDATE … WHERE tool_call_id = ? AND model_id = ? AND signature IS
+  NULL`, so it can't overwrite a record that a later response wrote for the same ID (§23.5).
+
+### 23.2 Storage
+
+- **Schema version 3** (`db.py`: `SCHEMA_VERSION = 3`, `MIGRATIONS[2]`): `ALTER TABLE affinity
+  ADD COLUMN signature TEXT`. Rows from version 2 keep `NULL`, so their calls get the placeholder,
+  which is what they get today in a handoff. A version-1 file runs 1→2 then 2→3 in the same
+  startup transaction; a new file runs both. As in §20.10, a version-3 file is refused by an
+  older proxy, so going back means deleting the file (open tool turns then get the placeholder or
+  route as `unknown`).
+- **Column, not a table.** The signature belongs to exactly one affinity record: same key, same
+  24 h lifetime, written in the same transaction, deleted by the same prune. A separate table
+  would need its own pruning and could hold a signature whose affinity row is gone.
+- **Per signature:** at most 16,384 characters, from `[A-Za-z0-9+/=_-]` (base64 and URL-safe
+  base64), so characters and bytes are equal. Phase 0 and 1a saw 196 to 1,036. A value
+  that breaks either rule is stored as `NULL` and counted as `too_large` or `invalid`. It isn't
+  cut short, since part of a signature is worth less than the placeholder.
+- **In total:** at most 16 MiB of signatures across all live rows (at 1 KB each, about 16,000
+  calls; the expected load is a few thousand a day). `record()` checks
+  `SUM(length(signature))` in its transaction (a scan of at most a few tens of thousands of
+  rows). Over the cap, the oldest signatures are set to `NULL` until it fits, and the count goes
+  to `evicted`. The affinity rows stay, so pinning still works. Oldest first because active
+  turns are recent.
+- **Deletion:** with the affinity row, older than 24 h, in the hourly prune (§20.10). Nothing
+  new to schedule.
+- The `_SAFE_TO_DELETE` message stays true: deleting the file loses open tool turns, whose
+  dropped signatures then get the placeholder.
+
+### 23.3 Privacy and scrubbing
+
+A signature is an opaque blob Google derives from the model's reasoning. The proxy treats it
+like prompt text (§17.1), not like metadata:
+
+- Never in a log line, log message or exception text, `/status`, `/metrics`, the dashboard,
+  429 captures (§20.7), or an error body. Counts only. SQLite's errors don't include bound
+  parameters, and no log call formats a body, record or call map.
+- Never sent back to a client. It goes only upstream, in a request authenticated with the
+  proxy's own key, to the model that made the call.
+- **Database file permissions:** the file now holds content-derived data, so at startup it is
+  set to `0600` and its directory to `0700`, as for 429 captures. SQLite creates the `-wal` and
+  `-shm` files with the database's permissions.
+- Scrubbing (§20.7) needs no new rule, since a signature never reaches a log or an error body.
+  The tests check that, including the exception paths.
+
+### 23.4 Restoring
+
+Only assistant tool calls in the **active turn** (§5.1) are considered; earlier turns aren't
+validated by Google, so they are sent as received. For each such call, in the body for the model
+being called (decided per candidate, since a handoff target gets a different body):
+
+| The client sent | The call's record | Sent upstream |
+|---|---|---|
+| a signature | any | §16.8 as today: the placeholder if another model made the call (handoff or `mixed`), else unchanged |
+| none | made by this model, signature stored | **the stored signature** (`restored`) |
+| none | made by this model, `''` | unchanged |
+| none | made by this model, `NULL` | the placeholder (`placeholder`) |
+| none | made by another model | the placeholder (§16.8; counted there, not here) |
+| none | unknown ID, no ID, or the lookup failed | the placeholder (`placeholder`) |
+
+- **A signature the client sent always wins** over a stored one. The client is the source of the
+  history, and Zoo Code's requests stay exactly as today.
+- **Only the signature of the model that made the call.** "This model" means the configured
+  model ID in the affinity record equals the candidate's ID. A stored signature is never sent to
+  another model: a handoff target gets the placeholder for the owner's calls (§16.8) and its own
+  stored signatures for its own calls. In a `mixed` turn the latest owner gets its own calls back
+  and the placeholder for the rest.
+- **Unpinned turns too.** A turn routed as `unknown` (no ID known, the owner no longer
+  configured, or the lookup failed) gets the placeholder on its calls that lack a signature, for
+  whichever candidate serves it. Without it, that request would get a certain 400.
+- **One lookup.** `_pin` already reads `lookup_records(ids)` for the active turn's IDs; the
+  record gains `signature`. No second read. A failed read is today's `unknown` path, with every
+  missing signature getting the placeholder.
+- **The client's request is never changed.** The body is built copy-on-write, as
+  `with_placeholder_signatures` does: only the changed messages and calls are copied, and the
+  request itself is returned when nothing changes. The two rewrites become one function that
+  takes the serving model's ID and the records and returns the body and its counts.
+- **Estimate:** a body with restored signatures is longer than the client's. As for handoffs, a
+  candidate's context fit, TPM check and reservation come from the body it is sent.
+- §16.8's "the only place the proxy changes a request body other than `model`" and §20.3's list of
+  upstream body changes get this case added.
+- **A 400 after restoring** is still returned unchanged and never retried on another model
+  (§5.1). The error log line names the model and the counts (no values), and suggests removing
+  a handoff target only when the body held placeholders for another model's calls, as today.
+
+### 23.5 Failure paths
+
+- **Store write fails** (`record()`): one transaction, so the affinity record and its signature
+  are lost together, as today. The next request routes as `unknown`, and its missing signatures
+  get the placeholder. Logged, counted in `qr_state_errors_total`, never fails the response.
+- **Settling write fails** (streams): the calls stay `NULL`, so a call without a signature gets
+  the placeholder instead of being sent as received. Logged and counted; the affinity record
+  stays.
+- **Read fails:** the turn routes as `unknown` (§5.2) with placeholders, as above.
+- **An ID seen twice** (§20.6): the upsert already overwrites `model_id`, `created_at` and
+  `turn_id`; it overwrites `signature` too, `''` and `NULL` included, so a stale signature never
+  sits on a record that names another model. Still counted in `qr_tool_call_id_reused_total`.
+  The settling write's `model_id` and `IS NULL` guard keeps a late write from one response from
+  landing on another model's record.
+- **Concurrent requests** in one turn only read. A follow-up can't arrive before its calls are
+  recorded, because `complete()` runs before the response's last bytes (§20.5). If it did, it
+  would route as `unknown` with placeholders.
+- **Restart:** records are in SQLite, so a restart between a tool call and its follow-up
+  restores as usual. A stream cut off by the restart leaves its calls `NULL`.
+- **Older database:** version-2 rows are `NULL` (placeholder), version-1 rows have no `turn_id`
+  either (§16.8 1d). Nothing breaks.
+- **Some signatures present, some missing:** decided per call by the table above. A turn can
+  therefore mix the client's signatures, restored ones and placeholders.
+- **Copilot changes the IDs:** if it sent back IDs it made up, nothing would match and every
+  call would get the placeholder: Option B in practice, visible in the counts. The live log
+  showed `aff=pinned`, so Copilot keeps them.
+
+### 23.6 Visibility
+
+- **Metric** `qr_thought_signatures_total{model, action}`, with `model` the configured model ID
+  (for `stored`, the one that made the call; for the rest, the one called) and `action` from a
+  fixed list: `stored`, `none` (stored as `''`), `too_large`, `invalid`, `conflict`, `evicted`
+  (capture); `restored`, `placeholder` (restore, for calls the client sent without a
+  signature). §16.8's placeholders for another model's calls are not counted here; they
+  show in `qr_handoff_total` and `x-turn-affinity`.
+- **Log line:** an attempt's entry in `attempts` (§22.4) gets `signatures: {"restored": n,
+  "placeholder": n}` when either is above 0. Counts only, no IDs or values.
+- **`/status`:** `signatures` with the restore and capture counts since start, next to
+  `state_errors`. The dashboard shows nothing new.
+
+### 23.7 Not changed, cost, tests
+
+- Not changed: pinning, handoff rules, the turn log, `x-turn-affinity` values, Zoo Code's
+  requests (it sends its signatures, so nothing is restored), streaming of responses.
+- No config switch. The behaviour only changes active-turn calls the client sent without a
+  signature, and a call whose response had one gets a 400 from Gemini 3 and 4 today.
+- Cost: no extra upstream requests. One more column per affinity row (about 1 KB per Gemini 3
+  call), and for streams with calls that have no signature, one extra UPDATE.
+- Offline tests (injected clock, temporary SQLite, `respx`):
+  - **Regression:** a Copilot-shaped follow-up (assistant tool call without `extra_content`, then
+    its tool result) on a pinned turn sends the stored signature upstream. It fails on today's
+    code, which sends the body unchanged.
+  - capture, non-streamed: one call; parallel calls (first with a signature, second stored as
+    `''`); `too_large` and `invalid` stored as `NULL`;
+  - capture, streamed: signature in the ID's delta; signature in a later delta matched by index;
+    no signature (`''` at `[DONE]`); two different values (`conflict`); a stream cut off or a
+    client disconnect before the end (`finish()` settles; a failed settle leaves `NULL`);
+  - restore: each row of §23.4's table; a stored signature never sent to another model (handoff
+    target, `mixed` turn); unknown IDs and a failed lookup get the placeholder; a client
+    signature isn't replaced; earlier turns untouched; the client's request is deep-equal before
+    and after; the estimate comes from the body sent;
+  - migration 2→3 on a version-2 file with affinity rows (they read as `NULL`); 1→3; a new file;
+  - an ID recorded twice overwrites the signature; the settling write doesn't touch another
+    model's record;
+  - the total cap clears the oldest signatures and keeps the rows; the prune deletes them with
+    the row;
+  - a failed record, settling write or lookup doesn't fail the request and leads to the
+    placeholder;
+  - privacy: a known signature value never appears in captured log output (exception paths
+    included), `/status`, `/metrics`, dashboard data or an error body;
+  - metric and log counts.
+- **Live check**, by hand (a few `gemini-smart` requests out of 20 RPD per smart model): in
+  Copilot agent mode on `gemini-smart`, "Read quota_router/quota.py and explain in 5 bullet
+  points what `try_reserve` does. Don't edit any files." Pass: the tool turn returns 200 with
+  an answer, the follow-up's `attempts` entry shows `signatures.restored` ≥ 1, and no 400. Then
+  one short Zoo Code task on `gemini-fast`, which should show no `signatures` field. Results go
+  into probe-results.md.
+- Docs at implementation: §5.1's last bullet, §15 (Copilot), §16.8 and §20.3 point here; README's
+  Copilot section drops any "agent mode doesn't work" note.
+
+**Approved as proposed (2026-11-21):**
+
+1. Store the signature as a column on `affinity` (migration 2→3) rather than in a new table.
+2. Three signature states: stored, `''` (none in the response, sent as received) and `NULL`
+   (unknown, placeholder).
+3. Limits: 16,384 characters per signature in the base64 alphabet, 16 MiB in total with the
+   oldest cleared first.
+4. A signature the client sent always wins; a stored one goes only to the model that made the
+   call; unpinned turns get the placeholder on missing signatures.
+5. Database file `0600` and its directory `0700`.
+6. No config switch.
+7. Review at implementation: `code-reviewer-deep`, since the stream capture is a two-step write
+   that can partly fail and depends on how ID reuse is handled.
