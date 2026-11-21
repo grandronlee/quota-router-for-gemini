@@ -1435,3 +1435,124 @@ the WSL `/mnt/c` warning, limits and disclaimers.
 ### 21.9 Not in Phase 3
 
 Alerts (§17.2 layer 6), remote hosting (§18), `gemini-smart` and `gemini-auto` (§16).
+
+## 22. Overloaded models: a growing 5xx cooldown — approved 2026-11-21 with adjustments
+
+**Problem** (live check, [probe-results.md](probe-results.md), 2026-11-21). On that day
+`gemini-4-hydrogen` and `gemini-3.6-flash` answered every request with 503 or a timeout. A
+model that fails gets a fixed 30 s cooldown (§5 step 4). Zoo Code starts a turn every minute or
+more, so the cooldown has always ended by the next turn: every `gemini-smart` turn start called
+both again and waited for them to fail before a working model answered (35 s and 95 s in the
+run). Each such call also uses one of the request's three attempts, keeps a scarce RPD
+reservation (the request may have used quota), and can take up to 120 s if it hangs (§9).
+
+**Change.** The 5xx cooldown grows while a model keeps failing. After its first 30 s, a model
+in a cooldown is tried only as a last resort, by one request at a time.
+
+### 22.1 What counts
+
+Each model keeps a failure **streak** (in memory, like today's cooldowns; a restart clears it).
+
+- **Counts as a failure:** 500/502/503/504 before the first event; a 5xx or code-less error
+  event, first or mid-stream (§8, §20.4); a stream that ends empty; and a timeout that used the
+  attempt's **full** budget **after the request was sent**, while waiting for the response
+  headers or the first data event.
+- **Doesn't count** (keeps today's state handling, changes neither streak nor epoch, §22.3):
+  connect, pool and write timeouts and other errors before the request was fully sent
+  (this machine's network, not the model); a timeout cut short by the request deadline (no
+  cooldown today either); the client cancelling or disconnecting; and a stream that stops without
+  `[DONE]` or an error event (the cause is unknown).
+- **Recovery** (sets the streak to 0 and ends the 5xx cooldown):
+  - a non-streamed 2xx;
+  - a stream that ends cleanly with `[DONE]`. Not its first data event: a model that keeps
+    breaking mid-stream must still build a streak;
+  - an error answer from the model before or during a stream that isn't a counting failure:
+    429 (which still sets its own quota cooldown, §6), and 400/401/403/422 returned unchanged.
+    The model answered, so it is reachable.
+- **Send phase.** Whether a timeout happened after the request was sent comes from httpx's
+  `trace` extension: the attempt notes when the request body was fully written. If that
+  can't be determined, the timeout doesn't count, which errs towards today's behaviour.
+
+### 22.2 Cooldown and order
+
+- **Length:** 30 s × 4^(streak − 1), capped at 15 min: 30 s, 2 min, 8 min, 15 min. Factor 4
+  because turn starts are minutes apart; with doubling, a model would fail about six times
+  before its cooldown outlasted the gap between turns.
+- **Hard, then soft.** The first 30 s after a counted failure blocks the model as today. For
+  the rest of the cooldown the model is only moved to the back: after the normal pass over the
+  candidates, if nothing served and attempts and time remain, the models skipped only for the
+  soft part of their cooldown are tried, in route order. A route whose working models are all
+  busy, or a pinned turn whose only candidate is its owner, therefore still reaches a model
+  that may have recovered, instead of getting 503 for up to 15 min.
+- **One recovery attempt at a time.** While a model's streak is above 0 and its hard 30 s are
+  over (soft part, or after the cooldown ends), at most one request across all concurrent
+  requests may have an attempt in flight on it. Others skip it as `recovering`, which counts
+  like the soft part: tried last, if the slot is free by then.
+  - The slot is taken under the router lock with the same reservation check as any attempt:
+    quota, remaining attempts and the deadline are checked again just before sending.
+  - It is released when the attempt's routing outcome is known (the first data event of a
+    stream, a non-streamed response, or a failure) and in a `finally` on cancellation, so a
+    disconnected client can't hold it. The reservation is released as today.
+  - A stream's recovery is recorded later, at `[DONE]`, under the epoch rule below.
+- **Handoffs** (§16.8) need no change: an owner in a 5xx cooldown already hands off. With the
+  soft rule, an owner whose targets all fail is still tried last.
+- **No synthetic requests.** A model is retried only by a real request.
+
+### 22.3 Stale outcomes
+
+Each model has an **epoch**. An attempt notes the epoch when its reservation is taken. Its
+outcome changes the streak or the 5xx cooldown only if the epoch is still the same, and an
+outcome that changes state (a failure, or a recovery while the streak is above 0) moves the
+epoch on. An outcome that changes nothing (a recovery at streak 0) leaves the epoch alone, so a
+busy healthy model still gets today's 30 s cooldown from a 503 that arrives after other 200s.
+
+- Two requests in flight when a model starts failing count as one failure.
+- A slow success from before newer failures can't reset the streak, and a delayed failure from
+  before a recovery can't put the recovered model back into cooldown.
+- A stale outcome still does everything else it does today: the RPD reservation, the 429 quota
+  state (§6), and the request's own handoff decision (§16.8), which uses the request's own result.
+
+### 22.4 Visibility
+
+- `/status` and the dashboard show each model's `unavailable_streak` next to its cooldown.
+- The request log line gets `attempts`: one entry per upstream call, in order, with `model`
+  (the configured model ID), `outcome`, `status` (the HTTP status when there is one, else null)
+  and `ms` (elapsed milliseconds). `outcome` is one of `ok` (non-streamed 2xx), `stream_complete`
+  (`[DONE]`), `stream_error` (error event after the first byte), `stream_incomplete` (ended
+  without either), `client_cancelled`, `rate_limited`, `unavailable` (5xx or error event before
+  the first byte), `timeout`, `not_sent`, `rejected` (4xx returned unchanged), `not_found`.
+  No payloads, headers or upstream error text (§17.1). The live check couldn't tell whether
+  Hydrogen's 95 s were a 503 or a hang, and this would show it.
+
+### 22.5 Not changed, cost, tests
+
+- Not changed: `max_attempts`, the 120 s time to first byte, the 30 s base. A shorter time to
+  first byte for smart models was rejected: they think before their first byte (Hydrogen took
+  about 60 s in Phase 0), so it would cut off answers that were coming.
+- Cost: a model that recovers may be passed over for up to 15 min while other candidates serve.
+  It is still tried whenever nothing else can serve.
+- Offline tests (injected clock):
+  - the cooldown sequence (30 s, 2 min, 8 min, cap);
+  - what counts: a full-budget timeout after sending counts; connect, pool and write timeouts,
+    a deadline-shortened timeout and a client cancellation don't;
+  - recovery on a non-streamed 2xx, on `[DONE]` (not on the first event), and on a 429 or 400;
+  - a mid-stream 5xx counts, and a stream that stops without `[DONE]` is neutral;
+  - races: two parallel failures count once; an old in-flight success doesn't reset; a delayed
+    failure after a recovery doesn't set a cooldown;
+  - one recovery attempt: concurrent requests don't both take the slot; the slot is freed on
+    cancellation and after a failure;
+  - the last-resort pass runs only when nothing else served, within `max_attempts` and the
+    deadline; a hard-blocked model is never tried; a pinned owner in a soft cooldown is tried
+    after its handoff targets fail;
+  - `attempts` in the log line (outcomes, status, no error text), and `unavailable_streak` in `/status`.
+- Docs at implementation: §5 step 4, §8, §9 and the §14 rows for overloaded models and network
+  errors point here.
+
+**Approved with these choices (2026-11-21):**
+
+1. Growth ×4 from 30 s, capped at 15 min.
+2. Only a full-budget timeout after sending counts; connect, pool and write timeouts, deadline
+   cuts and cancellations don't. Streams recover at `[DONE]`, not at the first event.
+3. Hard 30 s, then soft with a last-resort pass and one recovery attempt per model at a time;
+   stale outcomes ignored through the epoch.
+4. `attempts` in the log line in the same change, with a fixed outcome set and no error text.
