@@ -144,7 +144,7 @@ class Proxy:
         self.metrics = Metrics()
         self.stats = RequestStats(self.clock.now())
         self.auth_failures = 0
-        self.body_budget = BodyBudget(config.max_inflight_body_bytes)
+        self.body_budget = BodyBudget(config.max_inflight_parsed_bytes)
         capture_dir = Path(config.db_path).parent / "429" if config.db_path != ":memory:" else None
         self.captures = Captures(capture_dir, self.scrubber, self.clock.now) if capture_dir else None
         self.client: httpx.AsyncClient | None = None
@@ -599,6 +599,11 @@ async def _read_json(request: Request, limit: int, lease: BodyLease) -> dict | R
             chunks.append(chunk)
     except ClientDisconnect:  # gone while uploading; nothing was reserved
         return Response(status_code=499)
+    # Joining holds the chunks and the joined copy at once: charge 2× the raw size first
+    # (found in review). The estimate's own scratch memory is not covered yet (DESIGN §20.3,
+    # open item).
+    if not lease.grow_to(2 * size):
+        return _busy()
     raw = b"".join(chunks)
     del chunks
     # Charged before parsing, since the parse is what can take many times the raw size.

@@ -769,6 +769,8 @@ are not offered.
   - A failed handoff (targets tried, none served) still sends `x-handoff-from`.
   - The owner's wait is measured from when its state was read for this request, not from the
     gate's own clock reading, so a 60 s cooldown set by this request's 429 counts in full.
+    After a 429 it is measured from when the 429 is applied, since its cooldown runs from
+    there: a 429 that took 45 s to arrive with a 20 s delay is a 20 s wait (found in review).
   - Each candidate's input estimate (context fit, TPM, reservation) comes from the body it is
     sent. Placeholders are much shorter than real signatures (up to about 1 KB each in 1a).
 - New tool calls are recorded for B, so B owns the turn from then on. The existing `mixed`
@@ -1022,7 +1024,7 @@ after the Phase 4 review; it used to need `rpm × 10 < rpd`).
   from arrival, so routing gets only the time the upload left.
 - **Body memory budget** (added 2026-11-21 in Phase 4). `max_body_bytes` limits one request,
   not many at once, and a body is held as bytes, parsed JSON and the upstream request. So
-  request bodies share a budget, `max_inflight_body_bytes` in `config.yaml` (default 128 MB; a
+  request bodies share a budget, `max_inflight_parsed_bytes` in `config.yaml` (default 128 MB; a
   startup error if below 6 × `max_body_bytes` + 5 KB, see below). A request takes its declared `Content-Length` up
   front, or else each chunk as it arrives. If that would go over the budget, the proxy answers
   503 `server_busy` with `Retry-After: 1` at once, before buffering more. Nothing is reserved
@@ -1044,9 +1046,20 @@ after the Phase 4 review; it used to need `rpm × 10 < rpd`).
     retried from every later quote: quadratic, and it blocked the event loop (second review).
   - It covers every measured shape (estimate ÷ peak 1.07–2.0) and takes under 1 ms for
     agent-sized bodies, about 0.5 s at 20 MB.
+  - Before the chunks are joined, the share grows to 2 × the raw size, or the request gets
+    503 `server_busy`. That covers the join, which holds the chunks and the joined copy at
+    once (found in review).
+  - **Open (found in the second review of that fix, 2026-11-21):** the estimate itself isn't
+    covered. Its string-stripping `re.sub` builds a piece per string before joining, so it
+    briefly takes about 44× the raw size for a body of `"",0,` repeated, 28× for `"ab",12,`
+    and 10× for tool messages (tracemalloc, 2 MB bodies), above the estimate it then charges
+    (38×, 26×, 12×). A bounded-memory estimate is a design change to approve before code.
   An estimate over the whole budget gets 413 `request_too_large`, because it could never fit;
-  one over what is left gets 503 `server_busy`, as above. `max_inflight_body_bytes` now counts
-  estimated memory: the default is 128 MB (was 64 MB of raw bytes). It must be at least
+  one over what is left gets 503 `server_busy`, as above. The budget now counts estimated
+  memory, under a new key, `max_inflight_parsed_bytes`: the default is 128 MB. The old key,
+  `max_inflight_body_bytes` (64 MB of raw bytes in the old example), is still accepted but
+  ignored, with a startup warning naming the new key. Read as parsed memory, the old example's
+  value was below the minimum, so a copied config stopped the proxy (found in review). It must be at least
   6 × `max_body_bytes` + 5 KB, so the largest plain-ASCII request (system and user messages,
   stream options) is always accepted; a test checks it at exactly `max_body_bytes`. A body near
   `max_body_bytes` that holds a wide character can get 413 at the default: at 20 MB with one emoji

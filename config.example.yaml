@@ -11,7 +11,7 @@ max_attempts: 3
 db_path: data/quota.sqlite3   # RPD counts, exhausted state, tool affinity
 billing: free                 # the only supported value: use a key from a project without billing
 max_body_bytes: 20971520      # 20 MB per request
-max_inflight_body_bytes: 134217728  # 128 MB: estimated memory of all request bodies at once (DESIGN §20.3)
+max_inflight_parsed_bytes: 134217728  # 128 MB: estimated memory of all request bodies at once (DESIGN §20.3)
 
 models:
   lite-3-5: { id: gemini-3.5-flash-lite, rpm: 15, tpm_input: 250000, rpd: 500,

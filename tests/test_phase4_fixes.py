@@ -299,7 +299,7 @@ def test_a_user_message_after_an_assistant_reply_starts_a_new_turn():
 # ---- follow-up: request bodies share a memory budget (DESIGN §20.3) ----------
 
 def small_budget_proxy(**kw):
-    return make_proxy(max_body_bytes=1000, max_inflight_body_bytes=12_000, **kw)
+    return make_proxy(max_body_bytes=1000, max_inflight_parsed_bytes=12_000, **kw)
 
 
 def test_request_over_the_shared_budget_gets_503_busy_before_buffering():
@@ -314,6 +314,32 @@ def test_request_over_the_shared_budget_gets_503_busy_before_buffering():
     assert r.json()["error"]["code"] == "server_busy"
     assert up.requests == [] and held == 11_000  # nothing called, nothing kept
     assert status["requests"]["by_reason"] == {"busy": 1}
+
+
+def test_scratch_copies_are_charged_before_the_estimate_runs(monkeypatch):
+    # Review finding: joining the chunks and the estimate's string-stripped copy allocated up
+    # to 2× more while the lease held only the raw size. The lease must cover 2× raw first,
+    # and a request that can't get it is busy before anything is copied.
+    import quota_router.app as appmod
+    real = appmod.parsed_memory_estimate
+    seen: list[tuple[int, int]] = []
+
+    def spy(raw):
+        seen.append((len(raw), p.body_budget.used))
+        return real(raw)
+
+    monkeypatch.setattr(appmod, "parsed_memory_estimate", spy)
+    p = small_budget_proxy()
+    body = chat_body(content="x" * 500)
+    with mocked(Upstream()), running(p) as c:
+        assert post(c, body).status_code == 200
+        size, held = seen[-1]
+        assert held >= 2 * size
+        seen.clear()
+        p.body_budget.used = 12_000 - 1_000  # room for the raw body, not for 2× of it
+        r = post(c, body)
+    assert r.status_code == 503 and r.json()["error"]["code"] == "server_busy"
+    assert seen == []  # refused before the estimate (and its copy) ran
 
 
 def test_chunked_body_over_the_budget_gets_503_busy():
@@ -350,8 +376,8 @@ def test_budget_is_released_after_every_ending(script):
 
 def test_budget_below_max_body_bytes_is_a_config_error():
     from quota_router.config import ConfigError
-    with pytest.raises((ConfigError, ValueError), match="max_inflight_body_bytes"):
-        make_config(max_body_bytes=1000, max_inflight_body_bytes=11_119)
+    with pytest.raises((ConfigError, ValueError), match="max_inflight_parsed_bytes"):
+        make_config(max_body_bytes=1000, max_inflight_parsed_bytes=11_119)
 
 
 def test_release_removes_its_own_token_entry_not_an_equal_one():
@@ -398,7 +424,7 @@ def test_estimate_covers_measured_shapes_and_ignores_structure_inside_strings():
 def test_body_of_tiny_values_is_charged_more_than_its_bytes_and_gets_503_busy():
     # Regression (review): the budget counted upload bytes, so a body of tiny values within it
     # could take ~20× that in parsed memory.
-    p = make_proxy(max_body_bytes=40_000, max_inflight_body_bytes=4_000_000)
+    p = make_proxy(max_body_bytes=40_000, max_inflight_parsed_bytes=4_000_000)
     body = {"model": "fast", "messages": [{"role": "user", "content": "hi"}], "x": [[0]] * 6_000}
     raw_len = len(json.dumps(body))
     with mocked(Upstream()), running(p) as c:
@@ -410,7 +436,7 @@ def test_body_of_tiny_values_is_charged_more_than_its_bytes_and_gets_503_busy():
 
 
 def test_body_whose_estimate_exceeds_the_whole_budget_gets_413():
-    p = make_proxy(max_body_bytes=40_000, max_inflight_body_bytes=300_000)
+    p = make_proxy(max_body_bytes=40_000, max_inflight_parsed_bytes=300_000)
     body = {"model": "fast", "messages": [{"role": "user", "content": "hi"}], "x": [{}] * 6_000}
     up = Upstream()
     with mocked(up), running(p) as c:
@@ -422,7 +448,7 @@ def test_body_whose_estimate_exceeds_the_whole_budget_gets_413():
 
 def test_plain_body_of_the_largest_allowed_size_fits_the_minimum_budget():
     from quota_router.config import min_parsed_estimate
-    p = make_proxy(max_body_bytes=20_000, max_inflight_body_bytes=min_parsed_estimate(20_000) + 2_000)
+    p = make_proxy(max_body_bytes=20_000, max_inflight_parsed_bytes=min_parsed_estimate(20_000) + 2_000)
     with mocked(Upstream()), running(p) as c:
         r = post(c, chat_body(content="x" * 19_800))
         assert p.body_budget.used == 0
@@ -430,7 +456,20 @@ def test_plain_body_of_the_largest_allowed_size_fits_the_minimum_budget():
 
 
 def test_default_budget_is_128_mib():
-    assert make_config().max_inflight_body_bytes == 128 * 1024 * 1024
+    assert make_config().max_inflight_parsed_bytes == 128 * 1024 * 1024
+
+
+def test_config_from_the_old_example_still_starts_and_warns(caplog):
+    # Review finding: the pre-2026-11-21 example set max_inflight_body_bytes: 67108864 (raw
+    # bytes) with 20 MB bodies. Read as parsed memory that is below the minimum, so the proxy
+    # refused to start. The old key is now ignored with a warning naming the new one.
+    import logging
+    with caplog.at_level(logging.WARNING, logger="quota_router"):
+        cfg = make_config(max_body_bytes=20971520, max_inflight_body_bytes=67108864)
+    assert cfg.max_inflight_parsed_bytes == 128 * 1024 * 1024
+    assert "max_inflight_parsed_bytes" in caplog.text and "ignored" in caplog.text
+    p = make_proxy(max_body_bytes=20971520, max_inflight_body_bytes=67108864)
+    assert p.body_budget.limit == 128 * 1024 * 1024
 
 
 def test_unterminated_string_full_of_escaped_quotes_is_estimated_in_linear_time():
@@ -463,7 +502,7 @@ def test_body_of_exactly_max_body_bytes_fits_a_budget_of_exactly_the_minimum():
     # more than the allowance, so it got 413.
     from quota_router.config import min_parsed_estimate
     limit = 20_000
-    p = make_proxy(max_body_bytes=limit, max_inflight_body_bytes=min_parsed_estimate(limit))
+    p = make_proxy(max_body_bytes=limit, max_inflight_parsed_bytes=min_parsed_estimate(limit))
     shell = {"model": "fast", "stream": True, "stream_options": {"include_usage": True},
              "messages": [{"role": "system", "content": "s"}, {"role": "user", "content": ""}]}
     pad = limit - len(json.dumps(shell, separators=(",", ":")).encode())

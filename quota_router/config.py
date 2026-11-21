@@ -5,6 +5,7 @@ Any problem is a startup error (ConfigError). Secrets never live here.
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import urlsplit
@@ -29,6 +30,9 @@ PARSED_WIDTH_FACTOR = 3
 PARSED_BASE_FACTOR = 3 + PARSED_WIDTH_FACTOR  # the ASCII and Latin-1 case
 PARSED_OVERHEAD = 1024
 MIN_CHAT_STRUCTURE = 4096  # keys of a plain chat body (system + user, stream options: ~2.2 KB as estimated)
+
+
+log = logging.getLogger("quota_router")
 
 
 def min_parsed_estimate(size: int) -> int:
@@ -67,7 +71,11 @@ class Config(_Strict):
     billing: Literal["free", "paid"] = "free"
     max_body_bytes: PositiveInt = 20 * 1024 * 1024
     # Estimated memory of all request bodies in progress at once (DESIGN §20.3).
-    max_inflight_body_bytes: PositiveInt = 128 * 1024 * 1024
+    max_inflight_parsed_bytes: PositiveInt = 128 * 1024 * 1024
+    # Before 2026-11-21 the budget counted raw upload bytes under this name (example: 64 MiB).
+    # Still accepted, so older config files keep loading, but ignored with a warning: read as
+    # parsed memory, the old example's value would be too small to start (found in review).
+    max_inflight_body_bytes: PositiveInt | None = None
     models: dict[str, ModelConfig]
     routes: dict[str, list[str]]
     # Superseded by handoff_targets (DESIGN §16.8); still accepted when empty, so older
@@ -109,8 +117,14 @@ class Config(_Strict):
             raise ValueError(f"handoff_targets uses unknown model(s): {', '.join(unknown)}")
         if len(set(self.handoff_targets)) != len(self.handoff_targets):
             raise ValueError("handoff_targets lists a model twice")
-        if self.max_inflight_body_bytes < min_parsed_estimate(self.max_body_bytes):
-            raise ValueError(f"max_inflight_body_bytes must be at least "
+        if self.max_inflight_body_bytes is not None:
+            log.warning("config: max_inflight_body_bytes is no longer used and is ignored. The "
+                        "in-flight budget now counts memory once parsed and is set with "
+                        "max_inflight_parsed_bytes (now %d; at least %d for this max_body_bytes). "
+                        "Remove the old line (DESIGN §20.3).",
+                        self.max_inflight_parsed_bytes, min_parsed_estimate(self.max_body_bytes))
+        if self.max_inflight_parsed_bytes < min_parsed_estimate(self.max_body_bytes):
+            raise ValueError(f"max_inflight_parsed_bytes must be at least "
                              f"{min_parsed_estimate(self.max_body_bytes)} ({PARSED_BASE_FACTOR}× "
                              f"max_body_bytes, plus {PARSED_OVERHEAD + MIN_CHAT_STRUCTURE}): it counts the memory a "
                              f"body takes once parsed, so a smaller budget could never accept a "

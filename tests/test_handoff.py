@@ -141,6 +141,22 @@ def test_fresh_60_s_cooldown_hands_off_on_a_moving_clock():
     assert up.called == ["model-a", "model-b"]
 
 
+def test_slow_429_with_a_short_retry_delay_is_not_a_handoff():
+    # Review finding: the wait was measured from before the call, so a 429 that took 45 s to
+    # arrive with a 20 s retry delay looked like a 65 s wait and spent a target's quota.
+    import json
+    from apphelpers import rate_limited
+    from quota_router.router import RateLimited
+    env = env3()
+    env.affinity.record(["s1"], "model-a")
+    body = json.loads(rate_limited("minute", delay="20s").content)
+    up = ScriptedUpstream({"model-a": RateLimited(body)}, on_call=lambda m, t: env.clock.advance(45))
+    out = env.route(chat(messages=turn([call("s1")])), up)
+    assert isinstance(out, RouteFailed) and out.status == 429
+    assert up.called == ["model-a"]
+    assert out.retry_after_s == 20
+
+
 def test_target_size_is_estimated_from_the_body_it_receives():
     # Review finding: the estimate came from the client's body with its long real signatures,
     # so a target that fits the placeholder version was skipped as too large.

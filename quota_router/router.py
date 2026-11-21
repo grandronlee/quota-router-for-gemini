@@ -98,9 +98,10 @@ class Candidate:
     # Failed on this request (5xx, timeout, state error) or in a 5xx cooldown, whatever
     # `reason` says after merging with quota limits (DESIGN §5.2). Used by the handoff gate.
     unhealthy: bool = False
-    # When its state was read for this request (before reserving or skipping). The handoff
-    # gate measures the wait from here, so a cooldown set by this request's own 429 counts in
-    # full however long the bookkeeping after it took.
+    # When its state was read for this request (before reserving or skipping), or when its
+    # 429 was applied. The handoff gate measures the wait from here, so a cooldown set by this
+    # request's own 429 counts in full however long the bookkeeping after it took, and the
+    # time the 429 took to arrive doesn't count at all.
     checked_at: float | None = None
 
 
@@ -486,6 +487,11 @@ class Router:
                 if cls.kind == "unknown":
                     log.warning("unrecognised 429 from %s; cooling down", model.id)
                 c.reason, c.detail = "quota", f"429 {cls.kind}"
+                # The cooldown runs from when the 429 is applied, so the handoff gate measures
+                # from here: a 429 that took 45 s to arrive with a 20 s delay is a 20 s wait,
+                # not 65 s (found in review). Read before applying it, so a 60 s cooldown still
+                # counts in full.
+                c.checked_at = self._clock.now()
                 self._safely(self._store.on_rate_limited, model, cls, sent_at=res.at)
                 self._safely(self._store.refund_rpd, res)  # Google's 429 is the source of truth
             elif isinstance(result, Unavailable):

@@ -202,6 +202,7 @@ if the proxy is to run somewhere other than the user's machine.
 - [ ] README states it is not affiliated with Google, needs your own key, and makes no "bypass/unlimited" claims
 - [ ] LICENSE file present
 - [ ] COMPLIANCE.md reviewed against the current Google terms
+- [ ] The body-size estimate runs in bounded memory (DESIGN §20.3, open item from 2026-11-21)
 
 ## Decisions (2026-11-20)
 
