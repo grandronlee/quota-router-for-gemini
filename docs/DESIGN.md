@@ -140,7 +140,7 @@ flowchart TD
     H -- 2xx --> OK[Record actual usage<br/>return response with x-served-model]
     H -- 429 --> I[Classify per-minute or per-day<br/>set cooldown or exhausted<br/>refund RPD slot]
     I --> D
-    H -- 5xx or timeout --> J[Cool down 30 s<br/>keep reservation]
+    H -- 5xx or timeout --> J[Cool down 30 s, longer<br/>while it keeps failing §22<br/>keep reservation]
     J --> D
     H -- 404 model not found --> K[Disable model for this run]
     K --> D
@@ -173,9 +173,12 @@ flowchart TD
         conservative choice. Try the next candidate.
       - **500/502/503/504, or a timeout or network error before the first byte**: set a
         short cooldown (30 s) and try the next candidate. Keep the reservation, because the
-        request may still have used quota.
+        request may still have used quota. While a model keeps failing the cooldown grows, and
+        after its first 30 s the model is only tried as a last resort, by one request at a time
+        (§22; which failures count is in §22.1).
       - **The request never left the machine** (connect error, connect timeout, connection-pool
-        timeout, or a failure before sending started): the same 30 s cooldown, but refund the RPD
+        timeout, or a failure before sending started): the same 30 s cooldown, which doesn't
+        grow (§22.1), but refund the RPD
         reservation and keep the RPM slot, as for a 429. Google never saw the request, and
         a model blocked locally is never called again, so nothing would correct the count:
         a network outage of a few minutes would otherwise use up a scarce model's day.
@@ -183,7 +186,8 @@ flowchart TD
       - **400/401/403/404/422**: return the error to the client unchanged. It is the
         client's or the configuration's problem, and switching models won't fix it.
         Exception: a 404 "model not found" marks that model as disabled for this run
-        (misconfiguration) and falls back.
+        (misconfiguration) and falls back. A 400/401/403/422, like a 429, ends a §22 failure
+        streak: the model answered.
 5. **Nothing served the request.** Each candidate ends with exactly one reason:
 
    | Reason | Means | Can serve later? |
@@ -191,7 +195,7 @@ flowchart TD
    | `disabled` | 404 model not found earlier in this run | no (until restart) |
    | `too_large` | request doesn't fit its context, output or TPM limit | no |
    | `quota` | skipped for RPM, RPD, TPM, cooldown after a 429 or exhausted state, or it answered 429 | yes, at its `ready_at` |
-   | `unavailable` | 5xx, timeout, or cooldown after a 5xx | yes, at its `ready_at` |
+   | `unavailable` | 5xx, timeout, or cooldown after a 5xx (after its first 30 s only tried last, §22.2) | yes, at its `ready_at` |
    | `not_tried` | attempts or deadline ran out before reaching it | yes, now |
 
    `ready_at` is the earliest moment the model could take *this* request: the latest of
@@ -408,8 +412,10 @@ sequenceDiagram
 - Once bytes have been sent, an upstream error ends the stream with an SSE error event.
   Responses from two models are never spliced together. The error still updates the model's
   state, classified as for a first-event error (§20.4): a 429 sets the cooldown or exhausted
-  state, a 5xx or code-less error sets the 30 s cooldown. The RPD slot is kept, because the
-  request was served in part. (Added 2026-11-21 after the Phase 4 review.)
+  state, a 5xx or code-less error counts as a failure towards the growing cooldown (§22.1). The
+  RPD slot is kept, because the request was served in part. (Added 2026-11-21 after the Phase 4
+  review.) A stream ends a failure streak only when it ends with `[DONE]`; one that stops without
+  `[DONE]` or an error event changes nothing (§22.1).
 - If the client disconnects, the upstream request is cancelled and usage keeps its estimate.
 
 ## 9. Timeouts and limits
@@ -420,7 +426,8 @@ sequenceDiagram
   to the client. Each attempt's timeout is the smaller of 120 s and the time left. When
   it runs out, the proxy returns 503. Once streaming has started, the deadline no longer applies.
 - **At most 3 upstream attempts per request** (configurable), and at most one per candidate.
-  Skipping an ineligible candidate is not an attempt.
+  Skipping an ineligible candidate is not an attempt. The last-resort pass for models in the
+  soft part of a 5xx cooldown (§22.2) uses the same attempts and deadline.
 - Without these limits, a route of eight candidates could make one request wait about 16 minutes.
 - Maximum request body 20 MB (configurable).
 
@@ -442,7 +449,7 @@ sequenceDiagram
 |---|---|
 | `POST /v1/chat/completions` | main entry point; streaming and non-streaming |
 | `GET /v1/models` | lists the routes and the real model IDs that are enabled |
-| `GET /status` | for each model: RPM, TPM and RPD used/limit, cooldown and exhausted-until; next PT reset |
+| `GET /status` | for each model: RPM, TPM and RPD used/limit, cooldown and exhausted-until, `unavailable_streak` (§22.4); next PT reset |
 | `GET /healthz` | liveness check |
 | `GET /metrics` | Prometheus metrics (§17), Phase 2 |
 | `GET /dashboard` | read-only status page with a per-tab sign-in (§17, §21.4), Phase 3 |
@@ -500,10 +507,10 @@ formats, so the custom part is only the routing and quota logic (an estimated 40
 | Proxy restarts mid-day | RPD and exhausted state reload from SQLite; minute windows start empty (Google's 429 corrects any mistake) |
 | Usage outside the proxy | local counts are low; the first 429 marks the model correctly |
 | Daylight-saving change | reset computed in America/Los_Angeles with `zoneinfo` |
-| Upstream fails mid-stream | SSE error event; no splicing; no fallback; a 429 or 5xx in it still sets the model's cooldown |
-| Network down (connect errors) | 30 s cooldown per model, RPD slot refunded; 503 when the candidates run out |
+| Upstream fails mid-stream | SSE error event; no splicing; no fallback; a 429 or 5xx in it still sets the model's cooldown (a 5xx counts towards §22's streak) |
+| Network down (connect errors) | 30 s cooldown per model, not counted towards the growing cooldown (§22.1), RPD slot refunded; 503 when the candidates run out |
 | Every model exhausted | 429 with `Retry-After` set to the earliest reset |
-| Models overloaded (503 "high demand", common in Phase 0) | 30 s cooldown, next candidate; 503 when attempts or the deadline run out |
+| Models overloaded (503 "high demand", common in Phase 0) | 30 s cooldown, growing ×4 up to 15 min while the model keeps failing; after the first 30 s it is tried only as a last resort, one request at a time (§22); next candidate; 503 when attempts or the deadline run out |
 | Request larger than every candidate's context | 400 `context_length_exceeded`, no upstream call |
 | Tool result arrives while its model is out of quota | handoff to a listed `handoff_targets` model if the owner is blocked over `handoff_after_s`; otherwise 429/503 (§16.8) |
 | Proxy restarts in the middle of a tool turn | affinity reloads from SQLite; the turn stays on its model |
@@ -874,9 +881,10 @@ first). `scripts/init_config.py` offers it commented out.
 1. **Response headers** (§5, §16.4): `x-served-model`, `x-fallback-path`, `x-turn-affinity`,
    later `x-route-tier` and `x-route-reason`.
 2. **Log line** per request: time, route, served model, fallback path, status, reason, input
-   estimate, reported prompt and output tokens, latency, time to first byte, affinity.
+   estimate, reported prompt and output tokens, latency, time to first byte, affinity, and
+   `attempts`, one entry per upstream call (§22.4).
 3. **`/status`** (JSON, bearer token): per model RPM, input-TPM and RPD used and limit,
-   cooldown and exhausted-until, disabled; next PT reset; today's counts by status and reason;
+   cooldown and exhausted-until, disabled, `unavailable_streak` (§22.4); next PT reset; today's counts by status and reason;
    the last few errors (status and reason only). Later: the pace line per paced model.
 4. **`/dashboard`**: a read-only HTML page served by the proxy, drawing on `/status`: quota
    bars, countdowns, pace line against actual use, decisions by reason, 5xx rate. A browser
@@ -1436,7 +1444,7 @@ the WSL `/mnt/c` warning, limits and disclaimers.
 
 Alerts (§17.2 layer 6), remote hosting (§18), `gemini-smart` and `gemini-auto` (§16).
 
-## 22. Overloaded models: a growing 5xx cooldown — approved 2026-11-21 with adjustments
+## 22. Overloaded models: a growing 5xx cooldown — approved 2026-11-21 with adjustments; implemented 2026-11-21
 
 **Problem** (live check, [probe-results.md](probe-results.md), 2026-11-21). On that day
 `gemini-4-hydrogen` and `gemini-3.6-flash` answered every request with 503 or a timeout. A
@@ -1487,7 +1495,10 @@ Each model keeps a failure **streak** (in memory, like today's cooldowns; a rest
 - **One recovery attempt at a time.** While a model's streak is above 0 and its hard 30 s are
   over (soft part, or after the cooldown ends), at most one request across all concurrent
   requests may have an attempt in flight on it. Others skip it as `recovering`, which counts
-  like the soft part: tried last, if the slot is free by then.
+  like the soft part: tried last, if the slot is free by then. Its `ready_at` is 5 s ahead, so a
+  503 caused by a busy slot carries `Retry-After: 5` rather than 1 (changed after review,
+  2026-11-21). A candidate that is ready sooner still sets an earlier value, and quota limits
+  keep their own.
   - The slot is taken under the router lock with the same reservation check as any attempt:
     quota, remaining attempts and the deadline are checked again just before sending.
   - It is released when the attempt's routing outcome is known (the first data event of a
@@ -1511,13 +1522,16 @@ busy healthy model still gets today's 30 s cooldown from a 503 that arrives afte
   before a recovery can't put the recovered model back into cooldown.
 - A stale outcome still does everything else it does today: the RPD reservation, the 429 quota
   state (§6), and the request's own handoff decision (§16.8), which uses the request's own result.
+- A stale failure that doesn't count (§22.1) doesn't set its 30 s either, so a delayed network
+  error from before a recovery can't block the recovered model (found in review, 2026-11-21).
 
 ### 22.4 Visibility
 
 - `/status` and the dashboard show each model's `unavailable_streak` next to its cooldown.
 - The request log line gets `attempts`: one entry per upstream call, in order, with `model`
-  (the configured model ID), `outcome`, `status` (the HTTP status when there is one, else null)
-  and `ms` (elapsed milliseconds). `outcome` is one of `ok` (non-streamed 2xx), `stream_complete`
+  (the configured model ID), `outcome`, `status` (the HTTP status when there is one, else null;
+  for an SSE error event, its code) and `ms` (elapsed milliseconds; a served stream's runs to
+  its end). `outcome` is one of `ok` (non-streamed 2xx), `stream_complete`
   (`[DONE]`), `stream_error` (error event after the first byte), `stream_incomplete` (ended
   without either), `client_cancelled`, `rate_limited`, `unavailable` (5xx or error event before
   the first byte), `timeout`, `not_sent`, `rejected` (4xx returned unchanged), `not_found`.
@@ -1556,3 +1570,7 @@ busy healthy model still gets today's 30 s cooldown from a 503 that arrives afte
 3. Hard 30 s, then soft with a last-resort pass and one recovery attempt per model at a time;
    stale outcomes ignored through the epoch.
 4. `attempts` in the log line in the same change, with a fixed outcome set and no error text.
+5. Confirmed before implementation: the epoch moves only when an outcome changes state; the
+   failures that don't count keep today's 30 s; a stream cut off without `[DONE]` is neutral;
+   400/401/403/422 end a streak; the one-at-a-time rule also applies after the cooldown ends;
+   the send phase comes from httpx's `trace` extension, and an unknown phase doesn't count.
