@@ -73,6 +73,60 @@ def test_rendered_config_needs_fill_me_then_loads(tmp_path):
     assert "gemma-small" not in cfg.models and "#  gemma-small" in text.replace("  #  ", "#  ")
 
 
+def fill_limits(text):
+    return (text.replace("rpm: FILL_ME", "rpm: 5").replace("tpm_input: FILL_ME", "tpm_input: 250000")
+            .replace("rpd: FILL_ME", "rpd: 20"))
+
+
+def test_offered_smart_route_loads_once_uncommented(tmp_path):
+    # Every probed model is on the account, plus 3.8 Flash, whose tool call hasn't passed.
+    models = ic.generation_models([native(m) for m in ic.SMART_ORDER + ("gemini-3.8-flash",)])
+    text = ic.render(models, ["gemini-3.5-flash-lite"])
+    smart = "[gemini-4-hydrogen, gemini-3.6-flash, gemini-3-flash-preview, gemini-2.5-flash, " \
+            "gemini-3.5-flash-lite, gemini-2.5-flash-lite]"
+    assert f"  # gemini-smart: {smart}" in text
+    handoff = "[gemini-3-flash-preview, gemini-2.5-flash, gemini-3.5-flash-lite, gemini-2.5-flash-lite]"
+    assert f"handoff_targets: []   # with gemini-smart: {handoff}" in text
+    # As rendered, the smart route stays off.
+    path = tmp_path / "config.yaml"
+    path.write_text(fill_limits(text))
+    cfg = load_config(path)
+    assert list(cfg.routes) == ["gemini-fast"] and cfg.handoff_targets == []
+    # Follow the comment: uncomment the smart models and the route, set handoff_targets.
+    lines, continuation = [], False
+    for line in text.splitlines():
+        entry = any(line.startswith(f"  #  {m}: ") for m in ic.SMART_ORDER)
+        if entry or (continuation and line.startswith("  #    input_limit")):
+            line = line.replace("  #", "", 1)
+        continuation = entry
+        if line.startswith("  # gemini-smart:"):
+            line = "  gemini-smart:" + line.split(":", 1)[1]
+        if line.startswith("handoff_targets: []"):
+            line = f"handoff_targets: {handoff}"
+        lines.append(line)
+    path.write_text(fill_limits("\n".join(lines)))
+    cfg = load_config(path)
+    assert cfg.routes["gemini-smart"] == list(ic.SMART_ORDER)
+    assert cfg.handoff_targets == list(ic.HANDOFF_PASSED)
+    assert "gemini-3.8-flash" not in cfg.models
+
+
+def test_smart_route_offers_only_models_on_the_account():
+    text = ic.render(ic.generation_models([native("gemini-3.5-flash-lite"), native("gemini-2.5-flash")]), [])
+    assert "  # gemini-smart: [gemini-2.5-flash, gemini-3.5-flash-lite]" in text
+    assert "with gemini-smart: [gemini-2.5-flash, gemini-3.5-flash-lite]" in text
+    text = ic.render(ic.generation_models([native("gemini-a")]), [])
+    assert "gemini-smart" not in text and "handoff_targets: []  " in text
+
+
+def test_example_config_loads_with_the_probed_smart_route():
+    cfg = load_config(Path(__file__).resolve().parent.parent / "config.example.yaml")
+    ids = lambda keys: tuple(cfg.models[k].id for k in keys)  # noqa: E731
+    assert ids(cfg.routes["gemini-smart"]) == ic.SMART_ORDER
+    assert ids(cfg.handoff_targets) == ic.HANDOFF_PASSED
+    assert ids(cfg.routes["gemini-fast"]) == ("gemini-3.5-flash-lite",)
+
+
 def test_nothing_chosen_writes_only_comments_for_models(tmp_path):
     text = ic.render(ic.generation_models([native("gemini-a")]), [])
     assert "  # gemini-fast:" in text and "gemini-a: {" in text

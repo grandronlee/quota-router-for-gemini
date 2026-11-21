@@ -4,8 +4,10 @@ A local, OpenAI-compatible router that sends each request to a Gemini API model 
 has free-tier quota. It switches models automatically when one hits its rate limit, and stays
 within Google's published limits for your own single project and key.
 
-**Status: in development (v1).** One route, `gemini-fast`, with Zoo Code as the tested client.
-`gemini-smart`, automatic routing and more clients come after v1 ([plan](docs/PLAN.md)).
+**Status: in development.** Two routes: `gemini-fast`, tested live with Zoo Code, and
+`gemini-smart`, which can hand a tool turn to another model when its own runs out. `gemini-smart`
+hasn't had its live Zoo Code check yet. Automatic routing and more clients come later
+([plan](docs/PLAN.md)).
 
 - [Design](docs/DESIGN.md) · [Implementation plan](docs/PLAN.md) · [Terms of service notes](docs/COMPLIANCE.md)
 - License: [MIT](LICENSE)
@@ -53,7 +55,9 @@ filesystem (for example `~/repo`), not under `/mnt/c`.
    Then replace every `FILL_ME` with your project's RPM, input TPM and RPD from
    AI Studio → Rate Limit. The proxy won't start while a `FILL_ME` is left. Leave a value empty
    (`rpd:`) only if AI Studio shows no limit for it. `--models` takes IDs in route order;
-   they become the `gemini-fast` route. You can also start from `config.example.yaml`.
+   they become the `gemini-fast` route. The file also offers a `gemini-smart` route, commented
+   out, for the models on your account whose tool calls passed the probe; its comment says how
+   to turn it on. You can also start from `config.example.yaml`, which has both routes.
 
 3. **Run.**
 
@@ -97,14 +101,25 @@ and your `PROXY_TOKEN` as the API key. Set the context window to about **200000*
 2. Base URL `http://localhost:4000/v1`, API key `PROXY_TOKEN`, model ID `gemini-fast`.
 3. Context window about 200000; keep context condensing on.
 
+4. If `config.yaml` has the `gemini-smart` route, add a second profile the same way with model
+   ID `gemini-smart`.
+5. Pick a profile in each mode (Zoo Code remembers the profile last used in each one):
+   Architect, Debug and Orchestrator on `gemini-smart`; Code and Ask on `gemini-fast`.
+
 Zoo Code 3.98.0 keeps Gemini's thought signatures across tool calls, which tool loops need.
-After v1 a second profile on `gemini-smart` can serve Architect, Debug and Orchestrator modes.
-The exact steps are checked in Phase 4.
+The `gemini-fast` steps were checked live; the `gemini-smart` profile hasn't been yet.
+
+The smart models allow about 20 requests a day each, and a tool turn stays on the model that
+started it. When that model runs out, or is blocked for longer than `handoff_after_s`
+(60 s), the turn moves to the next model in the route that's listed in `handoff_targets`.
+The response then has the header `x-turn-affinity: handoff`. List a model there only after it
+passes `python3 -I scripts/probe.py --handoffs` ([DESIGN §16.8](docs/DESIGN.md)); the example
+config lists the ones that passed on the author's account.
 
 ### Cline / Kilo Code
 
-Provider **OpenAI Compatible**, same base URL and key, model `gemini-fast` (for both Plan and
-Act mode until `gemini-smart` exists). Not tested yet.
+Provider **OpenAI Compatible**, same base URL and key. Plan mode `gemini-smart` (or
+`gemini-fast` if you haven't set that route up), Act mode `gemini-fast`. Not tested yet.
 
 ### VS Code Copilot Chat (bring your own key)
 
@@ -156,7 +171,9 @@ Whether the dashboard sign-in works through `tailscale serve` is checked in Phas
 - A request too large for every model's context gets 400 `context_length_exceeded` without
   calling Google.
 - A tool result goes back to the model that made the tool call (kept for 24 hours, across
-  restarts), since Gemini's thought signatures only work with the same model.
+  restarts), since Gemini's thought signatures only work with the same model. The exception
+  is a handoff (see Zoo Code above): the proxy then swaps the other model's signatures for
+  the placeholder Google documents for history from a different model.
 - Prompts and replies are never logged. Each request logs one JSON line with route, model,
   status, token counts and timings. The first few rate-limit replies are saved, with keys
   removed, in `data/429/` so their format can be checked.

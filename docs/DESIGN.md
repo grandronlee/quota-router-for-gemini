@@ -114,7 +114,8 @@ The client picks a virtual model. Order is set in config; the defaults are:
 
 The models named here are from the account in §2; other accounts route their own models.
 v1 ships only `gemini-fast`, with just its first candidate (§0). The full lists above
-are the target once v1 works. A `gemma-small` route for short prompts (Gemma 4 31B → 26B → `gemini-fast`)
+are the target once v1 works. After v1, `gemini-smart` ships in `config.example.yaml` with the
+models whose tool call passed the probe, which leaves out 3.8 Flash and 3.1 Flash Lite (§16.8 1c). A `gemma-small` route for short prompts (Gemma 4 31B → 26B → `gemini-fast`)
 will be added after v1 if Phase 0 shows Gemma works well enough; it needs routes that can fall back into other routes.
 
 Requesting a real model ID directly sends the request to that model alone, with quota
@@ -458,9 +459,11 @@ models:   # limits: copy your own project's values from AI Studio
               input_limit: 1048576, output_limit: 65536 }   # limits from models.list
   lite-3-1: { id: gemini-3.1-flash-lite, rpm: 15, tpm_input: 250000, rpd: 500,
               input_limit: 1048576, output_limit: 65536 }
+  # ... the gemini-smart models: hydrogen-4, flash-3-6, flash-3, flash-2-5, lite-2-5
 routes:
   gemini-fast: [lite-3-5]   # add lite-3-1 once its tool call passes the probe
-handoff_targets: []   # models whose handoff probe passed (§16.8)
+  gemini-smart: [hydrogen-4, flash-3-6, flash-3, flash-2-5, lite-3-5, lite-2-5]
+handoff_targets: [flash-3, flash-2-5, lite-3-5, lite-2-5]   # handoff probe passed (§16.8)
 handoff_after_s: 60
 ```
 

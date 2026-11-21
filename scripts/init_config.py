@@ -33,6 +33,13 @@ ROOT = Path(__file__).resolve().parent.parent
 TIMEOUT_S = 30
 SAFE_ID = re.compile(r"^[a-z0-9][a-z0-9.\-]*$")
 FILL_ME = "FILL_ME"
+# gemini-smart in DESIGN §4 order, limited to models whose tool call passed the probe
+# (docs/probe-results.md); 3.8 Flash and 3.1 Flash Lite join once theirs pass.
+SMART_ORDER = ("gemini-4-hydrogen", "gemini-3.6-flash", "gemini-3-flash-preview",
+               "gemini-2.5-flash", "gemini-3.5-flash-lite", "gemini-2.5-flash-lite")
+# Passed the multi-step handoff probe with the placeholder signature (DESIGN §16.8 1a).
+HANDOFF_PASSED = ("gemini-3-flash-preview", "gemini-2.5-flash", "gemini-3.5-flash-lite",
+                  "gemini-2.5-flash-lite")
 
 
 def read_key(environ=os.environ, env_file: Path = ROOT / ".env") -> str:
@@ -142,7 +149,17 @@ def render(models: list[dict], chosen: list[str]) -> str:
         lines.append(f"  gemini-fast: [{', '.join(chosen)}]   # tried in this order")
     else:
         lines.append("  # gemini-fast: [model-key, other-model-key]   # tried in this order")
-    lines += ["", "handoff_targets: []           # models whose handoff probe passed (DESIGN §16.8)",
+    smart = [mid for mid in SMART_ORDER if mid in by_id]
+    handoff = [mid for mid in HANDOFF_PASSED if mid in smart]
+    if smart:
+        lines += ["  # Planning and debugging (Zoo Code Architect/Debug), DESIGN §4. To use it, uncomment",
+                  "  # these models above, fill in their limits, uncomment the route, then set",
+                  "  # handoff_targets to the list in its comment.",
+                  f"  # gemini-smart: [{', '.join(smart)}]"]
+    hint = (f"   # with gemini-smart: [{', '.join(handoff)}] (passed the handoff probe, DESIGN §16.8)"
+            if handoff
+            else "           # models whose handoff probe passed (DESIGN §16.8)")
+    lines += ["", f"handoff_targets: []{hint}",
               "handoff_after_s: 60           # hand a tool turn off only if its model is blocked longer",
               ""]
     return "\n".join(lines)

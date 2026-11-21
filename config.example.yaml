@@ -14,13 +14,30 @@ max_body_bytes: 20971520      # 20 MB per request
 max_inflight_parsed_bytes: 134217728  # 128 MB: estimated memory of all request bodies at once (DESIGN §20.3)
 
 models:
+  hydrogen-4: { id: gemini-4-hydrogen, rpm: 5, tpm_input: 250000, rpd: 20,
+                input_limit: 1048576, output_limit: 65536 }
+  # flash-3-8: { id: gemini-3.8-flash, rpm: 5, tpm_input: 250000, rpd: 20,
+  #              input_limit: 1048576, output_limit: 65536 }   # tool call not passed yet (503)
+  flash-3-6: { id: gemini-3.6-flash, rpm: 5, tpm_input: 250000, rpd: 20,
+               input_limit: 1048576, output_limit: 65536 }
+  flash-3: { id: gemini-3-flash-preview, rpm: 5, tpm_input: 250000, rpd: 20,
+             input_limit: 1048576, output_limit: 65536 }
+  flash-2-5: { id: gemini-2.5-flash, rpm: 5, tpm_input: 250000, rpd: 20,
+               input_limit: 1048576, output_limit: 65536 }
   lite-3-5: { id: gemini-3.5-flash-lite, rpm: 15, tpm_input: 250000, rpd: 500,
               input_limit: 1048576, output_limit: 65536 }
   lite-3-1: { id: gemini-3.1-flash-lite, rpm: 15, tpm_input: 250000, rpd: 500,
               input_limit: 1048576, output_limit: 65536 }
+  lite-2-5: { id: gemini-2.5-flash-lite, rpm: 10, tpm_input: 250000, rpd: 20,
+              input_limit: 1048576, output_limit: 65536 }
 
 routes:
   gemini-fast: [lite-3-5]     # add lite-3-1 once its tool call passes the probe
+  # Planning and debugging (Zoo Code Architect/Debug). DESIGN §4 order, limited to models
+  # whose tool call passed the probe: add flash-3-8 and lite-3-1 once theirs pass.
+  gemini-smart: [hydrogen-4, flash-3-6, flash-3, flash-2-5, lite-3-5, lite-2-5]
 
-handoff_targets: []           # models whose handoff probe passed (DESIGN §16.8)
+# Models whose multi-step handoff probe passed with the placeholder signature (DESIGN §16.8 1a,
+# docs/probe-results.md). Add hydrogen-4 and flash-3-6 only after `probe.py --handoffs` passes them.
+handoff_targets: [flash-3, flash-2-5, lite-3-5, lite-2-5]
 handoff_after_s: 60           # hand a tool turn off only if its model is blocked longer
