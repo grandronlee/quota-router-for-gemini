@@ -255,13 +255,23 @@ class GeminiUpstream:
         response: httpx.Response | None = None
         handed_over = False
         sending = False  # once True, Google may have received the request
+        body_sent = False  # the request body was fully written (DESIGN §22.1)
+
+        async def trace(name: str, _info: dict) -> None:
+            # httpcore names it "http11.send_request_body.complete" (or "http2."). A transport
+            # that doesn't trace leaves body_sent False, so its timeouts don't count.
+            nonlocal body_sent
+            if name.endswith("send_request_body.complete"):
+                body_sent = True
+
         try:
             async with asyncio.timeout(max(0.0, timeout_s)):
                 request = self._client.build_request(
                     "POST", self._url, content=self._payload(body, stream, model),
                     headers={"Authorization": f"Bearer {self._key}",
                              "Content-Type": "application/json",
-                             "User-Agent": "quota-router-for-gemini"})
+                             "User-Agent": "quota-router-for-gemini"},
+                    extensions={"trace": trace})
                 sending = True
                 response = await self._client.send(request, stream=True)
                 status = response.status_code
@@ -273,22 +283,27 @@ class GeminiUpstream:
                         # whether this model serves the request or routing continues.
                         first = await anext(events, None)
                     if first is None:
-                        return Unavailable("empty stream")
+                        return Unavailable("empty stream", counts=True, status=status)
                     err = first.error()
                     if err is not None:  # nothing has reached the client yet (DESIGN §20.4)
                         return self._first_event_error(model, err, first)
                     s = Stream(response, events, first)
                     handles.streams.append(s)
                     handed_over = True
-                    return Served(s)
+                    return Served(s, stream=True, status=status)
                 content = await response.aread()
         except TimeoutError:
-            return Unavailable("timeout", not_sent=not sending)
+            # The status, when headers came: a stall in the response, not before it (§22.4).
+            return Unavailable("timeout", not_sent=not sending, body_sent=body_sent,
+                               status=response.status_code if response is not None else None)
         except httpx.TimeoutException as e:
-            return Unavailable("timeout", not_sent=not sending or isinstance(e, _NOT_SENT_ERRORS))
+            return Unavailable("timeout", not_sent=not sending or isinstance(e, _NOT_SENT_ERRORS),
+                               body_sent=body_sent and not isinstance(e, httpx.WriteTimeout),
+                               status=response.status_code if response is not None else None)
         except httpx.HTTPError as e:
             return Unavailable(f"error: {type(e).__name__}",
-                               not_sent=not sending or isinstance(e, _NOT_SENT_ERRORS))
+                               not_sent=not sending or isinstance(e, _NOT_SENT_ERRORS),
+                               status=response.status_code if response is not None else None)
         except Exception as e:  # noqa: BLE001 - contract: every exception becomes a result
             log.exception("unexpected error calling %s", model.id)
             return Unavailable(f"error: {type(e).__name__}", not_sent=not sending)
@@ -298,16 +313,16 @@ class GeminiUpstream:
 
         ctype = response.headers.get("content-type", "application/json")
         if 200 <= status < 300:
-            return Served(Body(status, content, ctype))
+            return Served(Body(status, content, ctype), status=status)
         if status == 429:
             if self._captures:
                 self._captures.save(model.id, status, response.headers, content)
-            return RateLimited(content, dict(response.headers))
+            return RateLimited(content, dict(response.headers), status=status)
         if status in _UNAVAILABLE_STATUSES:
-            return Unavailable(f"http {status}")
+            return Unavailable(f"http {status}", counts=True, status=status)
         if status == 404 and _is_model_not_found(content):
-            return ModelNotFound(content)
-        return Rejected(Body(status, self._scrub.bytes(content), ctype))
+            return ModelNotFound(content, status=status)
+        return Rejected(Body(status, self._scrub.bytes(content), ctype), status=status)
 
     def _first_event_error(self, model: ModelConfig, err: dict, event: SSEEvent) -> UpstreamResult:
         kind, code = error_event_kind(err)
@@ -315,12 +330,12 @@ class GeminiUpstream:
         if kind == "rate_limited":
             if self._captures:
                 self._captures.save(model.id, 429, {}, raw)
-            return RateLimited(raw, None)
+            return RateLimited(raw, None, status=code)
         if kind == "unavailable":
-            return Unavailable(f"stream error event {code}")
+            return Unavailable(f"stream error event {code}", counts=True, status=code)
         if code == 404 and _is_model_not_found(raw):
-            return ModelNotFound(raw)
-        return Rejected(Body(code, self._scrub.bytes(raw), "application/json"))
+            return ModelNotFound(raw, status=code)
+        return Rejected(Body(code, self._scrub.bytes(raw), "application/json"), status=code)
 
 
 async def _close_quietly(response: httpx.Response) -> None:

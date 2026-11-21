@@ -13,6 +13,7 @@ import json
 import logging
 import math
 import sqlite3
+import time
 from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Literal, Mapping, Protocol
 
@@ -33,6 +34,7 @@ STATE_ERROR_RETRY_S = 30.0  # Retry-After hint when the quota state can't be rea
 MIN_ATTEMPT_S = 5.0  # a later attempt with less time left than this isn't started (DESIGN §5.2)
 
 _FAILED = object()  # sentinel: a state read failed
+_STOP = object()  # sentinel: the last-resort pass has no attempts or time left
 
 Reason = Literal["disabled", "too_large", "quota", "unavailable", "not_tried"]
 Affinity = Literal["pinned", "unknown", "mixed", "handoff"]
@@ -44,16 +46,23 @@ HandoffHook = Callable[[str, str, str], None]  # (from model ID, to model ID, re
 
 # ---- upstream results (supplied by the HTTP layer) -----------------------
 
+# Every result's `status` is the HTTP status, or for an SSE error event its code (None when it
+# has none). Only the request log line uses it (DESIGN §22.4), and Rejected's recovery rule.
+
 @dataclass(frozen=True)
 class Served:
-    """2xx, and (for streams) the first byte is ready. `payload` is opaque to the router."""
+    """2xx, and (for streams) the first byte is ready. `payload` is opaque to the router.
+    A stream's recovery is recorded later, at [DONE] (DESIGN §22.1)."""
     payload: Any
+    stream: bool = False
+    status: int | None = None
 
 
 @dataclass(frozen=True)
 class RateLimited:
     body: Any
     headers: Mapping[str, str] | None = None
+    status: int | None = 429
 
 
 @dataclass(frozen=True)
@@ -61,23 +70,68 @@ class Unavailable:
     """500/502/503/504, connect error, or timeout before the first byte.
 
     `not_sent`: the request never left the machine (connect error or timeout, pool timeout,
-    or a failure before sending started), so Google can't have counted it (DESIGN §5 step 4)."""
+    or a failure before sending started), so Google can't have counted it (DESIGN §5 step 4).
+    `counts`: a failure that grows the 5xx streak whatever its timing: a 5xx status, a 5xx or
+    code-less error event, or a stream that ends empty (DESIGN §22.1). A timeout counts only
+    if `body_sent` (the request was fully written) and it used the attempt's full budget."""
     detail: str
     not_sent: bool = False
+    counts: bool = False
+    body_sent: bool = False
+    status: int | None = None
 
 
 @dataclass(frozen=True)
 class ModelNotFound:
     body: Any
+    status: int | None = 404
 
 
 @dataclass(frozen=True)
 class Rejected:
     """Any other 4xx: returned to the client unchanged."""
     payload: Any
+    status: int | None = None
 
 
 UpstreamResult = Served | RateLimited | Unavailable | ModelNotFound | Rejected
+
+# 4xx answers that show the model is reachable, so they end a 5xx streak (DESIGN §22.1).
+RECOVERY_STATUSES = frozenset({400, 401, 403, 422})
+
+
+@dataclass
+class Attempt:
+    """One upstream call, for the request log line (DESIGN §22.4). `outcome` stays
+    `client_cancelled` if the call never returns. A served stream's entry is finished again
+    when the stream ends."""
+    model: str
+    started: float = field(default_factory=time.monotonic)
+    outcome: str = "client_cancelled"
+    status: int | None = None
+    ms: int | None = None
+
+    def finish(self, outcome: str, status: int | None) -> None:
+        self.outcome, self.status = outcome, status
+        self.ms = round((time.monotonic() - self.started) * 1000)
+
+    def log(self) -> dict:
+        return {"model": self.model, "outcome": self.outcome, "status": self.status, "ms": self.ms}
+
+
+def log_outcome(result: UpstreamResult) -> str:
+    """The log outcome of a call's result (DESIGN §22.4); a stream is finished later."""
+    if isinstance(result, Served):
+        return "stream_incomplete" if result.stream else "ok"
+    if isinstance(result, RateLimited):
+        return "rate_limited"
+    if isinstance(result, Unavailable):
+        if result.not_sent:
+            return "not_sent"
+        return "timeout" if result.detail == "timeout" else "unavailable"
+    if isinstance(result, Rejected):
+        return "rejected"
+    return "not_found"
 
 
 class Upstream(Protocol):
@@ -114,6 +168,7 @@ class RouteServed:
     affinity: Affinity | None
     handoff_from: str | None = None  # the turn's owner, when another model served it
     turn: TurnRef | None = None  # its decision-log turn (DESIGN §16.8 1d)
+    attempt: Attempt | None = None  # this call's log entry, finished when a stream ends
 
 
 @dataclass
@@ -380,7 +435,10 @@ class Router:
             log.exception("handoff hook failed")
 
     async def route(self, request: Mapping[str, Any], upstream: Upstream,
-                    *, started_at: float | None = None) -> RouteOutcome:
+                    *, started_at: float | None = None,
+                    attempts: list[Attempt] | None = None) -> RouteOutcome:
+        """Route one request. `attempts`, when given, receives one entry per upstream call as
+        it starts, so the caller can still log them if routing is cancelled (DESIGN §22.4)."""
         started = self._clock.now() if started_at is None else started_at
         deadline = started + self._config.request_deadline_s
         name = request.get("model")
@@ -397,42 +455,32 @@ class Router:
 
         results: list[Candidate] = []
         path: list[str] = []
-        attempts = 0
+        log_ = attempts if attempts is not None else []
+        tried = 0  # upstream calls made
         hand_off: bool | None = None  # decided once, from the owner's result
-        for model in candidates:
-            if owner is not None and model is not owner:
-                if hand_off is None:
-                    hand_off = self._may_hand_off(results[0])
-                if not hand_off:
-                    break  # the owner's own result decides (DESIGN §16.8)
-            # Calls the serving model didn't make carry the placeholder: after a handoff, or in
-            # a mixed turn served by its latest owner. An owner serving its own turn sends the
-            # body unchanged, unknown IDs included (most likely its own calls).
-            foreign = owner is not None and (
-                model.id != owner.id or any(v != model.id for v in known.values()))
-            body = with_placeholder_signatures(request, model.id, known) if foreign else request
+        # Skipped only for the soft part of a 5xx cooldown or a recovery attempt in flight:
+        # tried after the normal pass if nothing served (DESIGN §22.2).
+        deferred: list[tuple[Candidate, Mapping[str, Any], int]] = []
+
+        async def attempt(c: Candidate, body: Mapping[str, Any], tokens: int,
+                          last_resort: bool) -> RouteOutcome | None | object:
+            """Try one candidate. Returns an outcome to return, None to go on, or _STOP when
+            a last-resort pass has no attempts or time left."""
+            nonlocal tried
+            model = c.model
             served_affinity = affinity if owner is None or model.id == owner.id else "handoff"
             handoff_from = owner.id if owner is not None and model.id != owner.id else None
-            # Estimated from what this model is sent: placeholders are much shorter than real
-            # signatures, so the client's body would overstate a handoff's size.
-            tokens = input_tokens if body is request else estimate_input_tokens(body)
-            c = Candidate(model)
-            results.append(c)
-            if self._store.is_disabled(model):
-                c.reason = "disabled"
-                continue
-            if not fits(model, tokens, output_tokens):
-                c.reason = "too_large"
-                continue
             async with self._lock:
                 c.checked_at = self._clock.now()
                 left = deadline - c.checked_at
                 # The first attempt runs while any time is left; a later one needs MIN_ATTEMPT_S,
                 # since a call that is sure to time out would only cost quota and a cooldown.
-                limits_left = attempts < self._config.max_attempts and \
-                    (left > 0 if attempts == 0 else left >= MIN_ATTEMPT_S)
+                limits_left = tried < self._config.max_attempts and \
+                    (left > 0 if tried == 0 else left >= MIN_ATTEMPT_S)
+                if last_resort and not limits_left:
+                    return _STOP  # keeps the reason it was deferred for
                 try:
-                    res = self._store.try_reserve(model, tokens) if limits_left \
+                    res = self._store.try_reserve(model, tokens, last_resort=last_resort) if limits_left \
                         else self._store.check(model, tokens)
                 except sqlite3.Error:
                     # Never call upstream without a reservation; this candidate is skipped.
@@ -441,42 +489,61 @@ class Router:
                     c.reason, c.detail = "unavailable", "quota state error"
                     c.ready_at = self._clock.now() + STATE_ERROR_RETRY_S
                     c.unhealthy = True
-                    continue
+                    return None
             if isinstance(res, Blocked):
                 c.reason, c.ready_at, c.detail = res.reason, res.ready_at, res.detail
                 c.unhealthy = res.cooling_down
-                continue
+                if res.deferred and not last_resort:
+                    deferred.append((c, body, tokens))
+                return None
             if res is None:  # eligible, but no attempts or time left
                 c.reason, c.ready_at = "not_tried", self._clock.now()
-                continue
-            # The reservation's SQLite write can wait (up to 1 s): measure again, and give the
-            # whole reservation back if the attempt may no longer start (DESIGN §5 notes).
-            left = deadline - self._clock.now()
-            if not (left > 0 if attempts == 0 else left >= MIN_ATTEMPT_S):
-                self._safely(self._store.release, res)
-                c.reason, c.ready_at = "not_tried", self._clock.now()
-                continue
+                return None
+            try:  # from here on, the recovery slot `res` may hold is freed on every path
+                # The reservation's SQLite write can wait (up to 1 s): measure again, and give the
+                # whole reservation back if the attempt may no longer start (DESIGN §5 notes).
+                left = deadline - self._clock.now()
+                if not (left > 0 if tried == 0 else left >= MIN_ATTEMPT_S):
+                    self._safely(self._store.release, res)
+                    c.reason, c.ready_at = "not_tried", self._clock.now()
+                    return _STOP if last_resort else None
 
-            attempts += 1
-            path.append(model.id)
-            full_timeout = min(ATTEMPT_TIMEOUT_CAP_S, self._config.request_deadline_s)
-            # The time left measured after reserving (> 0 here), so never zero or negative.
-            timeout = min(full_timeout, left)
-            # Clearly cut short by the request deadline, by an earlier attempt or a slow upload
-            # (the deadline counts from arrival, DESIGN §20.3): at least MIN_ATTEMPT_S less than usual.
-            shortened = timeout <= full_timeout - MIN_ATTEMPT_S
-            attempt_started = self._clock.now()
-            call = upstream(model, timeout) if body is request else upstream(model, timeout, body=body)
-            try:
-                result = await asyncio.wait_for(call, timeout + 1.0)
-            except TimeoutError:
-                result = Unavailable("timeout")
+                tried += 1
+                path.append(model.id)
+                full_timeout = min(ATTEMPT_TIMEOUT_CAP_S, self._config.request_deadline_s)
+                # The time left measured after reserving (> 0 here), so never zero or negative.
+                timeout = min(full_timeout, left)
+                # Clearly cut short by the request deadline, by an earlier attempt or a slow upload
+                # (the deadline counts from arrival, DESIGN §20.3): at least MIN_ATTEMPT_S less than usual.
+                shortened = timeout <= full_timeout - MIN_ATTEMPT_S
+                # Only a timeout with the whole usual budget counts towards the streak (§22.1).
+                full_budget = timeout >= full_timeout
+                attempt_started = self._clock.now()
+                entry = Attempt(model.id)
+                log_.append(entry)
+                call = upstream(model, timeout) if body is request else upstream(model, timeout, body=body)
+                try:
+                    result = await asyncio.wait_for(call, timeout + 1.0)
+                except TimeoutError:
+                    result = Unavailable("timeout")
+                except asyncio.CancelledError:
+                    entry.finish("client_cancelled", None)
+                    raise
+            finally:
+                # The attempt's routing outcome is known, or it was cancelled (DESIGN §22.2).
+                self._store.release_slot(res)
+            entry.finish(log_outcome(result), result.status)
 
             if isinstance(result, Served):
+                if not result.stream:
+                    self._store.on_recovered(model, res)
                 self._note_handoff(owner, model, "served")
                 return RouteServed(model, result.payload, res, path, served_affinity, handoff_from,
-                                   turn=self._served_turn(turn, resolved, model, handoff_from))
+                                   turn=self._served_turn(turn, resolved, model, handoff_from),
+                                   attempt=entry)
             if isinstance(result, Rejected):
+                if result.status in RECOVERY_STATUSES:
+                    self._store.on_recovered(model, res)
                 self._note_handoff(owner, model, "rejected")
                 return RoutePassthrough(model, result.payload, res, path, served_affinity, handoff_from,
                                         rewritten=body is not request,
@@ -492,6 +559,7 @@ class Router:
                 # not 65 s (found in review). Read before applying it, so a 60 s cooldown still
                 # counts in full.
                 c.checked_at = self._clock.now()
+                self._store.on_recovered(model, res)  # it answered (DESIGN §22.1)
                 self._safely(self._store.on_rate_limited, model, cls, sent_at=res.at)
                 self._safely(self._store.refund_rpd, res)  # Google's 429 is the source of truth
             elif isinstance(result, Unavailable):
@@ -499,13 +567,21 @@ class Router:
                 c.unhealthy = True  # kept even if the merge below relabels it "quota"
                 # ...and the timeout is that budget running out, not an early network timeout.
                 ran_out = self._clock.now() - attempt_started >= timeout - 1.0
-                # A connect or pool timeout is an early network timeout, whatever its timing.
-                if shortened and ran_out and result.detail == "timeout" and not result.not_sent:
+                timed_out = result.detail == "timeout"
+                if result.not_sent:
+                    # This machine's network, not the model: today's 30 s, no streak (DESIGN §22.1).
+                    self._store.on_unavailable(model, res)
+                elif shortened and ran_out and timed_out:
                     # Not evidence the model is unhealthy: it got less than its usual time.
                     # No cooldown; the RPD reservation is kept (the call may have used quota).
                     c.detail = "timeout (cut short by the request deadline)"
+                elif result.counts or (timed_out and ran_out and full_budget and result.body_sent):
+                    # Counted; a stale outcome changes nothing (DESIGN §22.3).
+                    self._store.on_failure(model, res)
                 else:
-                    self._safely(self._store.on_unavailable, model)
+                    # An early timeout, a write timeout, one the deadline cut by under 5 s, or a
+                    # send phase that can't be told: today's 30 s, no streak (DESIGN §22.1).
+                    self._store.on_unavailable(model, res)
                 if result.not_sent:
                     # Google never saw it, and a locally blocked model is never called again,
                     # so nothing else would correct the daily count (DESIGN §5 step 4).
@@ -515,7 +591,7 @@ class Router:
                 self._store.disable(model)
                 self._safely(self._store.refund_rpd, res)
                 c.reason = "disabled"
-                continue
+                return None
             else:
                 raise TypeError(f"unexpected upstream result: {result!r}")
             # Its state now (DESIGN §5.2): a 5xx on a model that is also out of quota counts as quota.
@@ -525,10 +601,51 @@ class Router:
                 c.ready_at = now + STATE_ERROR_RETRY_S
                 # Unhealthy only after a 5xx; a 429 with an unreadable state stays a short wait.
                 c.unhealthy = c.reason == "unavailable"
-                continue
+                return None
             c.ready_at = blocked.ready_at if blocked else now
             if blocked and blocked.reason == "quota" and c.reason == "unavailable":
                 c.reason, c.detail = "quota", f"{c.detail}; {blocked.detail}"
+            return None
+
+        for model in candidates:
+            if owner is not None and model is not owner:
+                if hand_off is None:
+                    hand_off = self._may_hand_off(results[0])
+                if not hand_off:
+                    break  # the owner's own result decides (DESIGN §16.8)
+            # Calls the serving model didn't make carry the placeholder: after a handoff, or in
+            # a mixed turn served by its latest owner. An owner serving its own turn sends the
+            # body unchanged, unknown IDs included (most likely its own calls).
+            foreign = owner is not None and (
+                model.id != owner.id or any(v != model.id for v in known.values()))
+            body = with_placeholder_signatures(request, model.id, known) if foreign else request
+            # Estimated from what this model is sent: placeholders are much shorter than real
+            # signatures, so the client's body would overstate a handoff's size.
+            tokens = input_tokens if body is request else estimate_input_tokens(body)
+            c = Candidate(model)
+            results.append(c)
+            if self._store.is_disabled(model):
+                c.reason = "disabled"
+                continue
+            if not fits(model, tokens, output_tokens):
+                c.reason = "too_large"
+                continue
+            out = await attempt(c, body, tokens, last_resort=False)
+            if out is not None:
+                return out  # type: ignore[return-value]
+
+        # Last resort (DESIGN §22.2): the models skipped only for the soft part of a 5xx
+        # cooldown or a busy recovery slot, in candidate order, while attempts and time remain.
+        # A pinned owner comes first here, after its handoff targets have failed.
+        for c, body, tokens in deferred:
+            if self._store.is_disabled(c.model):
+                c.reason = "disabled"
+                continue
+            out = await attempt(c, body, tokens, last_resort=True)
+            if out is _STOP:
+                break
+            if out is not None:
+                return out  # type: ignore[return-value]
 
         out = self._final(name, results, path, affinity)
         out.turn = turn
@@ -572,20 +689,35 @@ class Router:
         return RouteFailed(503, "upstream_unavailable", f"no model available for {name}: {listing}",
                            retry_after, path, affinity, results)
 
-    def stream_error(self, served: RouteServed, kind: str, body: Any = None) -> None:
+    def stream_error(self, served: RouteServed, kind: str, body: Any = None,
+                     code: int | None = None) -> None:
         """An error event after streaming started (DESIGN §8). `kind` is "rate_limited",
-        "unavailable" or "client". Updates the model's state; the RPD slot is kept, because
-        the request was served in part. Never raises."""
+        "unavailable" or "client"; `code` is the event's code. Updates the model's state; the
+        RPD slot is kept, because the request was served in part. A 5xx or code-less event
+        counts towards the streak; a 429 or a recovery 4xx ends it (§22.1). Never raises."""
+        res = served.reservation
         try:
             if kind == "rate_limited":
+                self._store.on_recovered(served.model, res)
                 cls = classify_429(body, None)
-                self._safely(self._store.on_rate_limited, served.model, cls,
-                             sent_at=served.reservation.at)
+                self._safely(self._store.on_rate_limited, served.model, cls, sent_at=res.at)
             elif kind == "unavailable":
-                self._safely(self._store.on_unavailable, served.model)
+                self._store.on_failure(served.model, res)
+            elif code in RECOVERY_STATUSES:
+                self._store.on_recovered(served.model, res)
         except Exception:  # the client already has its error event; this is bookkeeping
             self.state_errors += 1
             log.exception("could not record a mid-stream error for %s", served.model.id)
+
+    def stream_done(self, served: RouteServed) -> None:
+        """The stream ended cleanly with [DONE]: the model has recovered, unless the outcome
+        is stale (DESIGN §22.1, §22.3). Not called at the first event, so a model that keeps
+        breaking mid-stream still builds a streak. Never raises."""
+        try:
+            self._store.on_recovered(served.model, served.reservation)
+        except Exception:
+            self.state_errors += 1
+            log.exception("could not record a finished stream for %s", served.model.id)
 
     def complete(self, served: RouteServed, prompt_tokens: int | None,
                  tool_call_ids: list[str] | None = None) -> None:

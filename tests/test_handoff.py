@@ -182,8 +182,8 @@ def test_short_429_with_an_unreadable_state_is_not_a_handoff(monkeypatch):
         {"@type": "type.googleapis.com/google.rpc.RetryInfo", "retryDelay": "20s"}]}}
     real_reserve = env.store.try_reserve
 
-    def reserve_then_break(model, tokens):
-        res = real_reserve(model, tokens)
+    def reserve_then_break(model, tokens, **kw):
+        res = real_reserve(model, tokens, **kw)
         monkeypatch.setattr(env.store, "check", lambda *a: (_ for _ in ()).throw(sqlite3.OperationalError("x")))
         return res
 

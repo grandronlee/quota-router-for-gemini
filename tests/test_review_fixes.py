@@ -182,7 +182,7 @@ def test_timeout_cut_short_by_the_deadline_does_not_cool_down_a_healthy_model():
                                         "model-b": (70, _Unavailable("timeout"))})
     cooled = []
     real = e.store.on_unavailable
-    e.store.on_unavailable = lambda m: (cooled.append(m.id), real(m))
+    e.store.on_unavailable = lambda m, res=None: (cooled.append(m.id), real(m, res))
     out = e.route(chat(), call)
     assert isinstance(out, RouteFailed) and out.status == 503
     assert timeouts == {"model-a": 120, "model-b": 60}

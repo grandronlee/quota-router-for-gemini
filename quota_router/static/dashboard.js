@@ -52,8 +52,12 @@ function renderModels() {
       usageCell(s.rpm_used, s.rpm_limit), usageCell(s.tpm_input_used, s.tpm_input_limit),
       usageCell(s.rpd_used, s.rpd_limit));
     const until = s.exhausted_until || s.cooldown_until;
-    const td = el("td", until ? fmtDuration(untilSeconds(until)) : "–");
-    if (until) td.dataset.until = until;
+    const td = el("td");
+    const left = el("span", until ? fmtDuration(untilSeconds(until)) : "–");
+    if (until) left.dataset.until = until;
+    td.append(left);
+    // Failed calls in a row (DESIGN §22.4); the cooldown grows with it.
+    if (s.unavailable_streak) td.append(el("span", ` · ${num(s.unavailable_streak)} failed in a row`, "muted"));
     tr.append(td);
     rows.push(tr);
   }
@@ -83,8 +87,8 @@ function renderErrors() {
 function tick() {
   if (!data) return;
   document.getElementById("reset").textContent = fmtDuration(untilSeconds(data.next_pt_reset));
-  for (const td of document.querySelectorAll("td[data-until]")) {
-    td.textContent = fmtDuration(untilSeconds(td.dataset.until));
+  for (const span of document.querySelectorAll("span[data-until]")) {
+    span.textContent = fmtDuration(untilSeconds(span.dataset.until));
   }
 }
 

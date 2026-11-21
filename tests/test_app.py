@@ -436,7 +436,7 @@ def _opened_stream_then(outcome_factory):
     up = Upstream({"model-a": [httpx.Response(200, headers={"content-type": "text/event-stream"}, stream=body)]})
     p = make_proxy()
 
-    async def route(request, upstream, *, started_at=None):
+    async def route(request, upstream, *, started_at=None, attempts=None):
         await upstream(p.config.models["a"], 5.0)  # returns Served(Stream), which the router drops
         return outcome_factory()
 

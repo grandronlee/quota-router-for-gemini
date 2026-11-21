@@ -3,7 +3,12 @@
 - RPM and input-TPM: rolling 60 s windows, in memory only.
 - RPD: counter per (model, PT date), persisted to SQLite.
 - exhausted_until (per-day 429): persisted to SQLite.
-- Cooldowns and "disabled": in memory only.
+- Cooldowns, the 5xx failure streak and "disabled": in memory only.
+
+A model that keeps failing gets a growing 5xx cooldown (DESIGN §22): its first 30 s block it
+(hard), the rest only moves it to the back (soft, tried as a last resort). While its streak is
+above 0 and the hard part is over, one reservation at a time holds its recovery slot. An epoch
+per model makes outcomes of attempts reserved before the last state change stale (§22.3).
 
 Every method is synchronous and never awaits, so in the single event-loop thread
 each call is atomic. `try_reserve` checks eligibility and reserves in one call.
@@ -27,7 +32,12 @@ from .clock import Clock, next_pt_midnight, pt_date, pt_day_start
 from .config import ModelConfig
 
 WINDOW_S = 60.0
-UNAVAILABLE_COOLDOWN_S = 30.0
+UNAVAILABLE_COOLDOWN_S = 30.0  # the hard part of every 5xx cooldown (DESIGN §22.2)
+UNAVAILABLE_GROWTH = 4
+UNAVAILABLE_MAX_S = 900.0
+# Retry-After when a model is skipped only because its recovery attempt is in flight (DESIGN
+# §22.2). The attempt can take up to 120 s; this keeps a compliant client from retrying every second.
+RECOVERY_RETRY_S = 5.0
 DEFAULT_429_COOLDOWN_S = 60.0
 RPD_KEEP_DAYS = 7
 # A per-day 429 this soon after PT midnight is taken as Google's reset lagging behind
@@ -52,6 +62,15 @@ class Reservation:
     tokens: _TokenEntry
     rpd_refunded: bool = False
     settled: bool = False
+    epoch: int = 0  # the model's epoch when reserved (DESIGN §22.3)
+    slot: bool = False  # holds the model's recovery slot until `release_slot` (§22.2)
+
+
+def unavailable_cooldown_s(streak: int) -> float:
+    """Length of the 5xx cooldown after `streak` counted failures in a row (DESIGN §22.2)."""
+    if streak <= 0:
+        return 0.0
+    return min(UNAVAILABLE_MAX_S, UNAVAILABLE_COOLDOWN_S * UNAVAILABLE_GROWTH ** min(streak - 1, 8))
 
 
 @dataclass(frozen=True)
@@ -62,6 +81,9 @@ class Blocked:
     # A 5xx cooldown is live, even if `reason` is "quota" because a quota limit is hit too
     # (DESIGN §5.2). Handoffs need it: an unhealthy owner hands off (§16.8).
     cooling_down: bool = False
+    # Only the soft part of a 5xx cooldown, or a recovery attempt in flight, keeps the model
+    # out: the router may still try it in its last-resort pass (DESIGN §22.2).
+    deferred: bool = False
 
 
 @dataclass
@@ -71,7 +93,11 @@ class _State:
     rpm: deque[float] = field(default_factory=deque)
     tokens: deque[_TokenEntry] = field(default_factory=deque)
     quota_cooldown_until: float = 0.0
-    unavailable_cooldown_until: float = 0.0
+    unavailable_cooldown_until: float = 0.0  # hard: blocks the model
+    soft_until: float = 0.0  # end of the whole 5xx cooldown; after the hard part, tried last
+    streak: int = 0  # counted 5xx failures in a row (DESIGN §22.1)
+    epoch: int = 0  # moves on whenever the streak or the 5xx cooldown changes (§22.3)
+    slot: Reservation | None = None  # the recovery attempt in flight (§22.2)
     tpm_full_until: float = 0.0
     exhausted_until: float = 0.0
     disabled: bool = False
@@ -127,7 +153,8 @@ class QuotaStore:
             st.tokens.popleft()
         return st
 
-    def _blocked(self, model: ModelConfig, st: _State, input_tokens: int, now: float) -> Blocked | None:
+    def _blocked(self, model: ModelConfig, st: _State, input_tokens: int, now: float,
+                 last_resort: bool = False) -> Blocked | None:
         quota: list[str] = []
         ready = now
 
@@ -149,14 +176,23 @@ class QuotaStore:
             quota.append("tpm")
             ready = max(ready, tpm_ready)
 
-        unavailable = st.unavailable_cooldown_until > now
-        if unavailable:
+        hard = st.unavailable_cooldown_until > now
+        soft = not hard and st.soft_until > now
+        recovering = not hard and st.streak > 0 and st.slot is not None
+        if hard:
             ready = max(ready, st.unavailable_cooldown_until)
 
         if quota:
-            return Blocked("quota", ready, ", ".join(quota), cooling_down=unavailable)
-        if unavailable:
+            # Kept with a quota reason too, so a failing owner still hands off (§16.8, §22.2).
+            return Blocked("quota", ready, ", ".join(quota), cooling_down=hard or soft or recovering)
+        if hard:
             return Blocked("unavailable", ready, "5xx cooldown", cooling_down=True)
+        # Deferred models are ready now as a last resort, so they don't stretch Retry-After.
+        if soft and not last_resort:
+            return Blocked("unavailable", now, "5xx cooldown, tried last", cooling_down=True, deferred=True)
+        if recovering:
+            return Blocked("unavailable", now + RECOVERY_RETRY_S, "recovery attempt in flight",
+                           cooling_down=True, deferred=True)
         return None
 
     @staticmethod
@@ -179,21 +215,25 @@ class QuotaStore:
 
     # ---- public API ------------------------------------------------------
 
-    def check(self, model: ModelConfig, input_tokens: int) -> Blocked | None:
+    def check(self, model: ModelConfig, input_tokens: int, *, last_resort: bool = False) -> Blocked | None:
         """Why the model can't take this request now (None if it can). Reserves nothing."""
         now = self._clock.now()
-        return self._blocked(model, self._get(model, now), input_tokens, now)
+        return self._blocked(model, self._get(model, now), input_tokens, now, last_resort)
 
     def ready_at(self, model: ModelConfig, input_tokens: int) -> float:
         now = self._clock.now()
         b = self._blocked(model, self._get(model, now), input_tokens, now)
         return b.ready_at if b else now
 
-    def try_reserve(self, model: ModelConfig, input_tokens: int) -> Reservation | Blocked:
-        """Check eligibility and, if eligible, reserve one RPM slot, one RPD slot and the input tokens."""
+    def try_reserve(self, model: ModelConfig, input_tokens: int, *,
+                    last_resort: bool = False) -> Reservation | Blocked:
+        """Check eligibility and, if eligible, reserve one RPM slot, one RPD slot and the input
+        tokens. `last_resort` ignores the soft part of a 5xx cooldown (DESIGN §22.2). A model
+        with a failure streak also gives the reservation its recovery slot, which the caller
+        must free with `release_slot` (or `release`) once the attempt's outcome is known."""
         now = self._clock.now()
         st = self._get(model, now)
-        blocked = self._blocked(model, st, input_tokens, now)
+        blocked = self._blocked(model, st, input_tokens, now, last_resort)
         if blocked:
             return blocked
         self._save_rpd(model.id, st.day, st.rpd + 1)
@@ -201,7 +241,20 @@ class QuotaStore:
         st.rpm.append(now)
         entry = _TokenEntry(now, input_tokens)
         st.tokens.append(entry)
-        return Reservation(model.id, st.day, now, entry)
+        res = Reservation(model.id, st.day, now, entry, epoch=st.epoch)
+        if st.streak > 0:  # `_blocked` saw the slot free and the hard part over
+            res.slot = True
+            st.slot = res
+        return res
+
+    def release_slot(self, res: Reservation) -> None:
+        """Free the recovery slot if `res` holds it. Safe to call more than once."""
+        if not res.slot:
+            return
+        res.slot = False
+        st = self._state[res.model_id]
+        if st.slot is res:
+            st.slot = None
 
     def refund_rpd(self, res: Reservation) -> None:
         """Give back the RPD slot (after a 429 or 404). The RPM slot and tokens are kept."""
@@ -216,7 +269,8 @@ class QuotaStore:
 
     def release(self, res: Reservation) -> None:
         """Undo a reservation whose call was never started (DESIGN §5 notes): give back the
-        RPD slot, the RPM slot and the tokens. Memory first, then the RPD write."""
+        RPD slot, the RPM slot, the tokens and any recovery slot. Memory first, then the RPD write."""
+        self.release_slot(res)
         st = self._state[res.model_id]
         try:
             st.rpm.remove(res.at)
@@ -270,10 +324,44 @@ class QuotaStore:
         if c.kind == "tpm":
             st.tpm_full_until = max(st.tpm_full_until, now + WINDOW_S)
 
-    def on_unavailable(self, model: ModelConfig) -> None:
-        now = self._clock.now()
+    def on_unavailable(self, model: ModelConfig, res: Reservation | None = None) -> bool:
+        """A failure that doesn't count towards the streak (DESIGN §22.1): the hard 30 s only.
+        Changes neither the streak nor the epoch. With `res`, a stale outcome changes nothing,
+        so a delayed failure can't block a model that has since recovered (§22.3). Returns
+        whether the cooldown was set."""
         st = self._state[model.id]  # not `_get`, as in on_rate_limited
+        if res is not None and res.epoch != st.epoch:
+            return False
+        now = self._clock.now()
         st.unavailable_cooldown_until = max(st.unavailable_cooldown_until, now + UNAVAILABLE_COOLDOWN_S)
+        return True
+
+    def on_failure(self, model: ModelConfig, res: Reservation) -> bool:
+        """A counted failure of the attempt reserved as `res` (DESIGN §22.1). Grows the streak
+        and the cooldown, unless the outcome is stale (§22.3). Returns whether it counted."""
+        st = self._state[model.id]
+        if res.epoch != st.epoch:
+            return False
+        now = self._clock.now()
+        st.streak += 1
+        st.epoch += 1
+        st.unavailable_cooldown_until = max(st.unavailable_cooldown_until, now + UNAVAILABLE_COOLDOWN_S)
+        st.soft_until = max(st.soft_until, now + unavailable_cooldown_s(st.streak))
+        return True
+
+    def on_recovered(self, model: ModelConfig, res: Reservation) -> bool:
+        """The model answered the attempt reserved as `res` (DESIGN §22.1): the streak goes to
+        0 and the 5xx cooldown ends, unless the outcome is stale (§22.3). At streak 0 nothing
+        changes and the epoch stays, so a busy healthy model keeps today's 30 s cooldown from a
+        later 503. Returns whether the state changed."""
+        st = self._state[model.id]
+        if st.streak == 0 or res.epoch != st.epoch:
+            return False
+        st.streak = 0
+        st.epoch += 1
+        st.unavailable_cooldown_until = 0.0
+        st.soft_until = 0.0
+        return True
 
     def disable(self, model: ModelConfig) -> None:
         self._state[model.id].disabled = True
@@ -287,7 +375,7 @@ class QuotaStore:
         out = {}
         for model_id, model in self._models.items():
             st = self._get(model, now)
-            cooldown = max(st.quota_cooldown_until, st.unavailable_cooldown_until)
+            cooldown = max(st.quota_cooldown_until, st.unavailable_cooldown_until, st.soft_until)
             out[model_id] = {
                 "rpm_used": len(st.rpm), "rpm_limit": model.rpm,
                 "tpm_input_used": sum(e.tokens for e in st.tokens), "tpm_input_limit": model.tpm_input,
@@ -295,5 +383,6 @@ class QuotaStore:
                 "cooldown_until": cooldown if cooldown > now else None,
                 "exhausted_until": st.exhausted_until if st.exhausted_until > now else None,
                 "disabled": st.disabled,
+                "unavailable_streak": st.streak,
             }
         return out

@@ -37,8 +37,8 @@ from .db import connect
 from .logs import REQUEST_LOGGER
 from .metrics import OUTCOMES, STATUSES, Metrics, RequestStats, bounded
 from .quota import QuotaStore
-from .router import (ModelNotFound, RateLimited, Rejected, RouteFailed, RoutePassthrough, RouteServed,
-                     Router, Served, Unavailable, UpstreamResult, estimate_input_tokens)
+from .router import (Attempt, ModelNotFound, RateLimited, Rejected, RouteFailed, RoutePassthrough,
+                     RouteServed, Router, Served, Unavailable, UpstreamResult, estimate_input_tokens)
 from .scrub import Scrubber
 from .settings import Settings, normalize_host
 from .turns import TurnLog, TurnRef
@@ -197,7 +197,7 @@ class Proxy:
                affinity: str | None = None, input_estimate: int | None = None,
                prompt_tokens: int | None = None, output_tokens: int | None = None,
                first_byte_s: float | None = None, http_path: str | None = None,
-               handoff_from: str | None = None) -> None:
+               handoff_from: str | None = None, attempts: list[Attempt] | None = None) -> None:
         """One request's metrics, /status counts and its JSON log line (DESIGN §17.2)."""
         now = self.clock.now()
         self.metrics.inc("qr_requests_total", route=route, status=bounded(status, STATUSES), reason=reason)
@@ -216,6 +216,8 @@ class Proxy:
             "prompt_tokens": prompt_tokens, "output_tokens": output_tokens,
             "latency_ms": round((time.monotonic() - started) * 1000),
             "first_byte_ms": None if first_byte_s is None else round(first_byte_s * 1000),
+            # One entry per upstream call: model, outcome, status, ms; never error text (DESIGN §22.4).
+            "attempts": [a.log() for a in attempts or []],
         }
         if http_path is not None:
             fields["path"] = http_path[:200]
@@ -329,8 +331,10 @@ class StreamSession:
     """Forwards one served stream and settles it exactly once (DESIGN §8, §20.5)."""
 
     def __init__(self, proxy: Proxy, served: RouteServed, stream: Stream, *, request_id: str,
-                 route: str, started: float, input_estimate: int) -> None:
+                 route: str, started: float, input_estimate: int,
+                 attempts: list[Attempt] | None = None) -> None:
         self.p = proxy
+        self.attempts = attempts
         self.served = served
         self.stream = stream
         self.request_id = request_id
@@ -346,6 +350,9 @@ class StreamSession:
         self.prompt_tokens: int | None = None
         self.output_tokens: int | None = None
         self.first_byte_s: float | None = None
+        # How the served call ended, for its `attempts` entry (DESIGN §22.4); None: still open.
+        self.outcome: tuple[str, int | None] | None = None
+        self.status = served.attempt.status if served.attempt else None
 
     def _complete(self, prompt_tokens: int | None) -> None:
         ids, self.pending_ids = self.pending_ids, []
@@ -372,20 +379,23 @@ class StreamSession:
 
     def _record_stream_error(self, err: dict, ev: SSEEvent) -> None:
         """A 429 or 5xx after streaming started still updates the model's state (DESIGN §8)."""
-        kind, _ = error_event_kind(err)
+        kind, code = error_event_kind(err)
+        self.outcome = ("stream_error", code)
         raw = (ev.data or "").encode("utf-8")
         if kind == "rate_limited" and self.p.captures:
             try:
                 self.p.captures.save(self.served.model.id, 429, {}, raw)
             except Exception:  # a capture must never stop the error event reaching the client
                 log.exception("could not save a mid-stream 429 capture")
-        self.p.router.stream_error(self.served, kind, raw)  # never raises
+        self.p.router.stream_error(self.served, kind, raw, code)  # never raises
 
     def _handle(self, ev: SSEEvent) -> tuple[bytes | None, bool]:
         """Process one upstream event; returns (bytes to send, stop)."""
         if ev.is_done:
             self._complete_if_needed()  # before [DONE] reaches the client (router contract)
             self.done = True
+            self.outcome = ("stream_complete", self.status)
+            self.p.router.stream_done(self.served)  # the model recovered (DESIGN §22.1); never raises
             return ev.raw, True
         err = ev.error()
         if err is not None:  # mid-stream upstream error: one error event, no [DONE]
@@ -424,11 +434,13 @@ class StreamSession:
                 if not isinstance(e, (httpx.HTTPError, httpx.StreamError)):
                     log.exception("reading the upstream stream failed")
                 self.reason = "stream_error"
+                self.outcome = ("stream_incomplete", self.status)  # neutral (DESIGN §22.1)
                 self._complete_if_needed()
                 yield self._error_event(f"upstream stream failed: {type(e).__name__}")
                 return
             if ev is None:
                 self.reason = "stream_error"
+                self.outcome = ("stream_incomplete", self.status)  # neutral (DESIGN §22.1)
                 self._complete_if_needed()
                 yield self._error_event("upstream stream ended before [DONE]")
                 return
@@ -439,6 +451,9 @@ class StreamSession:
         self.finished = True
         if not self.done and self.reason == "served":
             self.reason = "client_disconnected"
+        if self.served.attempt is not None:
+            outcome, status = self.outcome or ("client_cancelled", self.status)
+            self.served.attempt.finish(outcome, status)
         try:
             self._complete_if_needed()  # estimate kept
         except Exception:
@@ -452,7 +467,7 @@ class StreamSession:
                       path=self.served.path, affinity=self.served.affinity,
                       input_estimate=self.input_estimate, prompt_tokens=self.prompt_tokens,
                       output_tokens=self.output_tokens, first_byte_s=self.first_byte_s,
-                      handoff_from=self.served.handoff_from)
+                      handoff_from=self.served.handoff_from, attempts=self.attempts)
 
 
 class ManagedStream(StreamingResponse):
@@ -849,9 +864,11 @@ def create_app(proxy: Proxy) -> FastAPI:
         stream = body.get("stream") is True
         estimate = estimate_input_tokens(body)
         handles = HandleSet()
+        attempts: list[Attempt] = []  # filled as calls start, so a cancelled request logs them too
         assert p.upstream is not None
         routing = asyncio.ensure_future(
-            p.router.route(body, p.upstream.bind(body, stream, handles), started_at=arrived))
+            p.router.route(body, p.upstream.bind(body, stream, handles), started_at=arrived,
+                           attempts=attempts))
         # DESIGN §8: if the client goes away before the response starts, stop routing (no
         # more attempts or fallbacks for nobody). uvicorn doesn't cancel the handler itself.
         watcher = asyncio.ensure_future(_wait_for_disconnect(request))
@@ -873,7 +890,8 @@ def create_app(proxy: Proxy) -> FastAPI:
             await handles.close_except(None)
             # The model being called keeps its reservation; name it, since rpd_used went up.
             p.record(request_id=request_id, route=route, status=499, reason="client_disconnected",
-                     stream=stream, started=started, path=handles.attempted, input_estimate=estimate)
+                     stream=stream, started=started, path=handles.attempted, input_estimate=estimate,
+                     attempts=attempts)
             return Response(status_code=499)
         try:
             outcome = routing.result()
@@ -881,7 +899,7 @@ def create_app(proxy: Proxy) -> FastAPI:
             await handles.close_except(None)
             log.exception("routing failed")
             p.record(request_id=request_id, route=route, status=500, reason="internal_error",
-                     stream=stream, started=started, input_estimate=estimate)
+                     stream=stream, started=started, input_estimate=estimate, attempts=attempts)
             return openai_error(500, "internal_error", "internal proxy error", "server_error",
                                 {"x-request-id": request_id})
         served_payload = outcome.payload if isinstance(outcome, RouteServed) else None
@@ -898,7 +916,7 @@ def create_app(proxy: Proxy) -> FastAPI:
             reason = reason or "unavailable"
             p.record(request_id=request_id, route=route, status=outcome.status, reason=reason, stream=stream,
                      started=started, path=outcome.path, affinity=outcome.affinity, input_estimate=estimate,
-                     handoff_from=outcome.handoff_from)
+                     handoff_from=outcome.handoff_from, attempts=attempts)
             p.note_turn(outcome.turn, route=route, status=outcome.status, handoff_from=outcome.handoff_from)
             return JSONResponse(p.scrubber.obj(outcome.error_body()),
                                 status_code=outcome.status, headers=headers)
@@ -917,7 +935,8 @@ def create_app(proxy: Proxy) -> FastAPI:
                           else "mixed turn", outcome.model.key)
             p.record(request_id=request_id, route=route, status=b.status, reason="passthrough", stream=stream,
                      started=started, served_model=outcome.model.id, path=outcome.path,
-                     affinity=outcome.affinity, input_estimate=estimate, handoff_from=outcome.handoff_from)
+                     affinity=outcome.affinity, input_estimate=estimate, handoff_from=outcome.handoff_from,
+                     attempts=attempts)
             p.note_turn(outcome.turn, route=route, status=b.status, handoff_from=outcome.handoff_from)
             headers["content-type"] = b.content_type
             return Response(b.content, status_code=b.status, headers=headers)
@@ -928,7 +947,7 @@ def create_app(proxy: Proxy) -> FastAPI:
         payload = outcome.payload
         if isinstance(payload, Stream):
             session = StreamSession(p, outcome, payload, request_id=request_id, route=route,
-                                    started=started, input_estimate=estimate)
+                                    started=started, input_estimate=estimate, attempts=attempts)
             headers.update({"cache-control": "no-cache", "x-accel-buffering": "no"})
             return ManagedStream(session, headers)
 
@@ -950,7 +969,8 @@ def create_app(proxy: Proxy) -> FastAPI:
         p.record(request_id=request_id, route=route, status=b.status, reason="served", stream=stream,
                  started=started, served_model=outcome.model.id, path=outcome.path,
                  affinity=outcome.affinity, input_estimate=estimate, prompt_tokens=prompt_tokens,
-                 output_tokens=output_tokens, first_byte_s=first_byte, handoff_from=outcome.handoff_from)
+                 output_tokens=output_tokens, first_byte_s=first_byte, handoff_from=outcome.handoff_from,
+                 attempts=attempts)
         headers["content-type"] = b.content_type
         return Response(b.content, status_code=b.status, headers=headers)
 
