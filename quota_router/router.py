@@ -53,8 +53,12 @@ class RateLimited:
 
 @dataclass(frozen=True)
 class Unavailable:
-    """500/502/503/504, connect error, or timeout before the first byte."""
+    """500/502/503/504, connect error, or timeout before the first byte.
+
+    `not_sent`: the request never left the machine (connect error or timeout, pool timeout,
+    or a failure before sending started), so Google can't have counted it (DESIGN §5 step 4)."""
     detail: str
+    not_sent: bool = False
 
 
 @dataclass(frozen=True)
@@ -162,13 +166,23 @@ def requested_output_tokens(request: Mapping[str, Any]) -> int | None:
 
 
 def active_turn_tool_call_ids(messages: Any) -> list[str]:
-    """IDs of assistant tool calls after the last user message, oldest first."""
+    """IDs of assistant tool calls in the active turn, oldest first (DESIGN §5.1).
+
+    The turn starts at the last `user` message that doesn't come straight after a `tool`
+    message: Zoo Code sends its environment details that way after every tool result."""
     if not isinstance(messages, list):
         return []
     last_user = -1
+    before_users = None  # role of the message before the current run of user messages
+    prev_role = None
     for i, m in enumerate(messages):
-        if isinstance(m, dict) and m.get("role") == "user":
-            last_user = i
+        role = m.get("role") if isinstance(m, dict) else None
+        if role == "user":
+            if prev_role != "user":
+                before_users = prev_role
+            if before_users != "tool":
+                last_user = i
+        prev_role = role
     ids: list[str] = []
     for m in messages[last_user + 1:]:
         if not (isinstance(m, dict) and m.get("role") == "assistant"):
@@ -284,14 +298,22 @@ class Router:
             if res is None:  # eligible, but no attempts or time left
                 c.reason, c.ready_at = "not_tried", self._clock.now()
                 continue
+            # The reservation's SQLite write can wait (up to 1 s): measure again, and give the
+            # whole reservation back if the attempt may no longer start (DESIGN §5 notes).
+            left = deadline - self._clock.now()
+            if not (left > 0 if attempts == 0 else left >= MIN_ATTEMPT_S):
+                self._safely(self._store.release, res)
+                c.reason, c.ready_at = "not_tried", self._clock.now()
+                continue
 
             attempts += 1
             path.append(model.id)
             full_timeout = min(ATTEMPT_TIMEOUT_CAP_S, self._config.request_deadline_s)
-            timeout = min(full_timeout, deadline - self._clock.now())
-            # Clearly cut short by the request deadline (only possible after an earlier attempt
-            # used time): at least MIN_ATTEMPT_S less than usual.
-            shortened = attempts > 1 and timeout <= full_timeout - MIN_ATTEMPT_S
+            # The time left measured after reserving (> 0 here), so never zero or negative.
+            timeout = min(full_timeout, left)
+            # Clearly cut short by the request deadline, by an earlier attempt or a slow upload
+            # (the deadline counts from arrival, DESIGN §20.3): at least MIN_ATTEMPT_S less than usual.
+            shortened = timeout <= full_timeout - MIN_ATTEMPT_S
             attempt_started = self._clock.now()
             try:
                 result = await asyncio.wait_for(upstream(model, timeout), timeout + 1.0)
@@ -313,12 +335,17 @@ class Router:
                 c.reason, c.detail = "unavailable", result.detail
                 # ...and the timeout is that budget running out, not an early network timeout.
                 ran_out = self._clock.now() - attempt_started >= timeout - 1.0
-                if shortened and ran_out and result.detail == "timeout":
+                # A connect or pool timeout is an early network timeout, whatever its timing.
+                if shortened and ran_out and result.detail == "timeout" and not result.not_sent:
                     # Not evidence the model is unhealthy: it got less than its usual time.
                     # No cooldown; the RPD reservation is kept (the call may have used quota).
                     c.detail = "timeout (cut short by the request deadline)"
                 else:
                     self._safely(self._store.on_unavailable, model)
+                if result.not_sent:
+                    # Google never saw it, and a locally blocked model is never called again,
+                    # so nothing else would correct the daily count (DESIGN §5 step 4).
+                    self._safely(self._store.refund_rpd, res)
             elif isinstance(result, ModelNotFound):
                 log.error("model %s not found upstream; disabled until restart", model.id)
                 self._store.disable(model)
@@ -374,6 +401,21 @@ class Router:
                                retry_after, path, affinity, results)
         return RouteFailed(503, "upstream_unavailable", f"no model available for {name}: {listing}",
                            retry_after, path, affinity, results)
+
+    def stream_error(self, served: RouteServed, kind: str, body: Any = None) -> None:
+        """An error event after streaming started (DESIGN §8). `kind` is "rate_limited",
+        "unavailable" or "client". Updates the model's state; the RPD slot is kept, because
+        the request was served in part. Never raises."""
+        try:
+            if kind == "rate_limited":
+                cls = classify_429(body, None)
+                self._safely(self._store.on_rate_limited, served.model, cls,
+                             sent_at=served.reservation.at)
+            elif kind == "unavailable":
+                self._safely(self._store.on_unavailable, served.model)
+        except Exception:  # the client already has its error event; this is bookkeeping
+            self.state_errors += 1
+            log.exception("could not record a mid-stream error for %s", served.model.id)
 
     def complete(self, served: RouteServed, prompt_tokens: int | None,
                  tool_call_ids: list[str] | None = None) -> None:

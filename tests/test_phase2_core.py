@@ -12,7 +12,6 @@ from helpers import Env, FailingConn, T0, make_config, model_dict, pt
 from quota_router.classify import Classification
 from quota_router.config import ConfigError, parse_config
 from quota_router.db import SCHEMA, SCHEMA_VERSION, StateDBError, connect
-from quota_router.quota import midnight_grace_applies
 from quota_router.scrub import Scrubber
 from quota_router.settings import Settings, SettingsError, load_settings, normalize_host, parse_env_file
 from quota_router.upstream import CAPTURE_MAX_FILES
@@ -63,11 +62,19 @@ def test_context_fit_without_tpm_limit_uses_input_limit():
     assert fits(m, 1000, None) and not fits(m, 1001, None)
 
 
-@pytest.mark.parametrize("rpm,rpd,grace", [(15, 500, True), (5, 20, False), (None, 500, False),
-                                           (15, None, True), (None, None, True), (50, 500, False)])
-def test_midnight_grace_rule(rpm, rpd, grace):
-    m = make_config({"a": model_dict("model-a", rpm=rpm, rpd=rpd)}).models["a"]
-    assert midnight_grace_applies(m) is grace
+@pytest.mark.parametrize("rpm,rpd", [(15, 500), (5, 20), (None, 500), (15, None), (None, None), (50, 500)])
+def test_midnight_grace_applies_to_every_model(rpm, rpd):
+    # Changed after the Phase 4 review: a 5 RPM / 20 RPD model no longer loses the whole new day.
+    e = Env(make_config({"a": model_dict("model-a", rpm=rpm, rpd=rpd)}), start=pt(2026, 11, 21, 0, 0, 5))
+    e.store.on_rate_limited(e.model("a"), Classification("rpd", None), sent_at=e.clock.now())
+    snap = e.store.snapshot()["model-a"]
+    assert snap["exhausted_until"] is None and snap["cooldown_until"] == e.clock.now() + 60
+
+
+def test_per_day_429_after_the_grace_window_still_exhausts_a_small_model():
+    e = Env(make_config({"a": model_dict("model-a", rpm=5, rpd=20)}), start=pt(2026, 11, 21, 0, 10, 0))
+    e.store.on_rate_limited(e.model("a"), Classification("rpd", None), sent_at=e.clock.now())
+    assert e.store.snapshot()["model-a"]["exhausted_until"] == pt(2026, 11, 22)
 
 
 def test_daily_429_just_after_midnight_with_no_daily_limit_cools_down():

@@ -170,9 +170,15 @@ flowchart TD
       - **429**: classify it (§6) and set the cooldown or exhausted state. Refund the RPD
         reservation; Google's 429 is the source of truth. Keep the RPM slot, which is the
         conservative choice. Try the next candidate.
-      - **500/502/503/504, connect error or timeout before the first byte**: set a short
-        cooldown (30 s) and try the next candidate. Keep the reservation, because the
+      - **500/502/503/504, or a timeout or network error before the first byte**: set a
+        short cooldown (30 s) and try the next candidate. Keep the reservation, because the
         request may still have used quota.
+      - **The request never left the machine** (connect error, connect timeout, connection-pool
+        timeout, or a failure before sending started): the same 30 s cooldown, but refund the RPD
+        reservation and keep the RPM slot, as for a 429. Google never saw the request, and
+        a model blocked locally is never called again, so nothing would correct the count:
+        a network outage of a few minutes would otherwise use up a scarce model's day.
+        (Added 2026-11-21 after the Phase 4 review.)
       - **400/401/403/404/422**: return the error to the client unchanged. It is the
         client's or the configuration's problem, and switching models won't fix it.
         Exception: a 404 "model not found" marks that model as disabled for this run
@@ -224,8 +230,20 @@ placeholder signature (`skip_thought_signature_validator`) for history "transfer
 different model", but doesn't say whether a real signature works on a different model.
 
 Fallback inside a tool loop is therefore not assumed to be safe. The unit the proxy
-pins is the **active turn**: every message after the last `user` message. One turn can
-hold several assistant tool calls (a multi-step loop), and Google validates all of them.
+pins is the **active turn**: every message after the last `user` message that starts a turn.
+One turn can hold several assistant tool calls (a multi-step loop), and Google validates all of them.
+
+A `user` message that comes straight after `tool` messages doesn't start a turn. Zoo Code
+3.98.0 sends one after every set of tool results, carrying its auto-generated
+`environment_details` (seen in Phase 4; its OpenAI converter puts the non-tool parts of a
+tool-result message into a separate `user` message). Counting it as a new turn meant no Zoo
+Code tool turn was ever pinned. Whether Google treats such a message as a new turn isn't
+documented, so the proxy keeps the turn pinned, the safe choice. (Changed 2026-11-21.)
+
+A consequence worth stating: Zoo Code ends every task with a tool call, so a Zoo Code task
+stays on the model that served its first tool call. If that model runs out, the task gets 429
+or 503 until it is ready again, instead of switching models. That is the "no handoff in v1"
+rule below.
 
 - **Affinity record.** When the proxy serves a response that contains tool calls, it
   stores `tool_call_id → model` in SQLite (the same database as the quota state), kept
@@ -276,16 +294,19 @@ The sections above leave these open. `quota_router/` implements them as follows:
 - **Rule order.** Rules 2 and 3 apply in order, so an expired deadline whose remaining
   candidates are all `quota` returns 429, not 503.
 - **Per-day 429 and the PT date.** A per-day 429 exhausts the model until the PT midnight after
-  the request was *sent*. Two exceptions get a 60 s cooldown instead, and a warning in the log:
+  the request was *sent*. Two exceptions get a cooldown instead (60 s, or Google's `retryDelay` if longer), and a warning in the log:
   that midnight has already passed when the 429 is handled, or the request was sent in the first
-  10 minutes of a PT day. Google's reset may lag ours. The second exception applies only to a model
-  that can't use its whole day in 10 minutes (15 RPM × 10 = 150 < 500 RPD); a 5 RPM / 20 RPD model
-  gets none.
+  10 minutes of a PT day. Google's reset may lag ours. This applies to every model (changed
+  2026-11-21 after the Phase 4 review). A model that really used its whole day in those 10 minutes
+  (through usage outside the proxy, or with an empty `rpd`) gets a few more 429s, in bursts at
+  least 60 s apart and never above its RPM, and is then exhausted as usual.
 - **SQLite errors** (disk full, database locked) don't fail the request:
   - If the reservation can't be written, that candidate is skipped as `unavailable` and upstream is
     never called without a reservation.
   - A failed write after an upstream call is logged. Blocking state (exhausted) is set in memory
     first, so it still applies until restart. A failed refund leaves the slot used.
+  - Cooldown and exhausted state are set without reading the database, so a read that fails
+    (for example the first one of a new PT day) can't drop them.
   - A failed affinity lookup routes the turn as `unknown`.
   - The lock wait is 1 s, because a wait blocks the event loop.
 - **Retry delays** that are not finite or exceed 24 hours are ignored, and the default applies.
@@ -293,10 +314,16 @@ The sections above leave these open. `quota_router/` implements them as follows:
 - **`db_path`** in `config.yaml` (default `data/quota.sqlite3`) sets where the SQLite state lives.
 - **Attempts near the deadline** (added 2026-11-21 after the Phase 2 review): the first attempt
   runs while any time is left; a later attempt isn't started with less than 5 s left (that
-  candidate is `not_tried`). A later attempt whose timeout the deadline cut at least 5 s below
+  candidate is `not_tried`). An attempt whose timeout the deadline cut at least 5 s below
   the usual `min(120 s, request_deadline_s)`, and which then ran out that whole shortened time,
-  gets no 5xx cooldown: it got less time, which says nothing about the model's health. An earlier
-  network timeout (connect, pool) still cools down. Its RPD reservation is kept, as for any timeout.
+  gets no 5xx cooldown: it got less time, which says nothing about the model's health. This
+  includes the first attempt, since the upload counts against the deadline (§20.3). An earlier
+  network timeout (connect, pool) still cools down. Its RPD reservation is kept, as for any
+  timeout, unless the request never left the machine (step 4). The time left is measured again
+  after the slot is reserved, since the SQLite write can wait up to 1 s. If it no longer meets the
+  rule above (any time for the first attempt, 5 s for a later one), the whole reservation (RPM
+  slot, tokens and RPD slot) is released and the candidate is `not_tried`. Otherwise that time
+  sets the attempt timeout, so it is never zero or negative.
 
 ## 6. Classifying 429s
 
@@ -377,7 +404,10 @@ sequenceDiagram
 - The model can only be switched **before the first byte is sent to the client**.
   Rate-limit errors arrive before streaming starts, so this covers the main case.
 - Once bytes have been sent, an upstream error ends the stream with an SSE error event.
-  Responses from two models are never spliced together.
+  Responses from two models are never spliced together. The error still updates the model's
+  state, classified as for a first-event error (§20.4): a 429 sets the cooldown or exhausted
+  state, a 5xx or code-less error sets the 30 s cooldown. The RPD slot is kept, because the
+  request was served in part. (Added 2026-11-21 after the Phase 4 review.)
 - If the client disconnects, the upstream request is cancelled and usage keeps its estimate.
 
 ## 9. Timeouts and limits
@@ -465,7 +495,8 @@ formats, so the custom part is only the routing and quota logic (an estimated 40
 | Proxy restarts mid-day | RPD and exhausted state reload from SQLite; minute windows start empty (Google's 429 corrects any mistake) |
 | Usage outside the proxy | local counts are low; the first 429 marks the model correctly |
 | Daylight-saving change | reset computed in America/Los_Angeles with `zoneinfo` |
-| Upstream fails mid-stream | SSE error event; no splicing; no fallback |
+| Upstream fails mid-stream | SSE error event; no splicing; no fallback; a 429 or 5xx in it still sets the model's cooldown |
+| Network down (connect errors) | 30 s cooldown per model, RPD slot refunded; 503 when the candidates run out |
 | Every model exhausted | 429 with `Retry-After` set to the earliest reset |
 | Models overloaded (503 "high demand", common in Phase 0) | 30 s cooldown, next candidate; 503 when attempts or the deadline run out |
 | Request larger than every candidate's context | 400 `context_length_exceeded`, no upstream call |
@@ -773,8 +804,8 @@ cost. It must never cause spending, least of all without the user noticing: on a
 project, a fallback to a pricier model or a pace-upgrade to smart (§16.3) would do exactly that.
 
 What "paid" means for the Gemini API (checked 2026-11-21, Google's
-[billing](https://ai.google.dev/gemini-api/docs/billing) and
-[Google AI plans](https://ai.google.dev/gemini-api/docs/google-ai-plans) pages):
+[billing](https://aistudio.google.com/docs/billing) and
+[Google AI plans](https://aistudio.google.com/docs/google-ai-plans) pages):
 
 - Linking billing moves the project to the paid tier: the user buys prepaid credit and every
   request is charged per token from it. There is no already-paid allowance to use up; the
@@ -821,9 +852,8 @@ marked **(decide)** were open; each was approved as recommended on 2026-11-21.
 checked. A missing key is still a startup error, so a typo can't silently remove a limit.
 `/status` and `/metrics` show an empty limit as `null` / no `qr_*_limit` sample.
 
-The midnight grace of §5.2 needs both numbers. **(decide)** Recommended: grace applies when
-`rpd` is empty (no known daily limit to protect), or when `rpm × 10 < rpd`; an empty `rpm`
-with a set `rpd` gets no grace (it could use its whole day in 10 minutes).
+The midnight grace of §5.2 applies to every model, whatever its limits (changed 2026-11-21
+after the Phase 4 review; it used to need `rpm × 10 < rpd`).
 
 ### 20.3 Requests
 
@@ -835,8 +865,8 @@ with a set `rpd` gets no grace (it could use its whole day in 10 minutes).
   - `Host` must be `localhost`, `127.0.0.1` or `[::1]` (any port), or a name listed in
     `PROXY_ALLOWED_HOSTS` (comma-separated, empty by default; for a Tailscale name later, §18).
   - If an `Origin` header is present, its host must pass the same check. Requests without
-    `Origin` (CLI tools, VS Code extensions, scripts) are unaffected; Phase 4 confirms Zoo
-    Code sends none.
+    `Origin` (CLI tools, VS Code extensions, scripts) are unaffected. Zoo Code passed the guard
+    in Phase 4, so it sends none or a localhost one; which of the two wasn't recorded.
   - Otherwise 403 `forbidden_host` in OpenAI error format, counted in `qr_requests_total`.
   - No CORS headers are ever sent, so a cross-origin page can't read a response or send a
     preflighted `Authorization` header.
@@ -845,6 +875,22 @@ with a set `rpd` gets no grace (it could use its whole day in 10 minutes).
 - Body over `max_body_bytes` → 413; not a JSON object → 400 `invalid_request_error`; a body
   not fully received within `request_deadline_s` → 408 `request_timeout`. The deadline counts
   from arrival, so routing gets only the time the upload left.
+- **Body memory budget** (added 2026-11-21 in Phase 4). `max_body_bytes` limits one request,
+  not many at once, and a body is held as bytes, parsed JSON and the upstream request. So
+  request bodies share a budget, `max_inflight_body_bytes` in `config.yaml` (default 64 MB; a
+  startup error if below `max_body_bytes`). A request takes its declared `Content-Length` up
+  front, or else each chunk as it arrives. If that would go over the budget, the proxy answers
+  503 `server_busy` with `Retry-After: 1` at once, before buffering more. Nothing is reserved
+  and no upstream call is made. The bytes stay taken until the response ends: when a
+  non-stream response is returned, or when a stream ends in any way (`[DONE]`, error,
+  disconnect). They are released exactly once. Counted in `qr_requests_total` with reason `busy`.
+  The budget counts bytes on the wire, not memory. Agent traffic is mostly long strings (file
+  contents, base64 images), which peak at about 4× their size while held: 64 MB of it stays
+  inside the 512 MB container limit (§21.2). JSON made of many tiny objects can take 8–24× its
+  size once parsed, so a crafted body near `max_body_bytes` could still exhaust the container on
+  its own. That needs the proxy token, and Docker then restarts the proxy with its state intact.
+  A client that declares a large `Content-Length` and uploads slowly holds that much of the
+  budget until the request deadline.
 - The upstream request is the client's body with only two changes: `model` becomes the
   real ID, and streams get `stream_options.include_usage: true` (§7). None of the client's
   headers are forwarded; the proxy sends its own `Authorization: Bearer <GEMINI_API_KEY>`.
@@ -891,9 +937,9 @@ layer is closed before the callable returns.
 
 ### 20.6 Tool-call IDs
 
-Recorded 2026-11-20 PT ([probe-results.md](probe-results.md)): `call_` followed by 19 decimal
-digits, the size of a 64-bit integer. One sample can't show whether they are random or
-sequential. Affinity assumes an ID never repeats across responses.
+Recorded 2026-11-20 PT ([probe-results.md](probe-results.md)): `call_` followed by an unsigned
+64-bit integer in decimal, so 19 or 20 digits (both seen in Phase 4; nothing depends on the
+length). The samples can't show whether they are random or sequential. Affinity assumes an ID never repeats across responses.
 - When `complete()` records an ID already held by another live record, the proxy logs a
   warning and counts it (`qr_tool_call_id_reused_total`), so a repeating format shows up.
 - **(decide)** Record the format with one live tool-call request (from the 500 RPD of
@@ -929,7 +975,7 @@ sequential. Affinity assumes an ID never repeats across responses.
   `403`, `404`, `413`, `429`, `500`, `503`, `other`), reason (`served`, `passthrough`, `quota`,
   `unavailable`, `context_length_exceeded`, `no_enabled_model`, `model_not_found`,
   `bad_request`, `unauthorized`, `forbidden_host`, `stream_error`, `client_disconnected`,
-  `internal_error`, `login_throttled` (§21.4)), attempt outcome
+  `internal_error`, `login_throttled` (§21.4), `busy` (§20.3)), attempt outcome
   (§17.2), model state, token kind.
 - `qr_first_byte_seconds` buckets: 0.5, 1, 2, 5, 10, 20, 30, 60, 120, 180 s.
 
@@ -998,7 +1044,11 @@ Approving this section also approved the parts of §17 (layers 1–5 and the loc
   `./config.yaml` bind-mounted read-only at `/app/config.yaml`; named volume `qr-data` at
   `/app/data`; `json-file` logging with `max-size: 10m`, `max-file: 3`;
   `restart: unless-stopped`; `read_only: true` (writable only `/app/data` and a small `/tmp`
-  tmpfs); `cap_drop: [ALL]`; `security_opt: [no-new-privileges:true]`.
+  tmpfs); `cap_drop: [ALL]`; `security_opt: [no-new-privileges:true]`;
+  `mem_limit: 512m` and `pids_limit: 128` (added 2026-11-21 in Phase 4). It idles at about
+  50 MB; the headroom is for a few 20 MB bodies at once, each held as bytes, parsed JSON and
+  the re-encoded upstream request. If it hits the limit, Docker restarts it and its state
+  reloads from SQLite.
 - Service `test` (profile `test`, so `up` never starts it): the `test` stage running
   `pytest -q` with `network_mode: none`, which proves the suite needs no network.
   `docker compose run --rm test` becomes the documented command; the `.venv` command stays

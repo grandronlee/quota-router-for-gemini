@@ -40,7 +40,8 @@ from .router import (ModelNotFound, RateLimited, Rejected, RouteFailed, RoutePas
                      Router, Served, Unavailable, UpstreamResult, estimate_input_tokens)
 from .scrub import Scrubber
 from .settings import Settings, normalize_host
-from .upstream import Body, Captures, GeminiUpstream, HandleSet, SSEEvent, Stream, make_client
+from .upstream import (Body, Captures, GeminiUpstream, HandleSet, SSEEvent, Stream, error_event_kind,
+                       make_client)
 
 log = logging.getLogger("quota_router")
 request_log = logging.getLogger(REQUEST_LOGGER)
@@ -138,6 +139,7 @@ class Proxy:
         self.metrics = Metrics()
         self.stats = RequestStats(self.clock.now())
         self.auth_failures = 0
+        self.body_budget = BodyBudget(config.max_inflight_body_bytes)
         capture_dir = Path(config.db_path).parent / "429" if config.db_path != ":memory:" else None
         self.captures = Captures(capture_dir, self.scrubber, self.clock.now) if capture_dir else None
         self.client: httpx.AsyncClient | None = None
@@ -328,6 +330,17 @@ class StreamSession:
                          "code": "stream_error", "param": None}}
         return b"data: " + json.dumps(err).encode("utf-8") + b"\n\n"
 
+    def _record_stream_error(self, err: dict, ev: SSEEvent) -> None:
+        """A 429 or 5xx after streaming started still updates the model's state (DESIGN §8)."""
+        kind, _ = error_event_kind(err)
+        raw = (ev.data or "").encode("utf-8")
+        if kind == "rate_limited" and self.p.captures:
+            try:
+                self.p.captures.save(self.served.model.id, 429, {}, raw)
+            except Exception:  # a capture must never stop the error event reaching the client
+                log.exception("could not save a mid-stream 429 capture")
+        self.p.router.stream_error(self.served, kind, raw)  # never raises
+
     def _handle(self, ev: SSEEvent) -> tuple[bytes | None, bool]:
         """Process one upstream event; returns (bytes to send, stop)."""
         if ev.is_done:
@@ -338,6 +351,7 @@ class StreamSession:
         if err is not None:  # mid-stream upstream error: one error event, no [DONE]
             self.reason = "stream_error"
             self._complete_if_needed()
+            self._record_stream_error(err, ev)
             payload = self.p.scrubber.obj({"error": err})
             return b"data: " + self.p.scrubber.text(json.dumps(payload)).encode("utf-8") + b"\n\n", True
         obj = ev.json()
@@ -408,6 +422,7 @@ class ManagedStream(StreamingResponse):
     def __init__(self, session: StreamSession, headers: dict[str, str]) -> None:
         super().__init__(session.body(), media_type="text/event-stream", headers=headers)
         self.session = session
+        self.lease: BodyLease | None = None  # the request body's share of the budget
 
     async def __call__(self, scope, receive, send) -> None:
         try:
@@ -417,10 +432,14 @@ class ManagedStream(StreamingResponse):
         finally:
             with anyio.CancelScope(shield=True):
                 try:
-                    await self.body_iterator.aclose()  # type: ignore[attr-defined]
-                except Exception:
-                    pass
-                await self.session.finish()
+                    try:
+                        await self.body_iterator.aclose()  # type: ignore[attr-defined]
+                    except Exception:
+                        pass
+                    await self.session.finish()
+                finally:
+                    if self.lease is not None:
+                        self.lease.release()
 
 
 def _response_headers(request_id: str, path: list[str], affinity: str | None,
@@ -444,10 +463,55 @@ async def _wait_for_disconnect(request: Request) -> None:
         await asyncio.sleep(0)  # never spin, even with a server whose receive() doesn't wait
 
 
-async def _read_json(request: Request, limit: int) -> dict | Response:
+class BodyBudget:
+    """Bytes of request bodies in use at once, shared by all requests (DESIGN §20.3).
+    Only touched from the event loop, and never across an await, so no lock is needed."""
+
+    def __init__(self, limit: int) -> None:
+        self.limit = limit
+        self.used = 0
+
+    def lease(self) -> "BodyLease":
+        return BodyLease(self)
+
+
+class BodyLease:
+    """One request's share of the budget; `release` gives it all back, once."""
+
+    def __init__(self, budget: BodyBudget) -> None:
+        self._budget = budget
+        self.held = 0
+        self.released = False
+
+    def grow_to(self, size: int) -> bool:
+        """Hold at least `size` bytes. False (holding no more than before) if over the budget."""
+        extra = size - self.held
+        if extra <= 0:
+            return True
+        if self.released or self._budget.used + extra > self._budget.limit:
+            return False
+        self._budget.used += extra
+        self.held = size
+        return True
+
+    def release(self) -> None:
+        if not self.released:
+            self.released = True
+            self._budget.used -= self.held
+            self.held = 0
+
+
+def _busy() -> JSONResponse:
+    return openai_error(503, "server_busy", "too many large requests in progress; retry shortly",
+                        "server_error", {"Retry-After": "1"})
+
+
+async def _read_json(request: Request, limit: int, lease: BodyLease) -> dict | Response:
     declared = request.headers.get("content-length")
     if declared and declared.isdigit() and int(declared) > limit:
         return openai_error(413, "request_too_large", f"request body over {limit} bytes")
+    if declared and declared.isdigit() and not lease.grow_to(int(declared)):
+        return _busy()  # before buffering anything
     chunks: list[bytes] = []
     size = 0
     try:
@@ -455,6 +519,8 @@ async def _read_json(request: Request, limit: int) -> dict | Response:
             size += len(chunk)
             if size > limit:
                 return openai_error(413, "request_too_large", f"request body over {limit} bytes")
+            if not lease.grow_to(size):
+                return _busy()
             chunks.append(chunk)
     except ClientDisconnect:  # gone while uploading; nothing was reserved
         return Response(status_code=499)
@@ -533,16 +599,29 @@ def create_app(proxy: Proxy) -> FastAPI:
 
     @app.post("/v1/chat/completions")
     async def chat(request: Request):
+        lease = p.body_budget.lease()
+        handed_over = False
+        try:
+            response = await _chat(request, lease)
+            if isinstance(response, ManagedStream):
+                response.lease = lease  # released when the stream ends (DESIGN §20.3)
+                handed_over = True
+            return response
+        finally:
+            if not handed_over:
+                lease.release()
+
+    async def _chat(request: Request, lease: BodyLease):
         started = time.monotonic()
         arrived = p.clock.now()
         request_id = uuid.uuid4().hex[:16]
         try:  # the request deadline covers the upload too (DESIGN §9); routing gets what's left
             async with asyncio.timeout(p.config.request_deadline_s):
-                body = await _read_json(request, p.config.max_body_bytes)
+                body = await _read_json(request, p.config.max_body_bytes, lease)
         except TimeoutError:
             body = openai_error(408, "request_timeout", "request body not received within the deadline")
         if isinstance(body, Response):
-            reason = "client_disconnected" if body.status_code == 499 else "bad_request"
+            reason = {499: "client_disconnected", 503: "busy"}.get(body.status_code, "bad_request")
             p.record(request_id=request_id, route="unknown", status=body.status_code, reason=reason,
                      started=started)
             body.headers["x-request-id"] = request_id

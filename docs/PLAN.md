@@ -179,11 +179,13 @@ if the proxy is to run somewhere other than the user's machine.
   (set up once with `python3 -m venv .venv && .venv/bin/pip install -r requirements-dev.txt`).
   Offline: injected clock, in-memory or temporary SQLite, no network.
 - From Phase 3: `docker compose run --rm test` (runs `pytest -q`)
-- Live smoke test: `python -I scripts/smoke.py` (uses quota; run by hand only)
+- Live smoke test: by hand, as recorded in [probe-results.md](probe-results.md) (Phase 4); it uses quota
 
 ## Pre-publish checklist
 
-- [ ] `git log -p | grep -iE 'AIza|api[_-]?key\s*='` finds nothing; `.env` and `data/` are ignored
+- [ ] No key-shaped string in history apart from the test placeholders:
+  `git log -p --all | grep -oE 'AIza[0-9A-Za-z_-]{35}' | grep -vxF -e AIzaSyTEST-key-000000000000000000000000 -e AIzaOTHERKEY_aaaaaaaaaaaaaaaaaaaaaaaaaa | wc -l`
+  prints 0 (only the two exact test fixtures are skipped); `.env` and `data/` are ignored
 - [ ] The exact key and token values find nothing either. Not every key starts with `AIza`:
   `set -a; . ./.env; set +a; git log -p --all | grep -cF -e "$GEMINI_API_KEY" -e "$PROXY_TOKEN"` prints 0
 - [ ] No screenshots or exported chats containing account details

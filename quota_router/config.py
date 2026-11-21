@@ -49,6 +49,8 @@ class Config(_Strict):
     db_path: str = "data/quota.sqlite3"
     billing: Literal["free", "paid"] = "free"
     max_body_bytes: PositiveInt = 20 * 1024 * 1024
+    # Shared by all request bodies in use at once (DESIGN §20.3).
+    max_inflight_body_bytes: PositiveInt = 64 * 1024 * 1024
     models: dict[str, ModelConfig]
     routes: dict[str, list[str]]
     handoffs: list[Any] = Field(default_factory=list)
@@ -78,6 +80,9 @@ class Config(_Strict):
             raise ValueError("no routes configured")
         if self.handoffs:
             raise ValueError("handoffs must be empty in v1 (DESIGN §5.1)")
+        if self.max_inflight_body_bytes < self.max_body_bytes:
+            raise ValueError("max_inflight_body_bytes must be at least max_body_bytes, or no "
+                             "request of the largest allowed size could ever be accepted")
         ids: dict[str, str] = {}
         for key, m in self.models.items():
             # Two keys for one real model would each believe they had its full quota.

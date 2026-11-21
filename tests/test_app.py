@@ -649,6 +649,7 @@ def test_disconnect_log_names_the_model_that_kept_its_reservation():
     line = next(json.loads(ln) for ln in logs.getvalue().splitlines() if '"event": "request"' in ln)
     assert line["status"] == 499 and line["fallback_path"] == ["model-a"]
     assert p.store.snapshot()["model-a"]["rpd_used"] == 1
+    assert p.body_budget.used == 0  # the body's share of the budget is back (DESIGN §20.3)
 
 
 def test_disconnect_during_upload_is_logged_not_raised():
@@ -667,6 +668,7 @@ def test_disconnect_during_upload_is_logged_not_raised():
     assert '"reason": "client_disconnected"' in logs.getvalue()
     assert "Traceback" not in logs.getvalue()
     assert up.requests == []
+    assert p.body_budget.used == 0
 
 
 # ---- pasted review findings (2026-11-21) -------------------------------------
@@ -710,3 +712,35 @@ def test_slow_upload_hits_the_request_deadline():
     assert sent[0]["status"] == 408
     assert up.requests == []
     assert '"status": 408' in logs.getvalue()
+    assert p.body_budget.used == 0  # the part counted before the deadline is given back
+
+
+def test_disconnect_mid_stream_releases_the_body_budget():
+    """DESIGN §20.3: a stream that ends by disconnect gives its body bytes back."""
+    held: list[int] = []
+
+    class Slow(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            yield sse(chunk("partial"), done=False)[0]
+            held.append(p.body_budget.used)  # while the stream runs
+            await asyncio.sleep(10)
+            yield b"data: [DONE]\n\n"
+
+    up = Upstream({"model-a": [httpx.Response(200, headers={"content-type": "text/event-stream"},
+                                              stream=Slow())]})
+    p = make_proxy()
+    body = json.dumps(chat_body(stream=True)).encode()
+    msgs = [{"type": "http.request", "body": body, "more_body": False}]
+
+    async def receive():
+        if msgs:
+            return msgs.pop(0)
+        await asyncio.sleep(0.3)  # the client leaves after the first chunk
+        return {"type": "http.disconnect"}
+
+    with mocked(up), captured_logs() as logs:
+        sent = _asgi_post(p, receive)
+    assert sent[0]["status"] == 200
+    assert '"reason": "client_disconnected"' in logs.getvalue()
+    assert held == [len(body)]  # held for the whole stream, not released when the handler returned
+    assert p.body_budget.used == 0

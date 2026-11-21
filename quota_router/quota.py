@@ -31,22 +31,14 @@ UNAVAILABLE_COOLDOWN_S = 30.0
 DEFAULT_429_COOLDOWN_S = 60.0
 RPD_KEEP_DAYS = 7
 # A per-day 429 this soon after PT midnight is taken as Google's reset lagging behind
-# ours, not as a used-up day, but only for a model that can't use its whole day in that
-# time (15 RPM × 10 min = 150 < 500 RPD). A 5 RPM / 20 RPD model gets no grace.
+# ours, not as a used-up day. Every model gets this grace (DESIGN §5 notes, changed after
+# the Phase 4 review): a day really used up gets a few 429s, 60 s apart, then is exhausted.
 MIDNIGHT_GRACE_S = 600.0
 
 log = logging.getLogger("quota_router")
 
 
-def midnight_grace_applies(model: ModelConfig) -> bool:
-    """DESIGN §5.2, §20.2: grace only for a model that can't use its whole day in the grace
-    window. No daily limit: grace. No per-minute limit with a daily one: no grace."""
-    if model.rpd is None:
-        return True
-    return model.rpm is not None and model.rpm * MIDNIGHT_GRACE_S / 60 < model.rpd
-
-
-@dataclass
+@dataclass(eq=False)  # compared by identity: `release` must remove this reservation's own entry
 class _TokenEntry:
     t: float
     tokens: int
@@ -219,6 +211,20 @@ class QuotaStore:
             st.rpd -= 1
         res.rpd_refunded = True
 
+    def release(self, res: Reservation) -> None:
+        """Undo a reservation whose call was never started (DESIGN §5 notes): give back the
+        RPD slot, the RPM slot and the tokens. Memory first, then the RPD write."""
+        st = self._state[res.model_id]
+        try:
+            st.rpm.remove(res.at)
+        except ValueError:
+            pass  # already outside the minute window
+        try:
+            st.tokens.remove(res.tokens)
+        except ValueError:
+            pass
+        self.refund_rpd(res)
+
     def settle(self, res: Reservation, prompt_tokens: int | None) -> None:
         """Replace the estimated input tokens with the reported `prompt_tokens`, if any."""
         if res.settled:
@@ -231,16 +237,19 @@ class QuotaStore:
         """Apply a 429. `sent_at` is when the rejected request was sent: a per-day 429 is about
         that request's PT day, even if it is handled after midnight."""
         now = self._clock.now()
-        st = self._get(model, now)
+        # Not `_get`: blocking state doesn't depend on the day, and `_get` can read SQLite
+        # (first call of a new PT day). A failed read must not drop the state (DESIGN §5 notes).
+        st = self._state[model.id]
         if c.kind == "rpd":
             sent = now if sent_at is None else sent_at
             day_end = next_pt_midnight(sent)
-            grace = midnight_grace_applies(model)
-            if day_end <= now or (grace and sent - pt_day_start(sent) < MIDNIGHT_GRACE_S):
-                # The day it was about has ended, or it came minutes after midnight:
-                # back off briefly instead of losing the whole new day.
+            if day_end <= now or sent - pt_day_start(sent) < MIDNIGHT_GRACE_S:
+                # The day it was about has ended, or it came minutes after midnight (every
+                # model, DESIGN §5 notes): back off briefly instead of losing the whole new day.
                 log.warning("per-day 429 from %s near PT midnight; cooling down instead", model.id)
-                st.quota_cooldown_until = max(st.quota_cooldown_until, now + DEFAULT_429_COOLDOWN_S)
+                # At least 60 s, and never shorter than a delay Google gave.
+                delay = max(DEFAULT_429_COOLDOWN_S, c.retry_after_s or 0.0)
+                st.quota_cooldown_until = max(st.quota_cooldown_until, now + delay)
                 return
             until = max(st.exhausted_until, day_end)
             st.exhausted_until = until
@@ -260,7 +269,7 @@ class QuotaStore:
 
     def on_unavailable(self, model: ModelConfig) -> None:
         now = self._clock.now()
-        st = self._get(model, now)
+        st = self._state[model.id]  # not `_get`, as in on_rate_limited
         st.unavailable_cooldown_until = max(st.unavailable_cooldown_until, now + UNAVAILABLE_COOLDOWN_S)
 
     def disable(self, model: ModelConfig) -> None:

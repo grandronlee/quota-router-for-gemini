@@ -123,11 +123,12 @@ def test_per_day_429_is_about_the_day_the_request_was_sent():
 
 # ---- follow-up review ----------------------------------------------------
 
-def test_no_grace_for_a_model_that_can_use_its_day_in_ten_minutes():
+def test_grace_also_for_a_model_that_can_use_its_day_in_ten_minutes():
+    # Reversed after the Phase 4 review: grace applies to every model (DESIGN §5 notes).
     e = one_model(pt(2026, 11, 21, 0, 4), rpm=5, rpd=20)
     out = e.route(chat(), ScriptedUpstream({"model-a": RateLimited(RPD_429)}))
-    assert e.store.snapshot()["model-a"]["exhausted_until"] == pt(2026, 11, 22)
-    assert out.status == 429
+    assert e.store.snapshot()["model-a"]["exhausted_until"] is None
+    assert out.status == 429 and out.retry_after_s == 60
 
 
 def test_rollover_read_failure_after_a_5xx_does_not_raise():

@@ -133,3 +133,28 @@ Hand-written; `scripts/probe.py` keeps this section when it regenerates the repo
 - The thought signature arrived in `delta.tool_calls[].extra_content` (233 characters as JSON).
 - `usage` arrived in the stream (prompt 53, completion 16, total 69) and replaced the
   proxy's estimate of 76 input tokens; the affinity record was written before `[DONE]`.
+
+### Phase 4 live smoke test (PLAN Phase 4), 2026-11-20 21:51–22:40 PT
+
+Run by hand through the Docker proxy (`docker compose up -d --build`), one model on
+`gemini-fast` (`gemini-3.5-flash-lite`: 15 RPM, 250K input TPM, 500 RPD in AI Studio).
+
+- One request on `gemini-fast`: HTTP 200, `x-served-model: gemini-3.5-flash-lite`, reply
+  `pong`, usage 8 prompt + 1 completion tokens; `/status` then showed `rpd_used: 1` and 8 input tokens.
+- Exhausted model: with an `exhausted` row written while the proxy was stopped (no call to
+  Google), the next request got 429 with `retry-after: 7664` at 21:52 PT, the time to 00:00 PST.
+  The log showed `fallback_path: []` (no upstream call). The row was removed afterwards.
+- Zoo Code 3.98.0, profile "OpenAI Compatible", base URL `http://localhost:4000/v1`, model
+  `gemini-fast`, Code mode: the README setup steps match. A read-read-write task ran 4 tool
+  turns, all 200, no 400s.
+- Restart mid-task: the proxy was restarted right after the first tool turn of a 3-file read
+  task (down 22:39:35–22:39:38 PT). Zoo Code showed one "Provider Error", retried by itself,
+  and finished the task. No warnings or errors in the proxy log.
+- Tool turns were never pinned (`affinity` empty on every request): Zoo Code sends a separate
+  `user` message (its `environment_details`) after every set of tool results. DESIGN §5.1 was
+  changed so that such a message continues the turn.
+- Tool-call IDs: `call_` followed by 19 **or 20** decimal digits (9 IDs: five with 19, four
+  with 20), so not a fixed length. Nothing in the proxy depends on the length.
+- Not checked: whether Zoo Code sends an `Origin` header (the log doesn't record it; every
+  request passed the browser guard, so it sends none or a localhost one), and the dashboard
+  through `tailscale serve` (DESIGN §18).

@@ -316,8 +316,11 @@ def test_parallel_requests_never_exceed_rpd():
 # ---- tool-loop pinning (DESIGN §5.1) -------------------------------------
 
 def test_active_turn_ids():
-    msgs = tool_turn(["old"]) + tool_turn(["c1", "c2"], ["c3"])
+    answered = [{"role": "assistant", "content": "done"}]
+    msgs = tool_turn(["old"]) + answered + tool_turn(["c1", "c2"], ["c3"])
     assert active_turn_tool_call_ids(msgs) == ["c1", "c2", "c3"]
+    # A user message straight after tool results continues the turn (DESIGN §5.1).
+    assert active_turn_tool_call_ids(tool_turn(["old"]) + tool_turn(["c1"])) == ["old", "c1"]
     assert active_turn_tool_call_ids([{"role": "user", "content": "x"}]) == []
     assert active_turn_tool_call_ids(None) == []
 

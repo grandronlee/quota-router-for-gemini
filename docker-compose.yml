@@ -38,6 +38,9 @@ services:
     cap_drop: [ALL]
     security_opt:
       - no-new-privileges:true
+    # Idles at ~50 MB; room for a few 20 MB request bodies at once (DESIGN §21.2).
+    mem_limit: 512m
+    pids_limit: 128
     restart: unless-stopped
     logging: *logging
 

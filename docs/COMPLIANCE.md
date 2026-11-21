@@ -1,12 +1,12 @@
 # Terms of service notes
 
 This is **not legal advice**. These notes summarise the parts of Google's terms that
-shaped this design, as read on 2026-11-20 (Gemini API Additional Terms effective
-2026-03-23). The terms change, so check the current text:
+shaped this design, as read on 2026-11-20 and rechecked on 2026-11-21 (Gemini API
+Additional Terms effective 2026-03-23). The terms change, so check the current text:
 
 - Google APIs Terms of Service: https://developers.google.com/terms
-- Gemini API Additional Terms of Service: https://ai.google.dev/gemini-api/terms
-- Rate limits: https://ai.google.dev/gemini-api/docs/rate-limits
+- Gemini API Additional Terms of Service: https://aistudio.google.com/docs/terms
+- Rate limits: https://aistudio.google.com/docs/rate-limits
 
 ## 1. Rate limits: stay within them, never get around them
 
@@ -22,8 +22,9 @@ How the design complies:
   with free quota uses limits Google grants separately for each model. It doesn't go past any of them.
 - After a 429, the proxy waits for at least the delay Google gives (or 60 s, or until
   the daily reset) before trying that model again. It never retries in a fast loop.
-- Only documented endpoints are used (`/v1beta/openai/`), as §2(c) requires ("only access
-  an API by the means described in the documentation").
+- Only documented endpoints are used (`/v1beta/openai/`), as §2(c) requires ("You will
+  only access (or attempt to access) an API by the means described in the documentation
+  of that API").
 
 Project wording: describe it as a "quota-aware router" or "automatic fallback". Avoid
 "bypass", "unlimited" or "beat the rate limit".
@@ -51,7 +52,7 @@ pool or share access.
 
 > "You may only access the Services (or make API Clients available to users) within an
 > available region." (Gemini API Additional Terms, Use Restrictions; regions listed at
-> https://ai.google.dev/gemini-api/docs/available-regions)
+> https://aistudio.google.com/docs/available-regions)
 
 - Each user is responsible for using the API only from an available region. The list
   changes; check it before you start.

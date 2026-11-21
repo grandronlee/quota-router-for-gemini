@@ -20,7 +20,7 @@ within Google's published limits for your own single project and key.
 - The model list and limits belong to **your** account. They differ between accounts and
   change over time: copy them from AI Studio, don't trust the example values.
 - Use it only from a region where the Gemini API is available
-  ([list](https://ai.google.dev/gemini-api/docs/available-regions)).
+  ([list](https://aistudio.google.com/docs/available-regions)).
 - On the free tier, Google may use your prompts and responses to improve its products,
   and human reviewers may read them. Don't send confidential code or personal data.
 - This doesn't raise or get around any limit. It uses the separate quota each model already has.
@@ -67,7 +67,8 @@ filesystem (for example `~/repo`), not under `/mnt/c`.
 
 The proxy listens on `127.0.0.1:4000` only. Its state (daily counts, exhausted models, tool-turn
 records) is in the `qr-data` Docker volume and survives restarts and rebuilds. Logs go to
-`docker compose logs quota-router`, rotated at 3 × 10 MB.
+`docker compose logs quota-router`, rotated at 3 × 10 MB. The container is capped at 512 MB of
+memory (it idles at about 50 MB); Docker Desktop's other figure is the machine's total.
 
 - After editing `config.yaml`: `docker compose up -d --force-recreate quota-router`. The proxy
   reads it only at startup, and a plain `up -d` doesn't notice a changed file. `restart` isn't

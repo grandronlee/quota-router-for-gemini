@@ -32,6 +32,9 @@ CHUNK_TIMEOUT_S = 120.0  # between stream chunks, once streaming has started (DE
 CAPTURE_MAX_FILES = 50
 CAPTURE_MAX_BYTES = 64 * 1024
 _UNAVAILABLE_STATUSES = {500, 502, 503, 504}
+# Raised before any byte of the request is written, so Google never saw it (DESIGN §5 step 4).
+# Read and write errors are not here: the request may have reached Google.
+_NOT_SENT_ERRORS = (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout)
 
 
 def make_client(transport: httpx.AsyncBaseTransport | None = None, *,
@@ -187,6 +190,18 @@ class Captures:
 
 # ---- the upstream call ------------------------------------------------------
 
+def error_event_kind(err: dict) -> tuple[str, int | None]:
+    """Classify an SSE error event's `error` object: ("rate_limited" | "unavailable" | "client",
+    code). Used for the first event (DESIGN §20.4) and for later ones (§8)."""
+    code = err.get("code")
+    code = code if isinstance(code, int) and not isinstance(code, bool) else None
+    if code == 429 or str(err.get("status", "")).upper() == "RESOURCE_EXHAUSTED":
+        return "rate_limited", code
+    if code is None or code >= 500 or code < 400:
+        return "unavailable", code
+    return "client", code
+
+
 def _is_model_not_found(body: bytes) -> bool:
     err = parse_error_body(body)
     if not err:
@@ -237,6 +252,7 @@ class GeminiUpstream:
                     model: ModelConfig, timeout_s: float) -> UpstreamResult:
         response: httpx.Response | None = None
         handed_over = False
+        sending = False  # once True, Google may have received the request
         try:
             async with asyncio.timeout(max(0.0, timeout_s)):
                 request = self._client.build_request(
@@ -244,6 +260,7 @@ class GeminiUpstream:
                     headers={"Authorization": f"Bearer {self._key}",
                              "Content-Type": "application/json",
                              "User-Agent": "quota-router-for-gemini"})
+                sending = True
                 response = await self._client.send(request, stream=True)
                 status = response.status_code
                 if 200 <= status < 300 and stream:
@@ -264,14 +281,15 @@ class GeminiUpstream:
                     return Served(s)
                 content = await response.aread()
         except TimeoutError:
-            return Unavailable("timeout")
-        except httpx.TimeoutException:
-            return Unavailable("timeout")
+            return Unavailable("timeout", not_sent=not sending)
+        except httpx.TimeoutException as e:
+            return Unavailable("timeout", not_sent=not sending or isinstance(e, _NOT_SENT_ERRORS))
         except httpx.HTTPError as e:
-            return Unavailable(f"error: {type(e).__name__}")
+            return Unavailable(f"error: {type(e).__name__}",
+                               not_sent=not sending or isinstance(e, _NOT_SENT_ERRORS))
         except Exception as e:  # noqa: BLE001 - contract: every exception becomes a result
             log.exception("unexpected error calling %s", model.id)
-            return Unavailable(f"error: {type(e).__name__}")
+            return Unavailable(f"error: {type(e).__name__}", not_sent=not sending)
         finally:
             if response is not None and not handed_over:
                 await _close_quietly(response)
@@ -290,14 +308,13 @@ class GeminiUpstream:
         return Rejected(Body(status, self._scrub.bytes(content), ctype))
 
     def _first_event_error(self, model: ModelConfig, err: dict, event: SSEEvent) -> UpstreamResult:
-        code = err.get("code")
-        code = code if isinstance(code, int) and not isinstance(code, bool) else None
+        kind, code = error_event_kind(err)
         raw = (event.data or "").encode("utf-8")
-        if code == 429 or str(err.get("status", "")).upper() == "RESOURCE_EXHAUSTED":
+        if kind == "rate_limited":
             if self._captures:
                 self._captures.save(model.id, 429, {}, raw)
             return RateLimited(raw, None)
-        if code is None or code >= 500 or code < 400:
+        if kind == "unavailable":
             return Unavailable(f"stream error event {code}")
         if code == 404 and _is_model_not_found(raw):
             return ModelNotFound(raw)

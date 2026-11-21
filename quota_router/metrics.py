@@ -16,7 +16,7 @@ from .clock import pt_date, pt_day_start
 STATUSES = ("200", "400", "401", "403", "404", "408", "413", "429", "500", "503")
 REASONS = ("served", "passthrough", "quota", "unavailable", "context_length_exceeded",
            "no_enabled_model", "model_not_found", "bad_request", "unauthorized", "forbidden_host",
-           "stream_error", "client_disconnected", "internal_error", "login_throttled")
+           "stream_error", "client_disconnected", "internal_error", "login_throttled", "busy")
 OUTCOMES = ("ok", "429_rpm", "429_tpm", "429_rpd", "429_unknown", "5xx", "timeout", "404", "4xx", "error")
 STATES = ("available", "cooldown", "exhausted", "disabled")
 FIRST_BYTE_BUCKETS = (0.5, 1, 2, 5, 10, 20, 30, 60, 120, 180)
