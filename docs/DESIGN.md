@@ -39,8 +39,10 @@ model that still has quota. Every request stays within Google's published limits
 - Raising limits. We never rotate several API keys, projects or accounts, and never
   retry to get past a limit. See [COMPLIANCE.md](COMPLIANCE.md).
 - Hosting the proxy for other people. Each user runs their own instance with their own key.
-- Spending money. The proxy only uses the free quota the user's project already has, and
-  never runs against a billed project (§19.1).
+- Spending money. The proxy uses the Gemini API's free quota, which a project without
+  billing gets at no cost, and never runs against a billed project, where every call is
+  charged (§19.1). Quota from paid Google plans (the Gemini app, Antigravity, the AI Studio
+  web page) can only be used inside those apps; the API can't reach it.
 - Translating between API formats. Google's OpenAI-compatible endpoint does that.
 - Live API, TTS, embeddings, image, video or music models.
 
@@ -756,16 +758,29 @@ classify the same way (unverified until a real 429 is captured).
 
 ### 19.1 Billing guard: never spend money
 
-The proxy exists to use the free quota a project already has. It must never cause spending,
-least of all without the user noticing: on a billed project, a fallback to a pricier model
-or a pace-upgrade to smart (§16.3) would do exactly that.
+The proxy exists to get the most out of the quota a user can use through the API at no
+cost. It must never cause spending, least of all without the user noticing: on a billed
+project, a fallback to a pricier model or a pace-upgrade to smart (§16.3) would do exactly that.
+
+What "paid" means for the Gemini API (checked 2026-11-21, Google's
+[billing](https://ai.google.dev/gemini-api/docs/billing) and
+[Google AI plans](https://ai.google.dev/gemini-api/docs/google-ai-plans) pages):
+
+- Linking billing moves the project to the paid tier: the user buys prepaid credit and every
+  request is charged per token from it. There is no already-paid allowance to use up; the
+  paid tier's limits are spend caps. Credits that come with a plan work the same way.
+- Google AI plans (Plus, Pro, Ultra) raise limits in the Gemini app, Antigravity and the AI
+  Studio web page only. API keys and outside apps are billed separately, so that quota is
+  used in those apps, not through this proxy. Tools that send API traffic through those
+  apps' sign-in break Google's terms and put the whole Google account at risk (COMPLIANCE.md).
+
+The guard:
 
 - `billing` in `config.yaml`, default `free`. `billing: paid` is a startup error, with a
-  message saying the proxy only supports free-tier projects. This is permanent, not a v1 stopgap.
+  message saying the proxy only runs on a project without billing, because on a billed
+  project every call it routes costs money. This is permanent, not a v1 stopgap.
 - The proxy can't detect billing itself; it relies on this setting. The README says plainly:
-  use a key from a project without billing enabled.
-- To verify, and to state in the README: whether enabling billing moves the whole project off
-  free-tier limits, so that every call is charged.
+  use a key from a project without billing (AI Studio shows "Free tier" on its Rate Limit page).
 
 ### 19.2 Setting up a new account
 
