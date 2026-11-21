@@ -4,7 +4,7 @@ A local, OpenAI-compatible router that sends each request to the best Gemini API
 that still has free-tier quota. It switches models automatically when one hits its rate
 limit, and stays within Google's published limits for your own single project and key.
 
-**Status: design phase. Nothing is implemented yet.**
+**Status: in development. The core routing logic exists; there is no HTTP server yet.**
 
 - [Design](docs/DESIGN.md)
 - [Implementation plan](docs/PLAN.md)

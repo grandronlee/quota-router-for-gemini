@@ -1,6 +1,6 @@
 """Offline tests for scripts/probe.py verdicts and parsing. No network.
 
-Run: python3 -I -m unittest discover -s tests -v
+Run: python3 -I -m unittest discover -s tests -p test_probe.py -v
 """
 
 import json

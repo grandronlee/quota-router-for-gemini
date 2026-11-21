@@ -40,7 +40,8 @@ Added after review (2026-11-20):
     drops `extra_content`, and DESIGN §5.1's fallback plan (the proxy re-attaches signatures) is needed.
   - Zoo Code version, and the outcome, in `probe-results.md`.
 - `--rescore` rebuilds the report from the raw runs without sending requests.
-- Probe regression tests: `python3 -I -m unittest discover -s tests -v` (offline).
+- Probe regression tests: `python3 -I -m unittest discover -s tests -p test_probe.py -v`
+  (offline, standard library only; `pytest` also runs them).
 
 Status (2026-11-20): runs at 04:43 PT (all models, 51 requests), 05:15 PT (v1 pair, 27
 requests) and 05:28 PT (v1 pair, tools only, 8 requests) are done, and so is the Zoo Code check.
@@ -90,12 +91,26 @@ Tests (`pytest`, injected clock, no network):
 - RPD state survives a simulated restart; it resets on the next PT date
 - classifier against the recorded Phase 0 bodies, plus an unknown body, and error
   bodies shaped as both an object and an array
+  (Phase 0 recorded no 429, so the 429 bodies are synthetic, shaped like Google's RPC
+  error format; the recorded 503 checks the array shape)
+
+Status (2026-11-21): **Phase 1 is complete.** `quota_router/` implements the modules above
+plus `db.py` and `affinity.py`; every test listed above exists, and `.venv/bin/python -m pytest -q`
+passes (129 tests, including the probe's). A deep code review and a follow-up review of its fixes
+are done, and their decisions are in DESIGN §5.2.
 
 ## Phase 2: HTTP layer
 
 - FastAPI app: auth, `/v1/chat/completions` (streaming and non-streaming), `/v1/models`, `/status`, `/healthz`.
 - Fallback loop per DESIGN §5; streaming rules per §8; response headers.
 - Removing keys from logs and errors.
+- Contract with the Phase 1 router (from the Phase 1 review):
+  - The `Upstream` callable maps every exception (httpx errors included) to an
+    `UpstreamResult`; only cancellation propagates.
+  - Call `Router.complete()` (which records tool-call affinity) before sending the final
+    chunk or `[DONE]`, so a fast follow-up request finds its turn's model.
+  - Record the tool-call ID format from real responses: affinity assumes IDs don't repeat
+    across responses.
 
 Tests (`respx` mocking upstream):
 - 429 → next model; 400 → returned unchanged; 503 → next model plus a cooldown
@@ -120,9 +135,12 @@ Tests (`respx` mocking upstream):
   Copilot Chat and the second Zoo Code profile wait for `gemini-smart` after v1.
 - Pre-publish checklist (below).
 
-## Validation commands (to be fixed in Phase 1)
+## Validation commands
 
-- Unit and integration: `docker compose run --rm test` (runs `pytest -q`)
+- Unit and integration, until Phase 3 adds Docker: `.venv/bin/python -m pytest -q`
+  (set up once with `python3 -m venv .venv && .venv/bin/pip install -r requirements-dev.txt`).
+  Offline: injected clock, in-memory or temporary SQLite, no network.
+- From Phase 3: `docker compose run --rm test` (runs `pytest -q`)
 - Live smoke test: `python -I scripts/smoke.py` (uses quota; run by hand only)
 
 ## Pre-publish checklist

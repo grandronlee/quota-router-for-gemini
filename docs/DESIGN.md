@@ -1,7 +1,7 @@
 # Design: quota-aware fallback router for the Gemini API
 
 Status: **revision 2, approved 2026-11-20** (after the first Phase 0 probe run and two
-external reviews). Nothing is implemented yet.
+external reviews). Phase 1 (core logic, no HTTP) is implemented in `quota_router/`.
 Project name: `quota-router-for-gemini`. License: MIT.
 
 ## 0. v1 scope
@@ -247,6 +247,45 @@ hold several assistant tool calls (a multi-step loop), and Google validates all 
   that Zoo Code drops `extra_content`, the fallback plan is for the proxy to store each
   signature with its affinity record and re-attach it. That would be a design change to approve first.
 
+### 5.2 Details settled in Phase 1 (pending approval)
+
+The sections above leave these open. `quota_router/` implements them as follows:
+
+- **Candidates after the limits run out.** Once attempts or the deadline are used up, the
+  remaining candidates are still checked (nothing is reserved). One that is blocked is reported as
+  `quota` or `unavailable` with its real `ready_at`; only an eligible one is `not_tried`.
+  This keeps `Retry-After` honest.
+- **Blocked for two reasons.** A model in a 5xx cooldown that is also out of RPM, RPD or TPM
+  room counts as `quota`, and its `ready_at` is the later of the two. This holds for a
+  candidate that was just tried too: a 5xx that used its last daily slot makes it `quota`.
+- **404 model not found** refunds the RPD slot, as a 429 does. The RPM slot is kept.
+- **Unknown 429**: cooldown is the longer of 60 s and any `retryDelay` it carries.
+- **Non-text message parts** (images) count as a flat 1,500 tokens each in the estimate,
+  not by their base64 length.
+- **Pinning and direct model IDs.** Pinning applies whatever the client asked for, including a
+  real model ID. If the turn's model is no longer in `config.yaml`, the turn is routed
+  normally and marked `unknown`.
+- **`x-turn-affinity: pinned`** is sent when a turn is pinned to one model, alongside the
+  `unknown` and `mixed` values above.
+- **Rule order.** Rules 2 and 3 apply in order, so an expired deadline whose remaining
+  candidates are all `quota` returns 429, not 503.
+- **Per-day 429 and the PT date.** A per-day 429 exhausts the model until the PT midnight after
+  the request was *sent*. Two exceptions get a 60 s cooldown instead, and a warning in the log:
+  that midnight has already passed when the 429 is handled, or the request was sent in the first
+  10 minutes of a PT day. Google's reset may lag ours. The second exception applies only to a model
+  that can't use its whole day in 10 minutes (15 RPM × 10 = 150 < 500 RPD); a 5 RPM / 20 RPD model
+  gets none.
+- **SQLite errors** (disk full, database locked) don't fail the request:
+  - If the reservation can't be written, that candidate is skipped as `unavailable` and upstream is
+    never called without a reservation.
+  - A failed write after an upstream call is logged. Blocking state (exhausted) is set in memory
+    first, so it still applies until restart. A failed refund leaves the slot used.
+  - A failed affinity lookup routes the turn as `unknown`.
+  - The lock wait is 1 s, because a wait blocks the event loop.
+- **Retry delays** that are not finite or exceed 24 hours are ignored, and the default applies.
+  The classifier never raises; anything it can't read is `unknown`.
+- **`db_path`** in `config.yaml` (default `data/quota.sqlite3`) sets where the SQLite state lives.
+
 ## 6. Classifying 429s
 
 Google does **not document** how a 429 tells you which limit was hit. Phase 0 records
@@ -368,6 +407,7 @@ sequenceDiagram
 upstream_base_url: https://generativelanguage.googleapis.com/v1beta/openai/
 request_deadline_s: 180
 max_attempts: 3
+db_path: data/quota.sqlite3   # RPD counts, exhausted state, tool affinity
 models:   # limits: copy your own project's values from AI Studio
   lite-3-5: { id: gemini-3.5-flash-lite, rpm: 15, tpm_input: 250000, rpd: 500,
               input_limit: 1048576, output_limit: 65536 }   # limits from models.list

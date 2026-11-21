@@ -1,0 +1,55 @@
+"""Tool-call affinity: tool_call_id → model that made the call (DESIGN §5.1).
+
+Kept in SQLite for 24 hours, so a restart in the middle of a tool turn keeps the
+turn on its model.
+"""
+
+from __future__ import annotations
+
+import sqlite3
+from typing import Iterable
+
+from .clock import Clock
+
+AFFINITY_TTL_S = 24 * 3600.0
+
+
+class AffinityStore:
+    def __init__(self, conn: sqlite3.Connection, clock: Clock, ttl_s: float = AFFINITY_TTL_S) -> None:
+        self._conn = conn
+        self._clock = clock
+        self._ttl = ttl_s
+        self.prune()
+
+    def prune(self) -> None:
+        self._conn.execute("DELETE FROM affinity WHERE created_at <= ?", (self._clock.now() - self._ttl,))
+
+    def record(self, tool_call_ids: Iterable[str], model_id: str) -> None:
+        ids = [i for i in dict.fromkeys(tool_call_ids) if isinstance(i, str) and i]
+        if not ids:
+            return
+        now = self._clock.now()
+        with self._conn:  # one transaction: all of a response's calls or none
+            self._conn.execute("BEGIN")
+            self._conn.executemany(
+                "INSERT INTO affinity (tool_call_id, model_id, created_at) VALUES (?, ?, ?) "
+                "ON CONFLICT (tool_call_id) DO UPDATE SET model_id = excluded.model_id, "
+                "created_at = excluded.created_at",
+                [(i, model_id, now) for i in ids])
+            self._conn.execute("DELETE FROM affinity WHERE created_at <= ?", (now - self._ttl,))
+
+    def lookup(self, tool_call_ids: Iterable[str]) -> dict[str, str]:
+        """Map each known, unexpired ID to its model ID. Unknown IDs are left out."""
+        ids = list(dict.fromkeys(i for i in tool_call_ids if isinstance(i, str) and i))
+        if not ids:
+            return {}
+        cutoff = self._clock.now() - self._ttl
+        out: dict[str, str] = {}
+        for start in range(0, len(ids), 500):  # stay under SQLite's parameter limit
+            chunk = ids[start:start + 500]
+            marks = ",".join("?" * len(chunk))
+            rows = self._conn.execute(
+                f"SELECT tool_call_id, model_id FROM affinity "
+                f"WHERE tool_call_id IN ({marks}) AND created_at > ?", (*chunk, cutoff))
+            out.update(dict(rows.fetchall()))
+        return out
