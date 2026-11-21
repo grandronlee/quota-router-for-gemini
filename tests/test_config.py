@@ -64,3 +64,11 @@ def test_missing_file_and_bad_yaml(tmp_path):
     empty.write_text("")
     with pytest.raises(ConfigError, match="mapping"):
         load_config(empty)
+
+
+def test_config_path_is_a_folder_explains_docker_fix(tmp_path):
+    # Docker creates an empty folder when the bind-mounted config.yaml is missing (DESIGN §21.2).
+    folder = tmp_path / "config.yaml"
+    folder.mkdir()
+    with pytest.raises(ConfigError, match=r"is a folder.*rmdir config\.yaml"):
+        load_config(folder)

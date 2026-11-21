@@ -413,7 +413,7 @@ sequenceDiagram
 | `GET /status` | for each model: RPM, TPM and RPD used/limit, cooldown and exhausted-until; next PT reset |
 | `GET /healthz` | liveness check |
 | `GET /metrics` | Prometheus metrics (§17), Phase 2 |
-| `GET /dashboard` | read-only status page with a cookie login (§17), Phase 3 |
+| `GET /dashboard` | read-only status page with a per-tab sign-in (§17, §21.4), Phase 3 |
 
 ## 12. Configuration (`config.yaml`)
 
@@ -675,7 +675,7 @@ is reconsidered only if the reports show stable patterns over weeks.
   user sets their own `timezone`.
 - Visibility and monitoring: §17. Hosting: §18.
 
-## 17. Observability — proposed, pending approval
+## 17. Observability — layers 1–5 and local collection approved 2026-11-21 (§21); alerts and remote rows proposed
 
 ### 17.1 Principles
 
@@ -699,8 +699,8 @@ is reconsidered only if the reports show stable patterns over weeks.
    the last few errors (status and reason only). Later: the pace line per paced model.
 4. **`/dashboard`**: a read-only HTML page served by the proxy, drawing on `/status`: quota
    bars, countdowns, pace line against actual use, decisions by reason, 5xx rate. A browser
-   can't easily send a bearer token, so a login form exchanges `PROXY_TOKEN` for an
-   `HttpOnly`, `SameSite=Strict` session cookie, valid only for `/dashboard` and `/status`.
+   can't easily send a bearer token, so a sign-in form exchanges `PROXY_TOKEN` for a session
+   valid only for the dashboard's data. Built as a per-tab session, not a cookie (§21.4).
 5. **`/metrics`** (Prometheus text, bearer token; if a host's scraper can't send one, a
    separate port bound to an internal interface):
 
@@ -730,7 +730,7 @@ is reconsidered only if the reports show stable patterns over weeks.
 Expected volume: about 1,000–3,000 requests a day, so under 100 MB of logs a month and a
 few hundred series. Free-tier figures are a snapshot from 2026-11-21 and change often.
 
-## 18. Hosting — proposed, pending approval
+## 18. Hosting — local Docker and Tailscale approved 2026-11-21 (§21); remote hosting proposed
 
 - **v1: local Docker**, published on `127.0.0.1` only and not running all day. That is fine:
   RPD counts, exhausted state and tool affinity are in SQLite, and the minute windows that
@@ -757,7 +757,7 @@ few hundred series. Free-tier figures are a snapshot from 2026-11-21 and change 
 Prices come from secondary sources dated 2026 and changed several times that year; check
 them before choosing.
 
-## 19. Other accounts and billing — proposed, pending approval
+## 19. Other accounts and billing — approved 2026-11-21
 
 The model list and limits in §2 belong to one free-tier account. Another account type, or
 an upgrade of this one, changes them. Changing models and limits is a config edit and a
@@ -929,7 +929,7 @@ sequential. Affinity assumes an ID never repeats across responses.
   `403`, `404`, `413`, `429`, `500`, `503`, `other`), reason (`served`, `passthrough`, `quota`,
   `unavailable`, `context_length_exceeded`, `no_enabled_model`, `model_not_found`,
   `bad_request`, `unauthorized`, `forbidden_host`, `stream_error`, `client_disconnected`,
-  `internal_error`), attempt outcome
+  `internal_error`, `login_throttled` (§21.4)), attempt outcome
   (§17.2), model state, token kind.
 - `qr_first_byte_seconds` buckets: 0.5, 1, 2, 5, 10, 20, 30, 60, 120, 180 s.
 
@@ -971,3 +971,157 @@ proxy's state and logs bounded over weeks of running:
   reuses free pages), in-app log rotation.
 - **Optional, Phase 3:** GitHub Dependabot alerts on the pinned requirements (free for public
   repos), so dependency updates are visible.
+
+## 21. Packaging, dashboard and setup (Phase 3) — approved 2026-11-21
+
+Approving this section also approved the parts of §17 (layers 1–5 and the local row of
+§17.3), §18 (local Docker and Tailscale only) and §19 that Phase 3 builds. Items marked
+**(decide)** were open; each was approved as recommended on 2026-11-21.
+
+### 21.1 Image
+
+- Base `python:3.13-slim`, pinned by digest (`FROM python:3.13-slim@sha256:…`). Two stages:
+  `runtime` (what `docker compose up` runs) and `test` (adds `requirements-dev.txt` and `tests/`).
+- Dependencies installed with `pip install --require-hashes --no-deps -r requirements.txt`.
+- Runs as a fixed non-root user (UID/GID 10001). `/app/data` is created in the image, owned
+  by that user, mode 0700. A new named volume copies that ownership and mode the first time
+  it is mounted, so `data/` no longer depends on the umask.
+- Inside the container the proxy listens on `0.0.0.0:4000` (`PROXY_HOST=0.0.0.0`, set in the
+  compose file, not `.env`). It can only be reached through the published `127.0.0.1` port
+  and, with the `monitoring` profile, from the compose network.
+- `HEALTHCHECK`: a short Python call to `http://localhost:4000/healthz` (passes the Host guard,
+  needs no token). No curl in the image.
+
+### 21.2 Compose
+
+- Service `quota-router`: `ports: ["127.0.0.1:4000:4000"]`; `env_file: .env`;
+  `./config.yaml` bind-mounted read-only at `/app/config.yaml`; named volume `qr-data` at
+  `/app/data`; `json-file` logging with `max-size: 10m`, `max-file: 3`;
+  `restart: unless-stopped`; `read_only: true` (writable only `/app/data` and a small `/tmp`
+  tmpfs); `cap_drop: [ALL]`; `security_opt: [no-new-privileges:true]`.
+- Service `test` (profile `test`, so `up` never starts it): the `test` stage running
+  `pytest -q` with `network_mode: none`, which proves the suite needs no network.
+  `docker compose run --rm test` becomes the documented command; the `.venv` command stays
+  for working without Docker.
+- A missing `config.yaml` makes Docker create an empty folder in its place (neither
+  `create_host_path: false` nor `configs:` prevents this with Compose 5.1). The proxy then
+  stops with a startup error that says to `rmdir config.yaml` (no root needed) and copy the example.
+- The proxy reads `config.yaml` only at startup, and Compose doesn't recreate the container
+  when a bind-mounted file's content changes; an editor that saves by replacing the file
+  also leaves the container on the old one. The README says to use
+  `docker compose up -d --force-recreate quota-router` after a config edit.
+- `.env` is created with `install -m 600` in the README, not `cp`, so the key and token
+  aren't readable by other local users under the usual 022 umask.
+- The volume starts empty: counts in a host `data/` from running without Docker are not
+  imported. That is harmless, since local counts are a hint (§7).
+- `data/` is never under `/mnt/c` in WSL (§20.10). The named volume avoids that; the README
+  says so for anyone running without Docker.
+
+### 21.3 Hash-locked requirements
+
+- **(decide)** `requirements.in` and `requirements-dev.in` hold the direct dependencies;
+  `pip-compile --generate-hashes` (pip-tools, run in a throwaway venv, not a project
+  dependency) writes `requirements.txt` and `requirements-dev.txt`. Recommended: yes, with
+  the same versions as today, so this phase changes no code paths.
+- **(decide)** `.github/dependabot.yml` for `pip` and `docker` (alerts and update PRs; free on
+  public repos). Recommended: yes, weekly.
+
+### 21.4 Dashboard login
+
+Changed on 2026-11-21 after a second review (approved): the first version used a session
+cookie, but browsers send a cookie to every port of a host, where another local service could
+replay it to read the dashboard data. `HttpOnly`, `SameSite=Strict` and the origin rule don't
+prevent that. The session now lives in the page, scoped to its exact origin.
+
+- `GET /dashboard` serves the page to anyone who passes the guard; it holds no data. Its
+  script shows a sign-in form until it has a session.
+- `POST /dashboard/login` takes `{"token": "<PROXY_TOKEN>"}` as `application/json` only (a
+  cross-origin page can't send that without a CORS preflight, which fails), compares it with
+  `hmac.compare_digest`, and returns `{"session": "<32 random bytes, URL-safe>",
+  "expires_in": 43200}`. No cookie is ever set, and the session never carries the token.
+- The page keeps the session in `sessionStorage`, which belongs to this exact origin (port
+  included) and this tab, and sends it as the `X-QR-Session` header. Another port or another
+  site never sees it, and with no ambient credential there is nothing to forge. A new tab
+  signs in again.
+- The header is accepted **only** on `GET /dashboard/status.json` (the same body as `/status`)
+  and `POST /dashboard/logout` (drops the session, 204). This replaces §17.2's "valid for
+  `/dashboard` and `/status`": keeping `/status` bearer-only means a session can never reach
+  `/v1/chat/completions` or `/metrics`, and the bearer token doesn't open `status.json`.
+- Sessions are kept in memory, keyed by a SHA-256 of the ID (at most 16; the oldest is
+  dropped; 12 h each), so a restart signs every tab out. Signing in from a tab that still has
+  a session replaces it.
+- **Tighter origin rule** for every `/dashboard` request, on top of the existing guard:
+  - `Origin`, when present, must equal the request's own origin exactly (scheme, host and
+    port from `Host`), not just "a localhost name". Another local web app on another port
+    fails this.
+  - `Sec-Fetch-Site`, when present, must be `same-origin` or `none`.
+  - `POST` requests must send `Origin` (every current browser does on POST).
+  - Failures are 403 `forbidden_host`; a wrong token is 401 and counts in
+    `qr_auth_failures_total`. **(decide)** After 10 failed logins in a minute, further logins
+    get 429 for the rest of that minute. Recommended: yes. The throttle is global, not per
+    client: a local process can keep the owner locked out, an accepted trade-off on a
+    single-user machine (it can't learn the token that way). The minute starts at the first
+    failure. The throttle is checked before the body is read and again just before the
+    token comparison (no await in between), so sign-ins already in flight when the lockout
+    starts are refused too. The body (at most 4 KB) must arrive within 10 s, or 408.
+- Response headers on every `/dashboard` response: `Content-Security-Policy: default-src
+  'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self';
+  form-action 'none'; frame-ancestors 'none'; base-uri 'none'`, `Cache-Control: no-store`,
+  `Referrer-Policy: same-origin` (not `no-referrer`, which makes Chrome send
+  `Origin: null` on a form POST), `X-Content-Type-Options: nosniff`.
+
+### 21.5 Dashboard page
+
+- One HTML file, one JS file, one CSS file and a favicon (so the browser's automatic
+  `/favicon.ico` request isn't needed) under `quota_router/static/`, served from
+  `/dashboard/…`. No CDN, no build step, no new dependency. The JS polls
+  `/dashboard/status.json` every 5 s.
+- Shows: for each model, RPM, input-TPM and RPD bars (used against limit, "no limit" when
+  empty), state, and countdowns for cooldown or exhausted-until; time to the next PT reset;
+  today's requests by status and reason; the last 20 errors. Read-only: the only button
+  besides sign-in is sign-out. The pace line and decisions by reason come with `gemini-auto` (§16).
+- All text is inserted with `textContent`, never `innerHTML`.
+
+### 21.6 `monitoring` profile (off by default)
+
+- Prometheus and Grafana, each pinned by digest, started only with
+  `docker compose --profile monitoring up -d`.
+- Prometheus is not published. It is the one service without `read_only`: Compose can't place
+  an environment-sourced secret in a read-only container. It scrapes `quota-router:4000/metrics` every 15 s with the
+  bearer token read from a compose secret sourced from `PROXY_TOKEN` (`environment:`
+  secrets), so the token isn't copied into another file. Retention 15 days and 1 GB.
+- The compose file adds `quota-router` to `PROXY_ALLOWED_HOSTS` so the scrape passes the
+  Host guard. The dashboard's session lives in the browser tab, so that name never sees it.
+- Grafana is published on `127.0.0.1:3000` only, anonymous access off, admin password from
+  `GRAFANA_ADMIN_PASSWORD` in `.env` (compose refuses to start the profile without it). A
+  provisioned data source and one dashboard (requests by status and reason, attempts by
+  outcome, RPD used against limit, model state, first-byte latency).
+
+### 21.7 `scripts/init_config.py`
+
+- Reads `GEMINI_API_KEY` from the environment or `.env`; calls `models.list` (the same call
+  as `probe.py --list-only`, no generation quota) with the key in a header and redirects
+  refused, since urllib would copy the header onto a redirect to another host; keeps models that support
+  `generateContent`.
+- Writes `config.yaml` with every model's `input_limit` and `output_limit` filled in, and
+  `rpm`, `tpm_input` and `rpd` set to `FILL_ME`, which the config loader rejects with a message
+  pointing at AI Studio → Rate Limit. A forgotten value therefore stops the proxy instead of
+  silently removing a limit (§20.2). `routes` gets `gemini-fast` with a commented example.
+- Refuses to overwrite an existing `config.yaml` without `--force`; `--stdout` prints instead.
+  Errors are scrubbed of the key. Standard library only, so it runs on the host with
+  `python3 -I`; with Docker only, `docker run --rm --env-file .env quota-router-for-gemini:local
+  python scripts/init_config.py --stdout > config.yaml` (not `docker compose run`, which would
+  mount the missing `config.yaml` and create a folder in its place, §21.2).
+
+### 21.8 README
+
+Quick start (Docker and without Docker), `.env` and `config.yaml` setup with
+`init_config.py`, billing and free-tier notes (already present), Zoo Code / Cline / Copilot
+Chat setup (§15, with "checked in Phase 4" where unverified), `/status` and `/dashboard`,
+the `monitoring` profile, Tailscale access (§18: `tailscale serve --bg 4000`, adding the
+tailnet name to `PROXY_ALLOWED_HOSTS`, the token still required, only while the PC is on),
+the WSL `/mnt/c` warning, limits and disclaimers.
+
+### 21.9 Not in Phase 3
+
+Alerts (§17.2 layer 6), remote hosting (§18), `gemini-smart` and `gemini-auto` (§16).

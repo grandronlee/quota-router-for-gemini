@@ -1,0 +1,62 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>quota-router</title>
+<link rel="stylesheet" href="/dashboard/dashboard.css">
+<link rel="icon" href="/dashboard/favicon.svg">
+<script src="/dashboard/dashboard.js" defer></script>
+</head>
+<body>
+<noscript><p class="error">The dashboard needs JavaScript.</p></noscript>
+
+<div id="signin" class="login" hidden>
+  <main>
+    <h1>quota-router</h1>
+    <form id="signin-form">
+      <label for="token">Proxy token (<code>PROXY_TOKEN</code>)</label>
+      <input id="token" name="token" type="password" autocomplete="current-password" required>
+      <button type="submit">Sign in</button>
+    </form>
+    <p id="signin-error" class="error" role="alert" hidden></p>
+    <p class="meta">You stay signed in in this tab only, for up to 12 hours or until the proxy restarts.</p>
+  </main>
+</div>
+
+<div id="app" hidden>
+  <header>
+    <h1>quota-router</h1>
+    <p class="meta">Next daily reset (PT midnight) in <strong id="reset">–</strong>
+      · updated <span id="updated">–</span> <span id="conn" class="conn" hidden>offline</span></p>
+    <button id="signout" type="button">Sign out</button>
+  </header>
+  <main>
+    <section>
+      <h2>Models</h2>
+      <table>
+        <thead><tr><th>Model</th><th>State</th><th>Requests / min</th><th>Input tokens / min</th>
+          <th>Requests today</th><th>Until</th></tr></thead>
+        <tbody id="models"></tbody>
+      </table>
+      <p class="meta" id="routes"></p>
+    </section>
+    <section class="cols">
+      <div>
+        <h2>Requests since <span id="since">–</span></h2>
+        <h3>By status</h3><ul id="by-status" class="counts"></ul>
+        <h3>By reason</h3><ul id="by-reason" class="counts"></ul>
+      </div>
+      <div>
+        <h2>Recent errors</h2>
+        <table>
+          <thead><tr><th>Time</th><th>Route</th><th>Status</th><th>Reason</th></tr></thead>
+          <tbody id="errors"></tbody>
+        </table>
+        <p class="meta" id="state-errors"></p>
+      </div>
+    </section>
+  </main>
+</div>
+</body>
+</html>

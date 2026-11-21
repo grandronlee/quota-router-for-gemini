@@ -1,0 +1,13 @@
+# Keep secrets, state and local tooling out of the build context.
+.env
+.env.*
+config.yaml
+data/
+.git/
+.github/
+.venv/
+**/__pycache__/
+**/*.pyc
+.pytest_cache/
+docs/
+monitoring/

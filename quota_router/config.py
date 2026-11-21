@@ -127,9 +127,19 @@ class Config(_Strict):
         return [self.models[k] for k in self.routes[route]]
 
 
+FILL_ME = "FILL_ME"  # written by scripts/init_config.py where only the user knows the value
+
+
 def parse_config(data: Any) -> Config:
     if not isinstance(data, dict):
         raise ConfigError("config must be a mapping")
+    models = data.get("models")
+    if isinstance(models, dict):
+        missing = [f"{key}.{field}" for key, m in models.items() if isinstance(m, dict)
+                   for field, value in m.items() if value == FILL_ME]
+        if missing:
+            raise ConfigError(f"fill in {', '.join(missing)} from AI Studio → Rate Limit "
+                              "(leave a value empty only if AI Studio shows no limit for it)")
     try:
         return Config.model_validate(data)
     except ValidationError as e:
@@ -137,6 +147,12 @@ def parse_config(data: Any) -> Config:
 
 
 def load_config(path: str | Path) -> Config:
+    if Path(path).is_dir():
+        # Docker creates an empty folder when a bind-mounted file is missing on the host.
+        raise ConfigError(f"config {path} is a folder, not a file. If you run Docker, config.yaml "
+                          "was missing on the host and Docker created an empty folder in its place: "
+                          "run `rmdir config.yaml`, then `cp config.example.yaml config.yaml` and "
+                          "fill in your limits (or use scripts/init_config.py)")
     try:
         text = Path(path).read_text(encoding="utf-8")
     except OSError as e:

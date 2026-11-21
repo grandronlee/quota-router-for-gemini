@@ -1,0 +1,7 @@
+# Direct runtime dependencies. requirements.txt is generated from this file:
+#   pip-compile --generate-hashes --allow-unsafe --strip-extras requirements.in
+fastapi==0.165.0
+uvicorn==0.54.0
+httpx==0.28.1
+pydantic==2.14.4
+PyYAML==6.0.4

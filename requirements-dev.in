@@ -1,0 +1,6 @@
+# Direct test dependencies. requirements-dev.txt is generated from this file:
+#   pip-compile --generate-hashes --allow-unsafe --strip-extras requirements-dev.in
+-c requirements.txt
+-r requirements.in
+pytest==9.2.0
+respx==0.23.1

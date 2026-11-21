@@ -1,0 +1,16 @@
+# Dependency update alerts and PRs (DESIGN §21.3). Dependabot understands pip-compile
+# output, so it updates requirements*.in and the hash-locked requirements*.txt together.
+version: 2
+updates:
+  - package-ecosystem: pip
+    directory: /
+    schedule:
+      interval: weekly
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+  - package-ecosystem: docker-compose   # Prometheus and Grafana images in the monitoring profile
+    directory: /
+    schedule:
+      interval: weekly

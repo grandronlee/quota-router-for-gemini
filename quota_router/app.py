@@ -31,6 +31,7 @@ from .affinity import AffinityStore
 from .classify import classify_429
 from .clock import Clock, SystemClock, next_pt_midnight
 from .config import Config, ModelConfig
+from .dashboard import SECURITY_HEADERS, add_dashboard, dashboard_request_ok, is_dashboard_path
 from .db import connect
 from .logs import REQUEST_LOGGER
 from .metrics import OUTCOMES, STATUSES, Metrics, RequestStats, bounded
@@ -46,6 +47,8 @@ request_log = logging.getLogger(REQUEST_LOGGER)
 
 PRUNE_INTERVAL_S = 3600.0
 UNGUARDED_AUTH_PATHS = {"/healthz"}  # still behind the Host/Origin guard
+# /dashboard paths skip the bearer token too: they use a per-tab session header and a stricter
+# origin rule instead (dashboard.py, DESIGN §21.4).
 
 
 def _iso(t: float | None) -> str | None:
@@ -139,6 +142,28 @@ class Proxy:
         self.captures = Captures(capture_dir, self.scrubber, self.clock.now) if capture_dir else None
         self.client: httpx.AsyncClient | None = None
         self.upstream: GeminiUpstream | None = None
+        self.dashboard_sessions = None  # set by add_dashboard
+
+    def status_view(self) -> dict:
+        """Body of /status and /dashboard/status.json (DESIGN §17.2 layer 3, §20.8)."""
+        now = self.clock.now()
+        snap = self.store.snapshot()
+        models = {}
+        for model_id, s in snap.items():
+            models[model_id] = {**s, "state": model_state(s),
+                                "cooldown_until": _iso(s["cooldown_until"]),
+                                "exhausted_until": _iso(s["exhausted_until"])}
+        reset = next_pt_midnight(now)
+        view = self.stats.view(now)
+        return {
+            "now": _iso(now), "next_pt_reset": _iso(reset), "next_pt_reset_in_s": math.ceil(reset - now),
+            "routes": self.config.routes, "models": models,
+            "requests": {"since": _iso(view["since"]), "by_status": view["by_status"],
+                         "by_reason": view["by_reason"]},
+            "recent_errors": [{"at": _iso(e.at), "route": e.route, "status": e.status, "reason": e.reason}
+                              for e in reversed(self.stats.recent)],
+            "state_errors": self.router.state_errors,
+        }
 
     # ---- helpers ---------------------------------------------------------
 
@@ -219,6 +244,16 @@ class Proxy:
         return hmac.compare_digest(token.strip().encode("utf-8"), self.settings.proxy_token.encode("utf-8"))
 
 
+def _with_security_headers(send):
+    async def wrapped(message) -> None:
+        if message["type"] == "http.response.start":
+            names = {k.lower() for k, _ in message.get("headers", [])}
+            extra = [(k, v) for k, v in SECURITY_HEADERS if k not in names]
+            message = {**message, "headers": list(message.get("headers", [])) + extra}
+        await send(message)
+    return wrapped
+
+
 class Guard:
     """Pure ASGI middleware: Host/Origin check on every path, then the bearer token
     everywhere except /healthz (DESIGN §20.3). Never sends CORS headers."""
@@ -235,13 +270,17 @@ class Guard:
         headers = Headers(scope=scope)
         origin = headers.get("origin")
         path = scope.get("path", "")
-        if not p.host_allowed(headers.get("host")) or (origin is not None and not p.origin_allowed(origin)):
+        dashboard = is_dashboard_path(path)
+        if dashboard:
+            send = _with_security_headers(send)
+        if (not p.host_allowed(headers.get("host")) or (origin is not None and not p.origin_allowed(origin))
+                or (dashboard and not dashboard_request_ok(scope.get("method", ""), headers))):
             p.record(request_id=uuid.uuid4().hex[:16], route="unknown", status=403, reason="forbidden_host",
                      started=started, http_path=path)
             resp = openai_error(403, "forbidden_host", "requests must come from this machine "
                                 "(Host and Origin must be localhost)", "permission_error")
             return await resp(scope, receive, send)
-        if path not in UNGUARDED_AUTH_PATHS and not p.token_ok(headers.get("authorization")):
+        if not dashboard and path not in UNGUARDED_AUTH_PATHS and not p.token_ok(headers.get("authorization")):
             p.auth_failures += 1
             p.record(request_id=uuid.uuid4().hex[:16], route="unknown", status=401, reason="unauthorized",
                      started=started, http_path=path)
@@ -453,6 +492,7 @@ def create_app(proxy: Proxy) -> FastAPI:
     app = FastAPI(title="quota-router-for-gemini", lifespan=lifespan,
                   docs_url=None, redoc_url=None, openapi_url=None)
     app.add_middleware(Guard, proxy=p)
+    add_dashboard(app, p)
 
     @app.get("/healthz")
     async def healthz():
@@ -467,24 +507,7 @@ def create_app(proxy: Proxy) -> FastAPI:
 
     @app.get("/status")
     async def status():
-        now = p.clock.now()
-        snap = p.store.snapshot()
-        models = {}
-        for model_id, s in snap.items():
-            models[model_id] = {**s, "state": model_state(s),
-                                "cooldown_until": _iso(s["cooldown_until"]),
-                                "exhausted_until": _iso(s["exhausted_until"])}
-        reset = next_pt_midnight(now)
-        view = p.stats.view(now)
-        return {
-            "now": _iso(now), "next_pt_reset": _iso(reset), "next_pt_reset_in_s": math.ceil(reset - now),
-            "routes": p.config.routes, "models": models,
-            "requests": {"since": _iso(view["since"]), "by_status": view["by_status"],
-                         "by_reason": view["by_reason"]},
-            "recent_errors": [{"at": _iso(e.at), "route": e.route, "status": e.status, "reason": e.reason}
-                              for e in reversed(p.stats.recent)],
-            "state_errors": p.router.state_errors,
-        }
+        return p.status_view()
 
     @app.get("/metrics")
     async def metrics():

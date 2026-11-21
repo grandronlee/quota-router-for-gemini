@@ -1,0 +1,45 @@
+:root {
+  color-scheme: light dark;
+  --bg: #ffffff; --fg: #1d2330; --muted: #6b7280; --line: #e5e7eb; --panel: #f8fafc;
+  --ok: #15803d; --warn: #b45309; --bad: #b91c1c; --off: #6b7280; --accent: #2563eb;
+  font-family: system-ui, -apple-system, "Segoe UI", sans-serif; font-size: 15px;
+}
+@media (prefers-color-scheme: dark) {
+  :root { --bg: #0f1419; --fg: #e6e8eb; --muted: #9aa3ae; --line: #2a313b; --panel: #161c23;
+          --ok: #4ade80; --warn: #fbbf24; --bad: #f87171; --off: #9aa3ae; --accent: #60a5fa; }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--fg); }
+header { display: flex; flex-wrap: wrap; align-items: baseline; gap: 0.5rem 1.5rem;
+         padding: 1rem 1.5rem; border-bottom: 1px solid var(--line); }
+#signout { margin-left: auto; }
+[hidden] { display: none !important; }
+h1 { font-size: 1.2rem; margin: 0; }
+h2 { font-size: 1rem; margin: 1.5rem 0 0.5rem; }
+h3 { font-size: 0.85rem; margin: 1rem 0 0.25rem; color: var(--muted); font-weight: 600; }
+main { padding: 0 1.5rem 2rem; max-width: 1200px; }
+.meta, .muted { color: var(--muted); }
+.meta { margin: 0.5rem 0; font-size: 0.9rem; }
+.conn { color: var(--bad); font-weight: 600; }
+table { border-collapse: collapse; width: 100%; font-variant-numeric: tabular-nums; }
+th, td { text-align: left; padding: 0.4rem 0.6rem; border-bottom: 1px solid var(--line); white-space: nowrap; }
+th { font-size: 0.8rem; color: var(--muted); font-weight: 600; }
+meter { width: 7rem; height: 0.8rem; vertical-align: middle; }
+.state { font-weight: 600; }
+.state.available { color: var(--ok); }
+.state.cooldown { color: var(--warn); }
+.state.exhausted { color: var(--bad); }
+.state.disabled { color: var(--off); }
+.cols { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 0 2rem; }
+.counts { list-style: none; padding: 0; margin: 0; }
+.counts li { display: flex; justify-content: space-between; max-width: 20rem; padding: 0.15rem 0;
+             border-bottom: 1px dashed var(--line); font-variant-numeric: tabular-nums; }
+button { font: inherit; padding: 0.35rem 0.9rem; border: 1px solid var(--line); border-radius: 6px;
+         background: var(--panel); color: var(--fg); cursor: pointer; }
+button:hover { border-color: var(--accent); }
+.login main { max-width: 22rem; margin: 15vh auto; padding: 1.5rem; border: 1px solid var(--line);
+                  border-radius: 10px; background: var(--panel); }
+.login form { display: grid; gap: 0.6rem; margin-top: 1rem; }
+.login input { font: inherit; padding: 0.45rem 0.6rem; border: 1px solid var(--line); border-radius: 6px;
+                   background: var(--bg); color: var(--fg); }
+.error { color: var(--bad); margin: 0.75rem 0 0; }
