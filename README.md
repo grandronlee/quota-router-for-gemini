@@ -193,7 +193,7 @@ Whether the dashboard sign-in works through `tailscale serve` is checked in Phas
 ## Development
 
 ```sh
-docker compose run --rm test                  # the test suite, offline (no network)
+docker compose run --build --rm test          # the test suite, offline (no network)
 .venv/bin/python -m pytest -q                 # same, without Docker
 ```
 

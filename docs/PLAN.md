@@ -184,7 +184,9 @@ Done 2026-11-21: growing 5xx cooldown for overloaded models (DESIGN §22, approv
 found in the step 5 live check: per-model failure streak and epoch, cooldown 30 s × 4 up to
 15 min, hard for 30 s then soft with a last-resort pass and one recovery attempt per model,
 `unavailable_streak` in `/status`, `attempts` in the log line, with the offline tests in §22.5.
-Validation: `.venv/bin/python -m pytest -q` and `docker compose run --rm test`.
+Offline validation used `.venv/bin/python -m pytest -q` and `docker compose run --build --rm test`.
+Live validation is pending. During the next observed overload, use `attempts` in the request log
+to distinguish an upstream 503 from a timeout and check that later requests follow the cooldown.
 
 Also after v1: alerts (DESIGN §17.2 layer 6), a remote-hosting design (DESIGN §18)
 if the proxy is to run somewhere other than the user's machine.
@@ -194,7 +196,7 @@ if the proxy is to run somewhere other than the user's machine.
 - Unit and integration, until Phase 3 adds Docker: `.venv/bin/python -m pytest -q`
   (set up once with `python3 -m venv .venv && .venv/bin/pip install -r requirements-dev.txt`).
   Offline: injected clock, in-memory or temporary SQLite, no network.
-- From Phase 3: `docker compose run --rm test` (runs `pytest -q`)
+- From Phase 3: `docker compose run --build --rm test` (rebuilds the image and runs `pytest -q`)
 - Live smoke test: by hand, as recorded in [probe-results.md](probe-results.md) (Phase 4); it uses quota
 
 ## Pre-publish checklist

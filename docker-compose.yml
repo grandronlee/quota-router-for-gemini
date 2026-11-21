@@ -1,6 +1,6 @@
 # quota-router-for-gemini (DESIGN §21.2).
 #   docker compose up -d --build            run the proxy on http://127.0.0.1:4000
-#   docker compose run --rm test            run the test suite (no network)
+#   docker compose run --build --rm test    run the test suite (no network)
 #   docker compose --profile monitoring up -d   also start Prometheus and Grafana (§21.6)
 
 x-logging: &logging
