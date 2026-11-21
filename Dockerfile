@@ -1,6 +1,6 @@
 # quota-router-for-gemini (DESIGN §21.1). Two stages: `runtime` (default) and `test`.
 # The base image is pinned by digest; Dependabot proposes updates (.github/dependabot.yml).
-FROM python:3.13-slim@sha256:e48f59cdba69a3cbd9ed2cf0f348d90d45a8d350d98134cf1070bc106ee9ed90 AS base
+FROM python:3.15-slim@sha256:65a65fc7b30b06cb6df4930fd4650697cb23f4c2698ab81fc87e4b031bc36928 AS base
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
