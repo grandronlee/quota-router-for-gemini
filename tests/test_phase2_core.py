@@ -125,9 +125,9 @@ def test_scrubber():
 
 # ---- database housekeeping -------------------------------------------------
 
-def test_new_and_phase1_databases_get_schema_version_1(tmp_path):
+def test_new_and_phase1_databases_get_the_current_schema_version(tmp_path):
     fresh = connect(tmp_path / "new.sqlite3")
-    assert fresh.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION == 1
+    assert fresh.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION == 2
     fresh.close()
     old = sqlite3.connect(tmp_path / "old.sqlite3")
     old.executescript(SCHEMA)
@@ -135,7 +135,7 @@ def test_new_and_phase1_databases_get_schema_version_1(tmp_path):
     old.commit()
     old.close()
     conn = connect(tmp_path / "old.sqlite3")
-    assert conn.execute("PRAGMA user_version").fetchone()[0] == 1
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == 2
     assert conn.execute("SELECT count FROM rpd").fetchone()[0] == 3
 
 
@@ -159,7 +159,7 @@ def test_damaged_database_is_a_startup_error(tmp_path):
     path = tmp_path / "q.sqlite3"
     conn = connect(path)
     conn.execute("PRAGMA journal_mode=DELETE")
-    conn.executemany("INSERT INTO affinity VALUES (?, 'm', 0)", [(f"id-{i:05d}-" + "x" * 200,) for i in range(400)])
+    conn.executemany("INSERT INTO affinity (tool_call_id, model_id, created_at) VALUES (?, 'm', 0)", [(f"id-{i:05d}-" + "x" * 200,) for i in range(400)])
     conn.close()
     data = bytearray(path.read_bytes())
     page = 4096
@@ -176,12 +176,19 @@ def test_prune_removes_expired_rows_and_survives_errors():
     conn.execute("INSERT INTO rpd VALUES ('model-a', '2026-11-01', 5)")
     conn.execute("INSERT INTO rpd VALUES ('model-a', '2026-11-19', 5)")
     conn.execute("INSERT INTO exhausted VALUES ('model-a', ?)", (T0 - 1,))
-    conn.execute("INSERT INTO affinity VALUES ('old', 'model-a', ?)", (T0 - 25 * 3600,))
-    conn.execute("INSERT INTO affinity VALUES ('new', 'model-a', ?)", (T0 - 3600,))
+    conn.execute("INSERT INTO affinity (tool_call_id, model_id, created_at) VALUES ('old', 'model-a', ?)",
+                 (T0 - 25 * 3600,))
+    conn.execute("INSERT INTO affinity (tool_call_id, model_id, created_at) VALUES ('new', 'model-a', ?)",
+                 (T0 - 3600,))
+    # T0 is 2026-11-20 PT: rows from 30 days back (2026-10-21) are kept, older ones go.
+    for turn_id, day in (("t-old", "2026-10-20"), ("t-edge", "2026-10-21"), ("t-new", "2026-11-20")):
+        conn.execute("INSERT INTO turns VALUES (?, ?, 9, 'fast', 'model-a', 'model-a', 'first', 0, "
+                     "0, 0, 1, 0, 0, 200)", (turn_id, day))
     p.prune_once()
     assert [r[0] for r in conn.execute("SELECT day FROM rpd")] == ["2026-11-19"]
     assert conn.execute("SELECT COUNT(*) FROM exhausted").fetchone()[0] == 0
     assert [r[0] for r in conn.execute("SELECT tool_call_id FROM affinity")] == ["new"]
+    assert sorted(r[0] for r in conn.execute("SELECT turn_id FROM turns")) == ["t-edge", "t-new"]
 
     p.store._conn = FailingConn(conn, fail_on="DELETE FROM rpd")
     p.prune_once()  # logged and counted, not raised

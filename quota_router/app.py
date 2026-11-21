@@ -41,6 +41,7 @@ from .router import (ModelNotFound, RateLimited, Rejected, RouteFailed, RoutePas
                      Router, Served, Unavailable, UpstreamResult, estimate_input_tokens)
 from .scrub import Scrubber
 from .settings import Settings, normalize_host
+from .turns import TurnLog, TurnRef
 from .upstream import (Body, Captures, GeminiUpstream, HandleSet, SSEEvent, Stream, error_event_kind,
                        make_client)
 
@@ -135,6 +136,7 @@ class Proxy:
         self.conn = conn if conn is not None else connect(config.db_path, check_same_thread=False)
         self.store = QuotaStore(config.models.values(), self.conn, self.clock)
         self.affinity = AffinityStore(self.conn, self.clock)
+        self.turns = TurnLog(self.conn, self.clock)
         self.router = Router(config, self.store, self.affinity, self.clock)
         self.router.on_handoff = lambda src, dst, result: self.metrics.inc(
             "qr_handoff_total", **{"from": src, "to": dst, "result": result})
@@ -167,8 +169,17 @@ class Proxy:
                          "by_reason": view["by_reason"]},
             "recent_errors": [{"at": _iso(e.at), "route": e.route, "status": e.status, "reason": e.reason}
                               for e in reversed(self.stats.recent)],
+            "turns_today": self._turns_today(),
             "state_errors": self.router.state_errors,
         }
+
+    def _turns_today(self) -> dict[str, int] | None:
+        try:
+            return self.turns.today_by_route()
+        except sqlite3.Error:
+            self.router.state_errors += 1
+            log.exception("could not read the turn log")
+            return None
 
     # ---- helpers ---------------------------------------------------------
 
@@ -212,10 +223,26 @@ class Proxy:
             fields["handoff_from"] = handoff_from
         request_log.info("request", extra={"fields": fields})
 
+    def note_turn(self, turn: TurnRef | None, *, route: str, status: int, served_model: str | None = None,
+                  prompt_tokens: int | None = None, output_tokens: int | None = None,
+                  handoff_from: str | None = None) -> None:
+        """Write the request's decision-log row (DESIGN §16.8 1d). Never raises: a failed
+        write is logged and counted, and never fails the request (§5.2)."""
+        if turn is None:
+            return
+        try:
+            self.turns.note(turn, route=route, status=status, served_model=served_model,
+                            prompt_tokens=prompt_tokens, output_tokens=output_tokens,
+                            handoff=handoff_from is not None)
+        except Exception:
+            self.router.state_errors += 1
+            log.exception("could not write the turn log")
+
     def prune_once(self) -> None:
         try:
             self.store.prune()
             self.affinity.prune()
+            self.turns.prune()
         except sqlite3.Error:
             self.router.state_errors += 1
             log.exception("housekeeping prune failed; will retry")
@@ -322,6 +349,13 @@ class StreamSession:
 
     def _complete(self, prompt_tokens: int | None) -> None:
         ids, self.pending_ids = self.pending_ids, []
+        if not self.settled:
+            # The turn row is written before any of this response's tool calls are recorded,
+            # so a follow-up (which finds the turn only through them) always writes after it
+            # (DESIGN §16.8 1d). The first settle comes with usage, or at the end without it.
+            self.p.note_turn(self.served.turn, route=self.route, status=200,
+                             served_model=self.served.model.id, prompt_tokens=self.prompt_tokens,
+                             output_tokens=self.output_tokens, handoff_from=self.served.handoff_from)
         self.p.router.complete(self.served, prompt_tokens, ids or None)
         self.settled = True
 
@@ -730,6 +764,7 @@ def create_app(proxy: Proxy) -> FastAPI:
             p.record(request_id=request_id, route=route, status=outcome.status, reason=reason, stream=stream,
                      started=started, path=outcome.path, affinity=outcome.affinity, input_estimate=estimate,
                      handoff_from=outcome.handoff_from)
+            p.note_turn(outcome.turn, route=route, status=outcome.status, handoff_from=outcome.handoff_from)
             return JSONResponse(p.scrubber.obj(outcome.error_body()),
                                 status_code=outcome.status, headers=headers)
 
@@ -748,6 +783,7 @@ def create_app(proxy: Proxy) -> FastAPI:
             p.record(request_id=request_id, route=route, status=b.status, reason="passthrough", stream=stream,
                      started=started, served_model=outcome.model.id, path=outcome.path,
                      affinity=outcome.affinity, input_estimate=estimate, handoff_from=outcome.handoff_from)
+            p.note_turn(outcome.turn, route=route, status=b.status, handoff_from=outcome.handoff_from)
             headers["content-type"] = b.content_type
             return Response(b.content, status_code=b.status, headers=headers)
 
@@ -771,6 +807,9 @@ def create_app(proxy: Proxy) -> FastAPI:
         if isinstance(obj, dict):
             prompt_tokens, output_tokens = usage_tokens(obj.get("usage"))
             ids = tool_call_ids(obj, "message")
+        # The turn row before the tool calls that let a follow-up find it (DESIGN §16.8 1d).
+        p.note_turn(outcome.turn, route=route, status=b.status, served_model=outcome.model.id,
+                    prompt_tokens=prompt_tokens, output_tokens=output_tokens, handoff_from=outcome.handoff_from)
         p.router.complete(outcome, prompt_tokens, ids or None)  # before the response is returned
         first_byte = time.monotonic() - started
         p.record(request_id=request_id, route=route, status=b.status, reason="served", stream=stream,

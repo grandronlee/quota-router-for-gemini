@@ -1,4 +1,4 @@
-"""SQLite persistence for RPD counters, exhausted state and tool-call affinity.
+"""SQLite persistence for RPD counters, exhausted state, tool-call affinity and the turn log.
 
 One connection, used only from the event-loop thread (one uvicorn worker,
 DESIGN §7). Each write commits immediately.
@@ -12,7 +12,7 @@ from __future__ import annotations
 import sqlite3
 from pathlib import Path
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS rpd (
@@ -36,11 +36,35 @@ CREATE TABLE IF NOT EXISTS affinity (
 # transaction at startup (executescript() would commit part-way). Version 0 is a Phase 1
 # database or a new file; both get SCHEMA, which is and stays the version-1 schema. Later
 # changes go only into MIGRATIONS (never into SCHEMA), so a new file runs them all too.
-MIGRATIONS: dict[int, list[str]] = {}
+MIGRATIONS: dict[int, list[str]] = {
+    # 1 -> 2: the decision log (DESIGN §16.8 1d). Affinity rows from version 1 keep a NULL
+    # turn_id; a follow-up that finds only those starts a new turn row.
+    1: [
+        "ALTER TABLE affinity ADD COLUMN turn_id TEXT",
+        """CREATE TABLE turns (
+            turn_id       TEXT PRIMARY KEY,   -- 128 random bits as hex, never from content
+            day           TEXT NOT NULL,      -- PT date of the turn start, YYYY-MM-DD
+            hour          INTEGER NOT NULL,   -- PT hour of the turn start, 0-23
+            route         TEXT NOT NULL,      -- requested route or model ID
+            first_model   TEXT,               -- served the first request (NULL: none served)
+            last_model    TEXT,               -- served the latest served request
+            reason        TEXT NOT NULL,      -- first, spill, pinned, handoff, unknown
+            tools         INTEGER NOT NULL,   -- tool definitions in the first request
+            input_tokens  INTEGER NOT NULL,   -- sums of reported usage
+            output_tokens INTEGER NOT NULL,
+            steps         INTEGER NOT NULL,   -- served requests
+            errors        INTEGER NOT NULL,   -- failed requests
+            handoffs      INTEGER NOT NULL,   -- requests on which a handoff target was called
+            last_status   INTEGER NOT NULL    -- HTTP status of the latest request
+        )""",
+        "CREATE INDEX turns_day ON turns (day)",
+    ],
+}
 
 _CHECK_ACCESS = ("Check its permissions and free disk space, and that no other proxy is using it.")
 _SAFE_TO_DELETE = ("Deleting it is safe: only today's local request counts (a hint; Google's "
-                   "429s still enforce the limits) and open tool-turn records are lost.")
+                   "429s still enforce the limits), open tool-turn records and the turn log "
+                   "are lost.")
 
 
 class StateDBError(RuntimeError):

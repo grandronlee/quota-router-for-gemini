@@ -807,10 +807,32 @@ first). `scripts/init_config.py` offers it commented out.
   row, because requests can't be matched without reading content. The failed row has
   `steps: 0`, so the report can leave it out.
 - Writes: one INSERT at turn start and one UPDATE per later request, done in the bookkeeping
-  after the response, where affinity is recorded. A failed write is logged and counted in
+  after the response, where affinity is recorded (for a stream, when it settles; the exact
+  order is in the settled bullets below). A failed write is logged and counted in
   `state_errors`, and never fails the request (§5.2).
 - Rows older than 30 days are deleted during housekeeping. `/status` shows today's turn
   count per route. The suggestion report is step 5 (§16.6).
+- Settled in implementation (2026-11-21):
+  - Each write is one upsert keyed on `turn_id`. The columns that describe the turn's start
+    (`day`, `hour`, `route`, `reason`, `tools`, and `first_model` once set) are written only
+    when the row is created; `last_model` and `last_status` come from the latest write, and
+    the counters only add. A request writes its row before its tool calls' affinity is
+    recorded (a stream: when it settles, with usage if any, before its calls are recorded),
+    so a follow-up, which finds its turn only through those calls, always writes later. A
+    follow-up whose row is missing creates it under the same `turn_id`: its start's write
+    failed, or its calls predate version 2 (their `turn_id` is NULL, so the follow-up gets a
+    new one).
+  - `reason` is how the request that created the row was routed: `first` or `spill` for a
+    turn start (`first` also when nothing served it), `unknown` for a follow-up with no known
+    call, and `pinned` or `handoff` for a follow-up whose row was missing (also when its
+    call's model is no longer configured). If the affinity lookup fails, the follow-up
+    starts a new `unknown` row, and the turn's later requests continue that row.
+  - `steps` counts requests a model served (a stream that broke or was dropped part-way
+    included); every other routed outcome (429, 5xx, a 4xx returned unchanged) is an error.
+    `handoffs` counts requests on which a handoff target was called, served or not.
+  - `day` and `hour` come from the request's arrival, not from when the row is written.
+  - Not logged: requests that never reach routing (bad body, unknown model or route), a
+    client that disconnects before the response starts, and an internal proxy error.
 
 **1e. Validation.**
 
@@ -1144,7 +1166,9 @@ proxy's state and logs bounded over weeks of running:
   database.
 - **Schema version.** `PRAGMA user_version` is set to 1. At startup: 0 with the Phase 1
   tables present means version 1 and is updated; a version newer than the code knows is a
-  startup error; migrations to later versions run in one transaction at startup.
+  startup error; migrations to later versions run in one transaction at startup. Version 2
+  (§16.8 1d) adds `affinity.turn_id` and the `turns` table. An older proxy refuses a version-2
+  file, so going back to it means deleting the file.
 - **Damaged database.** At startup the proxy runs `PRAGMA quick_check` (milliseconds at this
   size). If it fails, or the file isn't a database, the proxy refuses to start and the message
   names the file and says deleting it is safe: only today's local counts (a hint, §7; Google's

@@ -13,7 +13,7 @@ import json
 import logging
 import math
 import sqlite3
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Literal, Mapping, Protocol
 
 from .affinity import AffinityStore
@@ -21,6 +21,7 @@ from .classify import classify_429
 from .clock import Clock
 from .config import Config, ModelConfig
 from .quota import Blocked, QuotaStore, Reservation
+from .turns import TurnReason, TurnRef, new_turn_id
 
 log = logging.getLogger("quota_router")
 
@@ -111,6 +112,7 @@ class RouteServed:
     path: list[str]
     affinity: Affinity | None
     handoff_from: str | None = None  # the turn's owner, when another model served it
+    turn: TurnRef | None = None  # its decision-log turn (DESIGN §16.8 1d)
 
 
 @dataclass
@@ -123,6 +125,7 @@ class RoutePassthrough:
     affinity: Affinity | None
     handoff_from: str | None = None
     rewritten: bool = False  # sent with placeholder signatures (DESIGN §16.8)
+    turn: TurnRef | None = None
 
 
 @dataclass
@@ -135,6 +138,7 @@ class RouteFailed:
     affinity: Affinity | None = None
     candidates: list[Candidate] = field(default_factory=list)
     handoff_from: str | None = None  # the owner, when a handoff target was tried and failed too
+    turn: TurnRef | None = None  # None only for an unknown model or route
 
     def error_body(self) -> dict:
         etype = {400: "invalid_request_error", 404: "invalid_request_error",
@@ -285,33 +289,65 @@ class Router:
         return [m] if m else None
 
     def _pin(self, request: Mapping[str, Any], candidates: list[ModelConfig]
-             ) -> tuple[list[ModelConfig], Affinity | None, dict[str, str]]:
-        """Candidates after pinning, the affinity label, and the known ID → model map
-        (empty unless the turn is pinned to an owner, which is then `candidates[0]`)."""
+             ) -> tuple[list[ModelConfig], Affinity | None, dict[str, str], str | None]:
+        """Candidates after pinning, the affinity label, the known ID → model map (empty
+        unless the turn is pinned to an owner, which is then `candidates[0]`), and the turn ID
+        of the latest known call that has one (DESIGN §16.8 1d)."""
         ids = active_turn_tool_call_ids(request.get("messages"))
         if not ids:
-            return candidates, None, {}
+            return candidates, None, {}, None
         try:
-            known = self._affinity.lookup(ids)
+            records = self._affinity.lookup_records(ids)
         except sqlite3.Error:
             self.state_errors += 1
             log.exception("affinity lookup failed; routing the tool turn normally")
-            return candidates, "unknown", {}
+            return candidates, "unknown", {}, None
+        known = {i: r.model_id for i, r in records.items()}
         owners = [known[i] for i in ids if i in known]
         if not owners:
             log.warning("tool turn with %d call ID(s), none known; routing normally", len(ids))
-            return candidates, "unknown", {}
+            return candidates, "unknown", {}, None
+        turn_id = next((records[i].turn_id for i in reversed(ids)
+                        if i in records and records[i].turn_id), None)
         owner_id = owners[-1]  # the latest known call's model
         model = self._config.model_by_id(owner_id)
         if model is None:
             log.warning("tool turn belongs to %s, which is no longer configured; routing normally", owner_id)
-            return candidates, "unknown", {}
+            return candidates, "unknown", {}, turn_id
         if len(set(owners)) > 1:
             # Expected after a handoff (DESIGN §16.8); without one it is worth a look.
             log.info("tool turn spans %d models; pinning to the latest call's model %s",
                      len(set(owners)), owner_id)
-            return [model], "mixed", known
-        return [model], "pinned", known
+            return [model], "mixed", known, turn_id
+        return [model], "pinned", known, turn_id
+
+    @staticmethod
+    def _turn(request: Mapping[str, Any], affinity: Affinity | None, turn_id: str | None,
+              started: float) -> TurnRef:
+        """The request's decision-log turn. A request with no tool calls in its active turn
+        starts one; a follow-up continues the turn its calls name, or starts a row (`unknown`
+        when none of its calls is known). A known call whose model is no longer configured is
+        routed as `unknown` but still names its turn, so that row is `pinned`."""
+        tools = request.get("tools")
+        n_tools = len(tools) if isinstance(tools, list) else 0
+        if affinity is None:
+            reason: TurnReason = "first"
+        elif affinity == "unknown" and turn_id is None:
+            reason = "unknown"
+        else:
+            reason = "pinned"
+        return TurnRef(turn_id or new_turn_id(), reason, n_tools, started)
+
+    @staticmethod
+    def _served_turn(turn: TurnRef, resolved: list[ModelConfig], model: ModelConfig,
+                     handoff_from: str | None) -> TurnRef:
+        """`turn` with the reason this request's serving model gives, in case it creates
+        the row: a turn start served after the route's first model is a spill."""
+        if turn.reason == "first" and model.id != resolved[0].id:
+            return replace(turn, reason="spill")
+        if turn.reason == "pinned" and handoff_from is not None:
+            return replace(turn, reason="handoff")
+        return turn
 
     def _handoff_targets(self, name: Any, resolved: list[ModelConfig],
                          owner: ModelConfig) -> list[ModelConfig]:
@@ -350,7 +386,8 @@ class Router:
         resolved = self.resolve(name)
         if resolved is None:
             return RouteFailed(404, "model_not_found", f"unknown model or route: {name!r}", None)
-        candidates, affinity, known = self._pin(request, resolved)
+        candidates, affinity, known, turn_id = self._pin(request, resolved)
+        turn = self._turn(request, affinity, turn_id, started)
         owner = candidates[0] if known else None
         if owner is not None:
             candidates = [owner, *self._handoff_targets(name, resolved, owner)]
@@ -436,11 +473,13 @@ class Router:
 
             if isinstance(result, Served):
                 self._note_handoff(owner, model, "served")
-                return RouteServed(model, result.payload, res, path, served_affinity, handoff_from)
+                return RouteServed(model, result.payload, res, path, served_affinity, handoff_from,
+                                   turn=self._served_turn(turn, resolved, model, handoff_from))
             if isinstance(result, Rejected):
                 self._note_handoff(owner, model, "rejected")
                 return RoutePassthrough(model, result.payload, res, path, served_affinity, handoff_from,
-                                        rewritten=body is not request)
+                                        rewritten=body is not request,
+                                        turn=self._served_turn(turn, resolved, model, handoff_from))
             self._note_handoff(owner, model, "failed")
             if isinstance(result, RateLimited):
                 cls = classify_429(result.body, result.headers)
@@ -486,6 +525,7 @@ class Router:
                 c.reason, c.detail = "quota", f"{c.detail}; {blocked.detail}"
 
         out = self._final(name, results, path, affinity)
+        out.turn = turn
         if owner is not None and any(m != owner.id for m in path):
             out.handoff_from = owner.id  # a target was called and failed too
         return out
@@ -543,14 +583,16 @@ class Router:
 
     def complete(self, served: RouteServed, prompt_tokens: int | None,
                  tool_call_ids: list[str] | None = None) -> None:
-        """After the response finished: settle usage and record tool-call affinity.
+        """After the response finished: settle usage and record tool-call affinity (with
+        the response's turn, DESIGN §16.8 1d).
 
         Safe to call more than once for one response: usage settles only the first time,
         so a later call can record tool-call IDs that arrived after the usage chunk."""
         self._store.settle(served.reservation, prompt_tokens)
         if tool_call_ids:
             try:
-                reused = self._affinity.record(tool_call_ids, served.model.id)
+                reused = self._affinity.record(tool_call_ids, served.model.id,
+                                               served.turn.turn_id if served.turn else None)
             except Exception:  # losing affinity only means "unknown" on the next request
                 self.state_errors += 1
                 log.exception("could not record tool-call affinity for %s", served.model.id)
