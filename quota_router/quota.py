@@ -38,6 +38,14 @@ MIDNIGHT_GRACE_S = 600.0
 log = logging.getLogger("quota_router")
 
 
+def midnight_grace_applies(model: ModelConfig) -> bool:
+    """DESIGN §5.2, §20.2: grace only for a model that can't use its whole day in the grace
+    window. No daily limit: grace. No per-minute limit with a daily one: no grace."""
+    if model.rpd is None:
+        return True
+    return model.rpm is not None and model.rpm * MIDNIGHT_GRACE_S / 60 < model.rpd
+
+
 @dataclass
 class _TokenEntry:
     t: float
@@ -81,9 +89,7 @@ class QuotaStore:
         self._models = {m.id: m for m in models}
         now = clock.now()
         today = pt_date(now)
-        oldest = (dt.date.fromisoformat(today) - dt.timedelta(days=RPD_KEEP_DAYS)).isoformat()
-        conn.execute("DELETE FROM rpd WHERE day < ?", (oldest,))
-        conn.execute("DELETE FROM exhausted WHERE until <= ?", (now,))
+        self.prune()
         self._state: dict[str, _State] = {}
         for model_id in self._models:
             st = _State(day=today, rpd=self._load_rpd(model_id, today))
@@ -91,6 +97,14 @@ class QuotaStore:
             if row:
                 st.exhausted_until = float(row[0])
             self._state[model_id] = st
+
+    def prune(self) -> None:
+        """Delete RPD rows older than RPD_KEEP_DAYS and expired exhausted rows (DESIGN §20.10).
+        Memory is untouched: it only ever holds today's count and live states."""
+        now = self._clock.now()
+        oldest = (dt.date.fromisoformat(pt_date(now)) - dt.timedelta(days=RPD_KEEP_DAYS)).isoformat()
+        self._conn.execute("DELETE FROM rpd WHERE day < ?", (oldest,))
+        self._conn.execute("DELETE FROM exhausted WHERE until <= ?", (now,))
 
     # ---- internals -------------------------------------------------------
 
@@ -128,11 +142,11 @@ class QuotaStore:
         if st.quota_cooldown_until > now:
             quota.append("429 cooldown")
             ready = max(ready, st.quota_cooldown_until)
-        if len(st.rpm) >= model.rpm:
+        if model.rpm is not None and len(st.rpm) >= model.rpm:
             quota.append("rpm")
             times = sorted(st.rpm)
             ready = max(ready, times[len(times) - model.rpm] + WINDOW_S)
-        if st.rpd >= model.rpd:
+        if model.rpd is not None and st.rpd >= model.rpd:
             quota.append("rpd")
             ready = max(ready, next_pt_midnight(now))
         tpm_ready = self._tpm_ready(model, st, input_tokens, now)
@@ -153,6 +167,8 @@ class QuotaStore:
     @staticmethod
     def _tpm_ready(model: ModelConfig, st: _State, input_tokens: int, now: float) -> float:
         """Earliest time the input-TPM window has room for `input_tokens`."""
+        if model.tpm_input is None:  # no limit, but a TPM 429 still blocks for its window
+            return max(now, st.tpm_full_until)
         if input_tokens > model.tpm_input:
             return math.inf  # never fits; the router reports this as too_large first
         t = max(now, st.tpm_full_until)
@@ -219,7 +235,7 @@ class QuotaStore:
         if c.kind == "rpd":
             sent = now if sent_at is None else sent_at
             day_end = next_pt_midnight(sent)
-            grace = model.rpm * MIDNIGHT_GRACE_S / 60 < model.rpd
+            grace = midnight_grace_applies(model)
             if day_end <= now or (grace and sent - pt_day_start(sent) < MIDNIGHT_GRACE_S):
                 # The day it was about has ended, or it came minutes after midnight:
                 # back off briefly instead of losing the whole new day.

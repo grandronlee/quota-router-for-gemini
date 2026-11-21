@@ -3,6 +3,9 @@
 .env.*
 !.env.example
 
+# per-account limits (copy config.example.yaml)
+config.yaml
+
 # runtime state (quota DB, captured 429 bodies)
 data/
 

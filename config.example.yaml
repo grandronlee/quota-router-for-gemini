@@ -1,0 +1,24 @@
+# Copy to config.yaml (ignored by git) and fill in your own project's limits from
+# AI Studio → Rate Limit. Limits differ between accounts and change over time (DESIGN §2, §19).
+#
+# rpm / tpm_input / rpd: leave a value empty (e.g. `rpd:`) only if AI Studio shows no limit;
+# the key itself must stay. input_limit / output_limit come from models.list.
+
+upstream_base_url: https://generativelanguage.googleapis.com/v1beta/openai/
+custom_upstream: false        # the API key goes to upstream_base_url; true only for an endpoint you trust
+request_deadline_s: 180
+max_attempts: 3
+db_path: data/quota.sqlite3   # RPD counts, exhausted state, tool affinity
+billing: free                 # the only supported value: use a key from a project without billing
+max_body_bytes: 20971520      # 20 MB
+
+models:
+  lite-3-5: { id: gemini-3.5-flash-lite, rpm: 15, tpm_input: 250000, rpd: 500,
+              input_limit: 1048576, output_limit: 65536 }
+  lite-3-1: { id: gemini-3.1-flash-lite, rpm: 15, tpm_input: 250000, rpd: 500,
+              input_limit: 1048576, output_limit: 65536 }
+
+routes:
+  gemini-fast: [lite-3-5]     # add lite-3-1 once its tool call passes the probe
+
+handoffs: []                  # must stay empty in v1 (DESIGN §5.1)

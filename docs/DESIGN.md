@@ -291,6 +291,12 @@ The sections above leave these open. `quota_router/` implements them as follows:
 - **Retry delays** that are not finite or exceed 24 hours are ignored, and the default applies.
   The classifier never raises; anything it can't read is `unknown`.
 - **`db_path`** in `config.yaml` (default `data/quota.sqlite3`) sets where the SQLite state lives.
+- **Attempts near the deadline** (added 2026-11-21 after the Phase 2 review): the first attempt
+  runs while any time is left; a later attempt isn't started with less than 5 s left (that
+  candidate is `not_tried`). A later attempt whose timeout the deadline cut at least 5 s below
+  the usual `min(120 s, request_deadline_s)`, and which then ran out that whole shortened time,
+  gets no 5xx cooldown: it got less time, which says nothing about the model's health. An earlier
+  network timeout (connect, pool) still cools down. Its RPD reservation is kept, as for any timeout.
 
 ## 6. Classifying 429s
 
@@ -430,6 +436,10 @@ The `input_limit`/`output_limit` values are the ones `models.list` reported in P
 ([probe-results.md](probe-results.md)).
 
 Secrets go in `.env` (`GEMINI_API_KEY`, `PROXY_TOKEN`), never in `config.yaml`.
+
+The API key is sent to `upstream_base_url`, so it must be `https://generativelanguage.googleapis.com/...`
+(no other host or port, no credentials, query or fragment). Another endpoint needs the explicit
+`custom_upstream: true`, and must still use HTTPS unless it is on localhost. Redirects are never followed.
 
 A rate limit left empty (`rpm:`, `tpm_input:` or `rpd:` with no value) means the dashboard
 shows no limit for it; the proxy then skips that check. Token limits (`input_limit`,
@@ -697,7 +707,7 @@ is reconsidered only if the reports show stable patterns over weeks.
    | Metric | Labels |
    |---|---|
    | `qr_requests_total` | route, status, reason |
-   | `qr_upstream_attempts_total` | model, outcome (`ok`, `429_rpm`, `429_tpm`, `429_rpd`, `429_unknown`, `5xx`, `timeout`, `404`, `4xx`) |
+   | `qr_upstream_attempts_total` | model, outcome (`ok`, `429_rpm`, `429_tpm`, `429_rpd`, `429_unknown`, `5xx`, `timeout`, `404`, `4xx`, `error` for connect and other failures) |
    | `qr_rpd_used`, `qr_rpd_limit`, `qr_rpm_used`, `qr_tpm_input_used` | model |
    | `qr_model_state` (1 for the current state) | model, state (`available`, `cooldown`, `exhausted`, `disabled`) |
    | `qr_first_byte_seconds` (histogram) | route |
@@ -832,7 +842,9 @@ with a set `rpd` gets no grace (it could use its whole day in 10 minutes).
     preflighted `Authorization` header.
 - Auth: `Authorization: Bearer <PROXY_TOKEN>`, compared with `hmac.compare_digest`, on
   every path except `/healthz`. 401 in OpenAI error format; counted in `qr_auth_failures_total`.
-- Body over `max_body_bytes` → 413; not a JSON object → 400 `invalid_request_error`.
+- Body over `max_body_bytes` → 413; not a JSON object → 400 `invalid_request_error`; a body
+  not fully received within `request_deadline_s` → 408 `request_timeout`. The deadline counts
+  from arrival, so routing gets only the time the upload left.
 - The upstream request is the client's body with only two changes: `model` becomes the
   real ID, and streams get `stream_options.include_usage: true` (§7). None of the client's
   headers are forwarded; the proxy sends its own `Authorization: Bearer <GEMINI_API_KEY>`.
@@ -844,7 +856,7 @@ with a set `rpd` gets no grace (it could use its whole day in 10 minutes).
 | Upstream | Result |
 |---|---|
 | 2xx, non-stream | `Served` with status, body and content type |
-| 2xx, stream, first SSE event is data | `Served`; the open stream and that first event go to the HTTP layer |
+| 2xx, stream, first SSE event is data | `Served`; the open stream and that first event go to the HTTP layer. Comment and heartbeat events before it are skipped: they commit nothing |
 | 2xx, stream, first SSE event is an `error` | **(decide)** recommended: treated by its code (429 → `RateLimited`, 5xx → `Unavailable`), since nothing has reached the client yet |
 | 429 | `RateLimited` with body and headers |
 | 500, 502, 503, 504; connect error; timeout before the first byte; any other exception | `Unavailable` |
@@ -872,11 +884,16 @@ layer is closed before the callable returns.
   complete. Recommended: yes.
 - The open upstream stream is closed in every case, including when the client disconnects
   before the first chunk is sent.
+- If the client disconnects before the response starts (§8), routing is cancelled: no further
+  attempt or fallback. The model being called keeps its reservation, and the log line (status
+  499, reason `client_disconnected`) names it in `fallback_path`. A disconnect while the body
+  is still uploading is logged the same way, with nothing reserved.
 
 ### 20.6 Tool-call IDs
 
-The format of Google's tool-call IDs hasn't been recorded (Phase 0 kept only names and
-arguments). Affinity assumes an ID never repeats across responses.
+Recorded 2026-11-20 PT ([probe-results.md](probe-results.md)): `call_` followed by 19 decimal
+digits, the size of a 64-bit integer. One sample can't show whether they are random or
+sequential. Affinity assumes an ID never repeats across responses.
 - When `complete()` records an ID already held by another live record, the proxy logs a
   warning and counts it (`qr_tool_call_id_reused_total`), so a repeating format shows up.
 - **(decide)** Record the format with one live tool-call request (from the 500 RPD of
@@ -888,12 +905,16 @@ arguments). Affinity assumes an ID never repeats across responses.
 - All log output is JSON lines on stdout. The per-request line (`"event": "request"`) holds
   the fields of §17.2 layer 2 plus `request_id` and `stream`; the route field is a
   configured route or model ID, or `"unknown"`.
-- A scrubbing filter runs on every formatted log line and on every error body sent to a
-  client: the exact `GEMINI_API_KEY` and `PROXY_TOKEN` values, and anything shaped like a
-  Google key (`AIza…`), become `<redacted>`.
+- A scrubbing filter runs on every log line and on every error body sent to a client: the
+  exact `GEMINI_API_KEY` and `PROXY_TOKEN` values, and anything shaped like a Google key
+  (`AIza…`), become `<redacted>`. It scrubs decoded values before JSON encoding (an escape such
+  as `\"` or `\u0041` would hide a secret from a text match), then the encoded text as a last
+  pass. A passed-through JSON error body is therefore re-encoded: same content, maybe different
+  spacing.
 - **(decide)** 429 bodies (scrubbed, with `retry-after` and status) are saved to
   `data/429/<time>-<model>.json`, at most 50 files, so the classifier can be checked against
-  real ones (§6, PLAN Phase 0). Recommended: yes.
+  real ones (§6, PLAN Phase 0). Recommended: yes. The whole body is redacted before it is cut to
+  64 KB, and the folder and files are owner-only (0700 and 0600) whatever the umask.
 
 ### 20.8 `/status` and `/metrics`
 
@@ -905,10 +926,10 @@ arguments). Affinity assumes an ID never repeats across responses.
   **(decide)** Written by hand (about 100 lines, no dependency) rather than with
   `prometheus_client`. Recommended: by hand, to keep the dependency list short.
 - Label values come only from config and these fixed lists: status (`200`, `400`, `401`,
-  `403`, `404`, `413`, `429`, `503`, `other`), reason (`served`, `passthrough`, `quota`,
+  `403`, `404`, `413`, `429`, `500`, `503`, `other`), reason (`served`, `passthrough`, `quota`,
   `unavailable`, `context_length_exceeded`, `no_enabled_model`, `model_not_found`,
-  `bad_request`, `unauthorized`, `forbidden_host`, `stream_error`, `client_disconnected`),
-  attempt outcome
+  `bad_request`, `unauthorized`, `forbidden_host`, `stream_error`, `client_disconnected`,
+  `internal_error`), attempt outcome
   (§17.2), model state, token kind.
 - `qr_first_byte_seconds` buckets: 0.5, 1, 2, 5, 10, 20, 30, 60, 120, 180 s.
 

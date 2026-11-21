@@ -155,3 +155,82 @@ def test_rollover_read_failure_after_a_429_does_not_advertise_ready_now():
 
     out = e.route(chat(), ScriptedUpstream({"model-a": RateLimited(RPM_429)}, on_call=cross_midnight))
     assert isinstance(out, RouteFailed) and out.status == 429 and out.retry_after_s == 30
+
+
+# ---- Phase 2 review, finding 8: deadline-shortened attempts ------------------
+
+from quota_router.router import RouteFailed, Unavailable as _Unavailable
+
+
+def _slow_upstream(env, script):
+    """Each model: (seconds the call takes on the fake clock, result). Records timeouts given."""
+    timeouts = {}
+
+    async def call(model, timeout_s):
+        timeouts[model.id] = timeout_s
+        took, result = script[model.id]
+        env.clock.advance(min(took, timeout_s))
+        return result
+
+    return call, timeouts
+
+
+def test_timeout_cut_short_by_the_deadline_does_not_cool_down_a_healthy_model():
+    e = Env(make_config({"a": model_dict("model-a"), "b": model_dict("model-b")}))
+    call, timeouts = _slow_upstream(e, {"model-a": (120, _Unavailable("timeout")),
+                                        "model-b": (70, _Unavailable("timeout"))})
+    cooled = []
+    real = e.store.on_unavailable
+    e.store.on_unavailable = lambda m: (cooled.append(m.id), real(m))
+    out = e.route(chat(), call)
+    assert isinstance(out, RouteFailed) and out.status == 503
+    assert timeouts == {"model-a": 120, "model-b": 60}
+    assert cooled == ["model-a"]                           # a full-length timeout still cools down
+    assert e.store.check(e.model("b"), 10) is None        # b only got 60 s: no cooldown
+    assert e.store.snapshot()["model-b"]["rpd_used"] == 1  # its reservation is kept
+    b = next(c for c in out.candidates if c.model.id == "model-b")
+    assert b.reason == "unavailable" and "cut short" in b.detail
+
+
+def test_no_later_attempt_with_less_than_the_minimum_time_left():
+    e = Env(make_config({"a": model_dict("model-a"), "b": model_dict("model-b")}, request_deadline_s=124))
+    call, timeouts = _slow_upstream(e, {"model-a": (120, _Unavailable("http 503")),
+                                        "model-b": (1, _Unavailable("http 503"))})
+    out = e.route(chat(), call)
+    assert list(timeouts) == ["model-a"]  # 4 s left: model-b isn't called
+    assert out.status == 503 and out.retry_after_s == 1
+    b = next(c for c in out.candidates if c.model.id == "model-b")
+    assert b.reason == "not_tried"
+    assert e.store.snapshot()["model-b"]["rpd_used"] == 0
+
+
+def test_first_attempt_runs_even_under_a_small_configured_deadline():
+    e = Env(make_config({"a": model_dict("model-a")}, request_deadline_s=2))
+    call, timeouts = _slow_upstream(e, {"model-a": (2, _Unavailable("timeout"))})
+    e.route(chat(), call)
+    assert timeouts == {"model-a": 2}
+    a = e.store.check(e.model("a"), 10)
+    assert a is not None and a.reason == "unavailable"  # its full time ran out: cooldown as before
+
+
+def test_early_network_timeout_on_a_later_attempt_still_cools_down():
+    """Review follow-up: a 10 s connect timeout isn't the deadline's doing."""
+    e = Env(make_config({"a": model_dict("model-a"), "b": model_dict("model-b")}))
+    call, timeouts = _slow_upstream(e, {"model-a": (61, _Unavailable("http 503")),
+                                        "model-b": (10, _Unavailable("timeout"))})
+    e.route(chat(), call)
+    assert timeouts["model-b"] == 119
+    b = e.store.check(e.model("b"), 10)
+    assert b is not None and b.reason == "unavailable"
+
+
+def test_nearly_full_budget_hang_on_a_later_attempt_still_cools_down():
+    """Review follow-up: 119 s instead of 120 s is not "cut short"."""
+    e = Env(make_config({"a": model_dict("model-a"), "b": model_dict("model-b")}))
+    call, timeouts = _slow_upstream(e, {"model-a": (61, _Unavailable("http 503")),
+                                        "model-b": (119, _Unavailable("timeout"))})
+    out = e.route(chat(), call)
+    assert timeouts["model-b"] == 119
+    b = next(c for c in out.candidates if c.model.id == "model-b")
+    assert "cut short" not in b.detail
+    assert e.store.check(e.model("b"), 10) is not None

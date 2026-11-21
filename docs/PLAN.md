@@ -127,6 +127,15 @@ Tests (`respx` mocking upstream):
   rows and survives a SQLite error; a version-0 database with the Phase 1 tables becomes
   version 1; a newer version, a damaged file or a non-database file is a startup error
   naming the file; 429 captures stop at 50 files
+
+Status (2026-11-21): **Phase 2 is complete.** `quota_router/` adds `app.py`, `upstream.py`,
+`settings.py`, `scrub.py`, `logs.py`, `metrics.py` and `__main__.py` (`python -m quota_router`);
+every test listed above exists, and `.venv/bin/python -m pytest -q` passes (205 tests). A deep
+code review and two follow-up reviews are done, then an external review's five security and
+correctness findings were fixed and checked by a further code review (DESIGN §12, §20.3, §20.4,
+§20.7). Every fix has a regression test; the router change the reviews led to (attempts near
+the deadline) is in DESIGN §5.2. One live tool-call
+request through the proxy recorded the tool-call ID format ([probe-results.md](probe-results.md)).
 - log lines and metrics hold no prompt or completion text, tokens or tool-call IDs; every
   metric label value comes from config or a fixed list
 

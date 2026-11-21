@@ -1,0 +1,619 @@
+"""HTTP layer: FastAPI app, auth, streaming and observability (DESIGN §5, §8, §10, §11, §17, §20).
+
+All handlers are `async def`, so the SQLite connection is only used from the
+event-loop thread. One uvicorn worker (DESIGN §7).
+"""
+
+from __future__ import annotations
+
+import asyncio
+import datetime as dt
+import hmac
+import json
+import logging
+import math
+import sqlite3
+import time
+import uuid
+from contextlib import asynccontextmanager
+from pathlib import Path
+from typing import Any
+from urllib.parse import urlsplit
+
+import anyio
+import httpx
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse, Response, StreamingResponse
+from starlette.datastructures import Headers
+from starlette.requests import ClientDisconnect
+
+from .affinity import AffinityStore
+from .classify import classify_429
+from .clock import Clock, SystemClock, next_pt_midnight
+from .config import Config, ModelConfig
+from .db import connect
+from .logs import REQUEST_LOGGER
+from .metrics import OUTCOMES, STATUSES, Metrics, RequestStats, bounded
+from .quota import QuotaStore
+from .router import (ModelNotFound, RateLimited, Rejected, RouteFailed, RoutePassthrough, RouteServed,
+                     Router, Served, Unavailable, UpstreamResult, estimate_input_tokens)
+from .scrub import Scrubber
+from .settings import Settings, normalize_host
+from .upstream import Body, Captures, GeminiUpstream, HandleSet, SSEEvent, Stream, make_client
+
+log = logging.getLogger("quota_router")
+request_log = logging.getLogger(REQUEST_LOGGER)
+
+PRUNE_INTERVAL_S = 3600.0
+UNGUARDED_AUTH_PATHS = {"/healthz"}  # still behind the Host/Origin guard
+
+
+def _iso(t: float | None) -> str | None:
+    return None if t is None else dt.datetime.fromtimestamp(t, dt.timezone.utc).isoformat(timespec="seconds")
+
+
+def openai_error(status: int, code: str, message: str, etype: str = "invalid_request_error",
+                 headers: dict[str, str] | None = None) -> JSONResponse:
+    return JSONResponse({"error": {"message": message, "type": etype, "code": code, "param": None}},
+                        status_code=status, headers=headers)
+
+
+def usage_tokens(usage: Any) -> tuple[int | None, int | None]:
+    """(prompt_tokens, output tokens). Output = total − prompt, so reasoning counts (DESIGN §7)."""
+    if not isinstance(usage, dict):
+        return None, None
+
+    def _int(v: Any) -> int | None:
+        return v if isinstance(v, int) and not isinstance(v, bool) and v >= 0 else None
+
+    prompt, total, completion = (_int(usage.get(k)) for k in ("prompt_tokens", "total_tokens", "completion_tokens"))
+    output = total - prompt if prompt is not None and total is not None and total >= prompt else completion
+    return prompt, output
+
+
+def tool_call_ids(obj: Any, part: str) -> list[str]:
+    """IDs from choices[].<part>.tool_calls[].id, where part is "message" or "delta"."""
+    ids: list[str] = []
+    choices = obj.get("choices") if isinstance(obj, dict) else None
+    for ch in choices if isinstance(choices, list) else []:
+        inner = ch.get(part) if isinstance(ch, dict) else None
+        calls = inner.get("tool_calls") if isinstance(inner, dict) else None
+        for tc in calls if isinstance(calls, list) else []:
+            tc_id = tc.get("id") if isinstance(tc, dict) else None
+            if isinstance(tc_id, str) and tc_id:
+                ids.append(tc_id)
+    return ids
+
+
+def attempt_outcome(result: UpstreamResult) -> str:
+    if isinstance(result, Served):
+        return "ok"
+    if isinstance(result, RateLimited):
+        return "429_" + classify_429(result.body, result.headers).kind
+    if isinstance(result, Unavailable):
+        d = result.detail
+        if d == "timeout":
+            return "timeout"
+        code = d.rsplit(" ", 1)[-1]
+        if d.startswith("http ") or (d.startswith("stream error event ") and code.isdigit() and int(code) >= 500):
+            return "5xx"
+        return "error"  # connect errors, an empty stream, an error event without a code
+    if isinstance(result, ModelNotFound):
+        return "404"
+    if isinstance(result, Rejected):
+        status = getattr(result.payload, "status", 0)
+        return "4xx" if 400 <= status < 500 else "error"
+    return "error"
+
+
+def model_state(snap: dict) -> str:
+    if snap["disabled"]:
+        return "disabled"
+    if snap["exhausted_until"] or (snap["rpd_limit"] is not None and snap["rpd_used"] >= snap["rpd_limit"]):
+        return "exhausted"
+    if snap["cooldown_until"]:
+        return "cooldown"
+    return "available"
+
+
+class Proxy:
+    """Everything one running proxy holds. Created before the event loop starts, so a bad
+    config or database fails at startup with a clear message."""
+
+    def __init__(self, settings: Settings, config: Config, *, clock: Clock | None = None,
+                 transport: httpx.AsyncBaseTransport | None = None,
+                 conn: sqlite3.Connection | None = None) -> None:
+        self.settings = settings
+        self.config = config
+        self.clock = clock or SystemClock()
+        self.transport = transport
+        self.conn = conn if conn is not None else connect(config.db_path, check_same_thread=False)
+        self.store = QuotaStore(config.models.values(), self.conn, self.clock)
+        self.affinity = AffinityStore(self.conn, self.clock)
+        self.router = Router(config, self.store, self.affinity, self.clock)
+        self.scrubber = Scrubber([settings.gemini_api_key, settings.proxy_token])
+        self.metrics = Metrics()
+        self.stats = RequestStats(self.clock.now())
+        self.auth_failures = 0
+        capture_dir = Path(config.db_path).parent / "429" if config.db_path != ":memory:" else None
+        self.captures = Captures(capture_dir, self.scrubber, self.clock.now) if capture_dir else None
+        self.client: httpx.AsyncClient | None = None
+        self.upstream: GeminiUpstream | None = None
+
+    # ---- helpers ---------------------------------------------------------
+
+    def route_label(self, name: Any) -> str:
+        if isinstance(name, str) and (name in self.config.routes or self.config.model_by_id(name)):
+            return name
+        return "unknown"
+
+    def on_attempt(self, model: ModelConfig, result: UpstreamResult) -> None:
+        self.metrics.inc("qr_upstream_attempts_total", model=model.id,
+                         outcome=bounded(attempt_outcome(result), OUTCOMES, "error"))
+
+    def record(self, *, request_id: str, route: str, status: int, reason: str, stream: bool = False,
+               started: float, served_model: str | None = None, path: list[str] | None = None,
+               affinity: str | None = None, input_estimate: int | None = None,
+               prompt_tokens: int | None = None, output_tokens: int | None = None,
+               first_byte_s: float | None = None, http_path: str | None = None) -> None:
+        """One request's metrics, /status counts and its JSON log line (DESIGN §17.2)."""
+        now = self.clock.now()
+        self.metrics.inc("qr_requests_total", route=route, status=bounded(status, STATUSES), reason=reason)
+        self.stats.record(now, route, status, reason)
+        if first_byte_s is not None:
+            self.metrics.observe_first_byte(first_byte_s, route)
+        if served_model:
+            if prompt_tokens is not None:
+                self.metrics.inc("qr_tokens_total", prompt_tokens, model=served_model, kind="input")
+            if output_tokens is not None:
+                self.metrics.inc("qr_tokens_total", output_tokens, model=served_model, kind="output")
+        fields = {
+            "event": "request", "request_id": request_id, "route": route, "stream": stream,
+            "status": status, "reason": reason, "served_model": served_model,
+            "fallback_path": path or [], "affinity": affinity, "input_estimate": input_estimate,
+            "prompt_tokens": prompt_tokens, "output_tokens": output_tokens,
+            "latency_ms": round((time.monotonic() - started) * 1000),
+            "first_byte_ms": None if first_byte_s is None else round(first_byte_s * 1000),
+        }
+        if http_path is not None:
+            fields["path"] = http_path[:200]
+        request_log.info("request", extra={"fields": fields})
+
+    def prune_once(self) -> None:
+        try:
+            self.store.prune()
+            self.affinity.prune()
+        except sqlite3.Error:
+            self.router.state_errors += 1
+            log.exception("housekeeping prune failed; will retry")
+
+    async def housekeeping(self) -> None:
+        while True:
+            await asyncio.sleep(PRUNE_INTERVAL_S)
+            try:
+                self.prune_once()
+            except Exception:  # keep the task alive; prune_once already handles SQLite errors
+                log.exception("housekeeping failed; will retry")
+
+    # ---- guard and auth ----------------------------------------------------
+
+    def host_allowed(self, host: str | None) -> bool:
+        return bool(host) and normalize_host(host) in self.settings.allowed_hosts
+
+    def origin_allowed(self, origin: str) -> bool:
+        try:
+            parts = urlsplit(origin)
+            hostname = parts.hostname
+        except ValueError:
+            return False
+        if parts.scheme not in ("http", "https") or not hostname:
+            return False  # includes "null" from sandboxed frames and file:// pages
+        return normalize_host(hostname) in self.settings.allowed_hosts
+
+    def token_ok(self, authorization: str | None) -> bool:
+        if not authorization:
+            return False
+        scheme, _, token = authorization.partition(" ")
+        if scheme.lower() != "bearer":
+            return False
+        return hmac.compare_digest(token.strip().encode("utf-8"), self.settings.proxy_token.encode("utf-8"))
+
+
+class Guard:
+    """Pure ASGI middleware: Host/Origin check on every path, then the bearer token
+    everywhere except /healthz (DESIGN §20.3). Never sends CORS headers."""
+
+    def __init__(self, app, proxy: Proxy) -> None:
+        self.app = app
+        self.proxy = proxy
+
+    async def __call__(self, scope, receive, send) -> None:
+        if scope["type"] != "http":
+            return await self.app(scope, receive, send)
+        p = self.proxy
+        started = time.monotonic()
+        headers = Headers(scope=scope)
+        origin = headers.get("origin")
+        path = scope.get("path", "")
+        if not p.host_allowed(headers.get("host")) or (origin is not None and not p.origin_allowed(origin)):
+            p.record(request_id=uuid.uuid4().hex[:16], route="unknown", status=403, reason="forbidden_host",
+                     started=started, http_path=path)
+            resp = openai_error(403, "forbidden_host", "requests must come from this machine "
+                                "(Host and Origin must be localhost)", "permission_error")
+            return await resp(scope, receive, send)
+        if path not in UNGUARDED_AUTH_PATHS and not p.token_ok(headers.get("authorization")):
+            p.auth_failures += 1
+            p.record(request_id=uuid.uuid4().hex[:16], route="unknown", status=401, reason="unauthorized",
+                     started=started, http_path=path)
+            resp = openai_error(401, "invalid_api_key", "missing or wrong bearer token",
+                                headers={"WWW-Authenticate": "Bearer"})
+            return await resp(scope, receive, send)
+        await self.app(scope, receive, send)
+
+
+class StreamSession:
+    """Forwards one served stream and settles it exactly once (DESIGN §8, §20.5)."""
+
+    def __init__(self, proxy: Proxy, served: RouteServed, stream: Stream, *, request_id: str,
+                 route: str, started: float, input_estimate: int) -> None:
+        self.p = proxy
+        self.served = served
+        self.stream = stream
+        self.request_id = request_id
+        self.route = route
+        self.started = started
+        self.input_estimate = input_estimate
+        self.reason = "served"
+        self.done = False           # saw [DONE] from upstream
+        self.settled = False        # complete() has run with usage (or for the final time)
+        self.finished = False
+        self.seen_ids: set[str] = set()
+        self.pending_ids: list[str] = []
+        self.prompt_tokens: int | None = None
+        self.output_tokens: int | None = None
+        self.first_byte_s: float | None = None
+
+    def _complete(self, prompt_tokens: int | None) -> None:
+        ids, self.pending_ids = self.pending_ids, []
+        self.p.router.complete(self.served, prompt_tokens, ids or None)
+        self.settled = True
+
+    def _complete_if_needed(self) -> None:
+        """Before the last bytes of any ending (router contract): settle with the estimate
+        if usage never came, and record tool-call IDs still pending."""
+        if not self.settled or self.pending_ids:
+            self._complete(None)
+
+    def _error_event(self, message: str) -> bytes:
+        err = {"error": {"message": self.p.scrubber.text(message), "type": "upstream_error",
+                         "code": "stream_error", "param": None}}
+        return b"data: " + json.dumps(err).encode("utf-8") + b"\n\n"
+
+    def _handle(self, ev: SSEEvent) -> tuple[bytes | None, bool]:
+        """Process one upstream event; returns (bytes to send, stop)."""
+        if ev.is_done:
+            self._complete_if_needed()  # before [DONE] reaches the client (router contract)
+            self.done = True
+            return ev.raw, True
+        err = ev.error()
+        if err is not None:  # mid-stream upstream error: one error event, no [DONE]
+            self.reason = "stream_error"
+            self._complete_if_needed()
+            payload = self.p.scrubber.obj({"error": err})
+            return b"data: " + self.p.scrubber.text(json.dumps(payload)).encode("utf-8") + b"\n\n", True
+        obj = ev.json()
+        if isinstance(obj, dict):
+            for i in tool_call_ids(obj, "delta"):
+                if i not in self.seen_ids:
+                    self.seen_ids.add(i)
+                    self.pending_ids.append(i)
+            usage = obj.get("usage")
+            if isinstance(usage, dict) and not self.settled:
+                self.prompt_tokens, self.output_tokens = usage_tokens(usage)
+                self._complete(self.prompt_tokens)  # before the usage chunk is forwarded
+            elif self.settled and self.pending_ids:
+                self._complete(None)  # IDs that arrived after usage
+        return ev.raw, False
+
+    async def body(self):
+        ev: SSEEvent | None = self.stream.first
+        while True:
+            out, stop = self._handle(ev)
+            if out:
+                if self.first_byte_s is None:
+                    self.first_byte_s = time.monotonic() - self.started
+                yield out
+            if stop:
+                return
+            try:
+                ev = await anext(self.stream.events, None)
+            except Exception as e:  # httpx errors and anything unexpected; cancellation propagates
+                if not isinstance(e, (httpx.HTTPError, httpx.StreamError)):
+                    log.exception("reading the upstream stream failed")
+                self.reason = "stream_error"
+                self._complete_if_needed()
+                yield self._error_event(f"upstream stream failed: {type(e).__name__}")
+                return
+            if ev is None:
+                self.reason = "stream_error"
+                self._complete_if_needed()
+                yield self._error_event("upstream stream ended before [DONE]")
+                return
+
+    async def finish(self) -> None:
+        if self.finished:
+            return
+        self.finished = True
+        if not self.done and self.reason == "served":
+            self.reason = "client_disconnected"
+        try:
+            self._complete_if_needed()  # estimate kept
+        except Exception:
+            log.exception("settling a stream failed")
+        try:
+            await self.stream.aclose()
+        except Exception:
+            log.debug("closing the upstream stream failed", exc_info=True)
+        self.p.record(request_id=self.request_id, route=self.route, status=200, reason=self.reason,
+                      stream=True, started=self.started, served_model=self.served.model.id,
+                      path=self.served.path, affinity=self.served.affinity,
+                      input_estimate=self.input_estimate, prompt_tokens=self.prompt_tokens,
+                      output_tokens=self.output_tokens, first_byte_s=self.first_byte_s)
+
+
+class ManagedStream(StreamingResponse):
+    """A StreamingResponse that always finishes its session: settles usage, records affinity,
+    closes the upstream stream and writes the log line, even if the client went away before
+    the first chunk."""
+
+    def __init__(self, session: StreamSession, headers: dict[str, str]) -> None:
+        super().__init__(session.body(), media_type="text/event-stream", headers=headers)
+        self.session = session
+
+    async def __call__(self, scope, receive, send) -> None:
+        try:
+            await super().__call__(scope, receive, send)
+        except ClientDisconnect:
+            pass
+        finally:
+            with anyio.CancelScope(shield=True):
+                try:
+                    await self.body_iterator.aclose()  # type: ignore[attr-defined]
+                except Exception:
+                    pass
+                await self.session.finish()
+
+
+def _response_headers(request_id: str, path: list[str], affinity: str | None,
+                      served_model: str | None = None) -> dict[str, str]:
+    h = {"x-request-id": request_id}
+    if served_model:
+        h["x-served-model"] = served_model
+    if path:
+        h["x-fallback-path"] = ",".join(path)
+    if affinity:
+        h["x-turn-affinity"] = affinity
+    return h
+
+
+async def _wait_for_disconnect(request: Request) -> None:
+    """Returns when the client disconnects. Called only after the body has been read."""
+    while True:
+        message = await request.receive()
+        if message.get("type") != "http.request":  # http.disconnect, or anything unexpected
+            return
+        await asyncio.sleep(0)  # never spin, even with a server whose receive() doesn't wait
+
+
+async def _read_json(request: Request, limit: int) -> dict | Response:
+    declared = request.headers.get("content-length")
+    if declared and declared.isdigit() and int(declared) > limit:
+        return openai_error(413, "request_too_large", f"request body over {limit} bytes")
+    chunks: list[bytes] = []
+    size = 0
+    try:
+        async for chunk in request.stream():
+            size += len(chunk)
+            if size > limit:
+                return openai_error(413, "request_too_large", f"request body over {limit} bytes")
+            chunks.append(chunk)
+    except ClientDisconnect:  # gone while uploading; nothing was reserved
+        return Response(status_code=499)
+    try:
+        body = json.loads(b"".join(chunks))
+    except (ValueError, RecursionError):
+        return openai_error(400, "invalid_json", "request body is not valid JSON")
+    if not isinstance(body, dict):
+        return openai_error(400, "invalid_json", "request body must be a JSON object")
+    return body
+
+
+def create_app(proxy: Proxy) -> FastAPI:
+    p = proxy
+
+    @asynccontextmanager
+    async def lifespan(_app: FastAPI):
+        p.client = make_client(p.transport, trust_env=p.config.upstream_base_url.startswith("https://"))
+        p.upstream = GeminiUpstream(p.client, p.config.upstream_base_url, p.settings.gemini_api_key,
+                                    p.scrubber, p.captures, p.on_attempt)
+        task = asyncio.create_task(p.housekeeping())
+        try:
+            yield
+        finally:
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
+            try:
+                await p.client.aclose()
+            finally:
+                p.conn.close()  # folds the WAL back into the database (DESIGN §20.10)
+
+    app = FastAPI(title="quota-router-for-gemini", lifespan=lifespan,
+                  docs_url=None, redoc_url=None, openapi_url=None)
+    app.add_middleware(Guard, proxy=p)
+
+    @app.get("/healthz")
+    async def healthz():
+        return {"status": "ok"}
+
+    @app.get("/v1/models")
+    async def models():
+        data = [{"id": r, "object": "model", "created": 0, "owned_by": "quota-router"} for r in p.config.routes]
+        data += [{"id": m.id, "object": "model", "created": 0, "owned_by": "google"}
+                 for m in p.config.models.values() if not p.store.is_disabled(m)]
+        return {"object": "list", "data": data}
+
+    @app.get("/status")
+    async def status():
+        now = p.clock.now()
+        snap = p.store.snapshot()
+        models = {}
+        for model_id, s in snap.items():
+            models[model_id] = {**s, "state": model_state(s),
+                                "cooldown_until": _iso(s["cooldown_until"]),
+                                "exhausted_until": _iso(s["exhausted_until"])}
+        reset = next_pt_midnight(now)
+        view = p.stats.view(now)
+        return {
+            "now": _iso(now), "next_pt_reset": _iso(reset), "next_pt_reset_in_s": math.ceil(reset - now),
+            "routes": p.config.routes, "models": models,
+            "requests": {"since": _iso(view["since"]), "by_status": view["by_status"],
+                         "by_reason": view["by_reason"]},
+            "recent_errors": [{"at": _iso(e.at), "route": e.route, "status": e.status, "reason": e.reason}
+                              for e in reversed(p.stats.recent)],
+            "state_errors": p.router.state_errors,
+        }
+
+    @app.get("/metrics")
+    async def metrics():
+        snap = p.store.snapshot()
+        gauges: dict[str, list] = {"qr_rpd_used": [], "qr_rpd_limit": [], "qr_rpm_used": [],
+                                   "qr_tpm_input_used": [], "qr_model_state": []}
+        for model_id, s in snap.items():
+            lbl = {"model": model_id}
+            gauges["qr_rpd_used"].append((lbl, s["rpd_used"]))
+            if s["rpd_limit"] is not None:
+                gauges["qr_rpd_limit"].append((lbl, s["rpd_limit"]))
+            gauges["qr_rpm_used"].append((lbl, s["rpm_used"]))
+            gauges["qr_tpm_input_used"].append((lbl, s["tpm_input_used"]))
+            state = model_state(s)
+            for st in ("available", "cooldown", "exhausted", "disabled"):
+                gauges["qr_model_state"].append(({"model": model_id, "state": st}, 1 if st == state else 0))
+        text = p.metrics.render(gauges, {
+            "qr_auth_failures_total": p.auth_failures,
+            "qr_state_errors_total": p.router.state_errors,
+            "qr_tool_call_id_reused_total": p.router.tool_call_ids_reused,
+        })
+        return Response(text, media_type="text/plain; version=0.0.4; charset=utf-8")
+
+    @app.post("/v1/chat/completions")
+    async def chat(request: Request):
+        started = time.monotonic()
+        arrived = p.clock.now()
+        request_id = uuid.uuid4().hex[:16]
+        try:  # the request deadline covers the upload too (DESIGN §9); routing gets what's left
+            async with asyncio.timeout(p.config.request_deadline_s):
+                body = await _read_json(request, p.config.max_body_bytes)
+        except TimeoutError:
+            body = openai_error(408, "request_timeout", "request body not received within the deadline")
+        if isinstance(body, Response):
+            reason = "client_disconnected" if body.status_code == 499 else "bad_request"
+            p.record(request_id=request_id, route="unknown", status=body.status_code, reason=reason,
+                     started=started)
+            body.headers["x-request-id"] = request_id
+            return body
+        route = p.route_label(body.get("model"))
+        stream = body.get("stream") is True
+        estimate = estimate_input_tokens(body)
+        handles = HandleSet()
+        assert p.upstream is not None
+        routing = asyncio.ensure_future(
+            p.router.route(body, p.upstream.bind(body, stream, handles), started_at=arrived))
+        # DESIGN §8: if the client goes away before the response starts, stop routing (no
+        # more attempts or fallbacks for nobody). uvicorn doesn't cancel the handler itself.
+        watcher = asyncio.ensure_future(_wait_for_disconnect(request))
+        try:
+            await asyncio.wait({routing, watcher}, return_when=asyncio.FIRST_COMPLETED)
+        except BaseException:  # the handler itself was cancelled
+            for t in (routing, watcher):
+                t.cancel()
+            with anyio.CancelScope(shield=True):
+                await handles.close_except(None)
+            raise
+        watcher.cancel()
+        if not routing.done():
+            routing.cancel()
+            try:
+                await routing
+            except (asyncio.CancelledError, Exception):
+                pass
+            await handles.close_except(None)
+            # The model being called keeps its reservation; name it, since rpd_used went up.
+            p.record(request_id=request_id, route=route, status=499, reason="client_disconnected",
+                     stream=stream, started=started, path=handles.attempted, input_estimate=estimate)
+            return Response(status_code=499)
+        try:
+            outcome = routing.result()
+        except Exception:
+            await handles.close_except(None)
+            log.exception("routing failed")
+            p.record(request_id=request_id, route=route, status=500, reason="internal_error",
+                     stream=stream, started=started, input_estimate=estimate)
+            return openai_error(500, "internal_error", "internal proxy error", "server_error",
+                                {"x-request-id": request_id})
+        served_payload = outcome.payload if isinstance(outcome, RouteServed) else None
+        await handles.close_except(served_payload)
+
+        if isinstance(outcome, RouteFailed):
+            headers = _response_headers(request_id, outcome.path, outcome.affinity)
+            if outcome.retry_after_s is not None:
+                headers["Retry-After"] = str(outcome.retry_after_s)
+            reason = {429: "quota", 400: "context_length_exceeded", 404: "model_not_found"}.get(outcome.status)
+            if outcome.code == "no_enabled_model":
+                reason = "no_enabled_model"
+            reason = reason or "unavailable"
+            p.record(request_id=request_id, route=route, status=outcome.status, reason=reason, stream=stream,
+                     started=started, path=outcome.path, affinity=outcome.affinity, input_estimate=estimate)
+            return JSONResponse(p.scrubber.obj(outcome.error_body()),
+                                status_code=outcome.status, headers=headers)
+
+        if isinstance(outcome, RoutePassthrough):
+            b: Body = outcome.payload
+            headers = _response_headers(request_id, outcome.path, outcome.affinity, outcome.model.id)
+            p.record(request_id=request_id, route=route, status=b.status, reason="passthrough", stream=stream,
+                     started=started, served_model=outcome.model.id, path=outcome.path,
+                     affinity=outcome.affinity, input_estimate=estimate)
+            headers["content-type"] = b.content_type
+            return Response(b.content, status_code=b.status, headers=headers)
+
+        assert isinstance(outcome, RouteServed)
+        headers = _response_headers(request_id, outcome.path, outcome.affinity, outcome.model.id)
+        payload = outcome.payload
+        if isinstance(payload, Stream):
+            session = StreamSession(p, outcome, payload, request_id=request_id, route=route,
+                                    started=started, input_estimate=estimate)
+            headers.update({"cache-control": "no-cache", "x-accel-buffering": "no"})
+            return ManagedStream(session, headers)
+
+        b = payload
+        prompt_tokens = output_tokens = None
+        ids: list[str] = []
+        try:
+            obj = json.loads(b.content)
+        except (ValueError, RecursionError):
+            obj = None
+        if isinstance(obj, dict):
+            prompt_tokens, output_tokens = usage_tokens(obj.get("usage"))
+            ids = tool_call_ids(obj, "message")
+        p.router.complete(outcome, prompt_tokens, ids or None)  # before the response is returned
+        first_byte = time.monotonic() - started
+        p.record(request_id=request_id, route=route, status=b.status, reason="served", stream=stream,
+                 started=started, served_model=outcome.model.id, path=outcome.path,
+                 affinity=outcome.affinity, input_estimate=estimate, prompt_tokens=prompt_tokens,
+                 output_tokens=output_tokens, first_byte_s=first_byte)
+        headers["content-type"] = b.content_type
+        return Response(b.content, status_code=b.status, headers=headers)
+
+    return app

@@ -4,7 +4,9 @@ A local, OpenAI-compatible router that sends each request to the best Gemini API
 that still has free-tier quota. It switches models automatically when one hits its rate
 limit, and stays within Google's published limits for your own single project and key.
 
-**Status: in development. The core routing logic exists; there is no HTTP server yet.**
+**Status: in development.** The routing logic and the HTTP server exist (`python -m quota_router`,
+with `config.yaml` copied from `config.example.yaml` and secrets in `.env`). Docker packaging and
+setup docs come next.
 
 - [Design](docs/DESIGN.md)
 - [Implementation plan](docs/PLAN.md)

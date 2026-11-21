@@ -29,6 +29,7 @@ CHARS_PER_TOKEN = 4.0
 ESTIMATE_SAFETY = 1.2
 NON_TEXT_PART_TOKENS = 1500  # images and other non-text parts; their bytes say little about tokens
 STATE_ERROR_RETRY_S = 30.0  # Retry-After hint when the quota state can't be read or written
+MIN_ATTEMPT_S = 5.0  # a later attempt with less time left than this isn't started (DESIGN §5.2)
 
 _FAILED = object()  # sentinel: a state read failed
 
@@ -181,7 +182,8 @@ def active_turn_tool_call_ids(messages: Any) -> list[str]:
 
 
 def fits(model: ModelConfig, input_tokens: int, output_tokens: int | None) -> bool:
-    if input_tokens > min(model.input_limit, model.tpm_input):
+    limit = model.input_limit if model.tpm_input is None else min(model.input_limit, model.tpm_input)
+    if input_tokens > limit:
         return False
     return output_tokens is None or output_tokens <= model.output_limit
 
@@ -198,6 +200,9 @@ class Router:
         # QuotaStore.try_reserve never awaits, so this also holds if the lock were removed;
         # it is kept so that a future awaiting store can't over-commit.
         self._lock = asyncio.Lock()
+        # For /metrics (DESIGN §17.2, §20.6): SQLite errors and tool-call IDs seen twice.
+        self.state_errors = 0
+        self.tool_call_ids_reused = 0
 
     def resolve(self, name: Any) -> list[ModelConfig] | None:
         if not isinstance(name, str):
@@ -215,6 +220,7 @@ class Router:
         try:
             known = self._affinity.lookup(ids)
         except sqlite3.Error:
+            self.state_errors += 1
             log.exception("affinity lookup failed; routing the tool turn normally")
             return candidates, "unknown"
         owners = [known[i] for i in ids if i in known]
@@ -257,12 +263,17 @@ class Router:
                 c.reason = "too_large"
                 continue
             async with self._lock:
-                limits_left = attempts < self._config.max_attempts and self._clock.now() < deadline
+                left = deadline - self._clock.now()
+                # The first attempt runs while any time is left; a later one needs MIN_ATTEMPT_S,
+                # since a call that is sure to time out would only cost quota and a cooldown.
+                limits_left = attempts < self._config.max_attempts and \
+                    (left > 0 if attempts == 0 else left >= MIN_ATTEMPT_S)
                 try:
                     res = self._store.try_reserve(model, input_tokens) if limits_left \
                         else self._store.check(model, input_tokens)
                 except sqlite3.Error:
                     # Never call upstream without a reservation; this candidate is skipped.
+                    self.state_errors += 1
                     log.exception("quota state error for %s; skipping it", model.id)
                     c.reason, c.detail = "unavailable", "quota state error"
                     c.ready_at = self._clock.now() + STATE_ERROR_RETRY_S
@@ -276,7 +287,12 @@ class Router:
 
             attempts += 1
             path.append(model.id)
-            timeout = min(ATTEMPT_TIMEOUT_CAP_S, deadline - self._clock.now())
+            full_timeout = min(ATTEMPT_TIMEOUT_CAP_S, self._config.request_deadline_s)
+            timeout = min(full_timeout, deadline - self._clock.now())
+            # Clearly cut short by the request deadline (only possible after an earlier attempt
+            # used time): at least MIN_ATTEMPT_S less than usual.
+            shortened = attempts > 1 and timeout <= full_timeout - MIN_ATTEMPT_S
+            attempt_started = self._clock.now()
             try:
                 result = await asyncio.wait_for(upstream(model, timeout), timeout + 1.0)
             except TimeoutError:
@@ -295,7 +311,14 @@ class Router:
                 self._safely(self._store.refund_rpd, res)  # Google's 429 is the source of truth
             elif isinstance(result, Unavailable):
                 c.reason, c.detail = "unavailable", result.detail
-                self._safely(self._store.on_unavailable, model)
+                # ...and the timeout is that budget running out, not an early network timeout.
+                ran_out = self._clock.now() - attempt_started >= timeout - 1.0
+                if shortened and ran_out and result.detail == "timeout":
+                    # Not evidence the model is unhealthy: it got less than its usual time.
+                    # No cooldown; the RPD reservation is kept (the call may have used quota).
+                    c.detail = "timeout (cut short by the request deadline)"
+                else:
+                    self._safely(self._store.on_unavailable, model)
             elif isinstance(result, ModelNotFound):
                 log.error("model %s not found upstream; disabled until restart", model.id)
                 self._store.disable(model)
@@ -316,13 +339,13 @@ class Router:
 
         return self._final(name, results, path, affinity)
 
-    @staticmethod
-    def _safely(fn, *args, failed: Any = None, **kwargs):
+    def _safely(self, fn, *args, failed: Any = None, **kwargs):
         """Run a state update after an upstream call; a SQLite error is logged, not raised,
         so the request can still fall back. Returns `failed` on error."""
         try:
             return fn(*args, **kwargs)
         except sqlite3.Error:
+            self.state_errors += 1
             log.exception("quota state update failed (%s)", getattr(fn, "__name__", fn))
             return failed
 
@@ -354,10 +377,19 @@ class Router:
 
     def complete(self, served: RouteServed, prompt_tokens: int | None,
                  tool_call_ids: list[str] | None = None) -> None:
-        """After the response finished: settle usage and record tool-call affinity."""
+        """After the response finished: settle usage and record tool-call affinity.
+
+        Safe to call more than once for one response: usage settles only the first time,
+        so a later call can record tool-call IDs that arrived after the usage chunk."""
         self._store.settle(served.reservation, prompt_tokens)
         if tool_call_ids:
             try:
-                self._affinity.record(tool_call_ids, served.model.id)
-            except Exception:  # the response is already sent; losing affinity means "unknown" later
+                reused = self._affinity.record(tool_call_ids, served.model.id)
+            except Exception:  # losing affinity only means "unknown" on the next request
+                self.state_errors += 1
                 log.exception("could not record tool-call affinity for %s", served.model.id)
+                return
+            if reused:
+                self.tool_call_ids_reused += reused
+                log.warning("%d tool-call ID(s) from %s were already recorded; affinity assumes "
+                            "IDs never repeat (DESIGN §20.6)", reused, served.model.id)

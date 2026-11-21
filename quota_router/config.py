@@ -6,10 +6,18 @@ Any problem is a startup error (ConfigError). Secrets never live here.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
+from urllib.parse import urlsplit
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, PositiveInt, ValidationError, model_validator
+
+GOOGLE_UPSTREAM_HOST = "generativelanguage.googleapis.com"
+_LOOPBACK = {"localhost", "127.0.0.1", "::1"}
+
+PAID_MESSAGE = ("billing: paid is not supported. The proxy only runs on a Gemini API project "
+                "without billing, because on a billed project every call it routes is charged "
+                "(DESIGN §19.1). Use a key from a project that shows 'Free tier' in AI Studio.")
 
 
 class ConfigError(ValueError):
@@ -23,18 +31,24 @@ class _Strict(BaseModel):
 class ModelConfig(_Strict):
     key: str = ""  # filled from the mapping key in Config
     id: str = Field(min_length=1)
-    rpm: PositiveInt
-    tpm_input: PositiveInt
-    rpd: PositiveInt
+    # Rate limits must be present; an empty value (YAML null) means "no limit" (DESIGN §12, §20.2).
+    rpm: PositiveInt | None
+    tpm_input: PositiveInt | None
+    rpd: PositiveInt | None
     input_limit: PositiveInt
     output_limit: PositiveInt
 
 
 class Config(_Strict):
     upstream_base_url: str = "https://generativelanguage.googleapis.com/v1beta/openai/"
+    # The API key goes to upstream_base_url. Anything other than Google over HTTPS needs this
+    # explicit opt-in, so a typo can't send the key elsewhere (DESIGN §12).
+    custom_upstream: bool = False
     request_deadline_s: float = Field(default=180, gt=0)
     max_attempts: PositiveInt = 3
     db_path: str = "data/quota.sqlite3"
+    billing: Literal["free", "paid"] = "free"
+    max_body_bytes: PositiveInt = 20 * 1024 * 1024
     models: dict[str, ModelConfig]
     routes: dict[str, list[str]]
     handoffs: list[Any] = Field(default_factory=list)
@@ -55,6 +69,9 @@ class Config(_Strict):
 
     @model_validator(mode="after")
     def _check(self) -> "Config":
+        if self.billing == "paid":
+            raise ValueError(PAID_MESSAGE)
+        self._check_upstream()
         if not self.models:
             raise ValueError("no models configured")
         if not self.routes:
@@ -78,6 +95,27 @@ class Config(_Strict):
             if len(set(members)) != len(members):
                 raise ValueError(f"route {route!r} lists a model twice")
         return self
+
+    def _check_upstream(self) -> None:
+        url = self.upstream_base_url
+        if url != url.strip() or any(ord(ch) < 0x21 or ch == "\x7f" for ch in url):
+            # urlsplit drops tabs and newlines that httpx rejects: catch them at startup.
+            raise ValueError("upstream_base_url must not contain spaces or control characters")
+        try:
+            u = urlsplit(self.upstream_base_url)
+            host, port = u.hostname, u.port
+        except ValueError as e:
+            raise ValueError(f"upstream_base_url is not a valid URL: {e}") from None
+        if u.scheme not in ("https", "http") or not host or u.username or u.password or u.query or u.fragment:
+            raise ValueError("upstream_base_url must be an http(s) URL with a host and no "
+                             "credentials, query or fragment")
+        if not self.custom_upstream:
+            if u.scheme != "https" or host != GOOGLE_UPSTREAM_HOST or port not in (None, 443):
+                raise ValueError(f"upstream_base_url must be https://{GOOGLE_UPSTREAM_HOST}/...; the "
+                                 "API key is sent there. Set custom_upstream: true only for an "
+                                 "endpoint you trust with the key")
+        elif u.scheme != "https" and host not in _LOOPBACK:
+            raise ValueError("a custom upstream must use https (plain http only to localhost)")
 
     def model_by_id(self, model_id: str) -> ModelConfig | None:
         for m in self.models.values():

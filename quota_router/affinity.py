@@ -24,19 +24,29 @@ class AffinityStore:
     def prune(self) -> None:
         self._conn.execute("DELETE FROM affinity WHERE created_at <= ?", (self._clock.now() - self._ttl,))
 
-    def record(self, tool_call_ids: Iterable[str], model_id: str) -> None:
+    def record(self, tool_call_ids: Iterable[str], model_id: str) -> int:
+        """Store each ID → model. Returns how many IDs already had a live record: affinity
+        assumes IDs never repeat across responses, so a non-zero count is worth a warning."""
         ids = [i for i in dict.fromkeys(tool_call_ids) if isinstance(i, str) and i]
         if not ids:
-            return
+            return 0
         now = self._clock.now()
         with self._conn:  # one transaction: all of a response's calls or none
             self._conn.execute("BEGIN")
+            reused = 0
+            for start in range(0, len(ids), 500):
+                chunk = ids[start:start + 500]
+                marks = ",".join("?" * len(chunk))
+                reused += self._conn.execute(
+                    f"SELECT COUNT(*) FROM affinity WHERE tool_call_id IN ({marks}) AND created_at > ?",
+                    (*chunk, now - self._ttl)).fetchone()[0]
             self._conn.executemany(
                 "INSERT INTO affinity (tool_call_id, model_id, created_at) VALUES (?, ?, ?) "
                 "ON CONFLICT (tool_call_id) DO UPDATE SET model_id = excluded.model_id, "
                 "created_at = excluded.created_at",
                 [(i, model_id, now) for i in ids])
             self._conn.execute("DELETE FROM affinity WHERE created_at <= ?", (now - self._ttl,))
+        return reused
 
     def lookup(self, tool_call_ids: Iterable[str]) -> dict[str, str]:
         """Map each known, unexpired ID to its model ID. Unknown IDs are left out."""

@@ -121,3 +121,15 @@ Hand-written; `scripts/probe.py` keeps this section when it regenerates the repo
   HTTP 400 ("Function call is missing a thought_signature in functionCall parts"). Since
   Zoo Code's multi-step task got no 400, **Zoo Code 3.98.0 preserves `extra_content`**, and
   the proxy doesn't need to re-attach signatures (DESIGN §5.1 fallback not needed).
+
+### Tool-call ID format through the proxy (DESIGN §20.6), 2026-11-20 19:48 PT
+
+- One streamed tool-call request on `gemini-fast` through the Phase 2 proxy (1 RPD of
+  `gemini-3.5-flash-lite`). HTTP 200, `x-served-model: gemini-3.5-flash-lite`, two data events
+  then `[DONE]`, `finish_reason: "stop"` on the tool call.
+- Tool-call ID: `call_` followed by 19 decimal digits (24 characters), the size of a 64-bit
+  integer. One sample can't show whether the digits are random or sequential; a repeat would
+  show up in `qr_tool_call_id_reused_total` and as a warning in the log.
+- The thought signature arrived in `delta.tool_calls[].extra_content` (233 characters as JSON).
+- `usage` arrived in the stream (prompt 53, completion 16, total 69) and replaced the
+  proxy's estimate of 76 input tokens; the affinity record was written before `[DONE]`.
