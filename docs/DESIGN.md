@@ -39,6 +39,8 @@ model that still has quota. Every request stays within Google's published limits
 - Raising limits. We never rotate several API keys, projects or accounts, and never
   retry to get past a limit. See [COMPLIANCE.md](COMPLIANCE.md).
 - Hosting the proxy for other people. Each user runs their own instance with their own key.
+- Spending money. The proxy only uses the free quota the user's project already has, and
+  never runs against a billed project (§19.1).
 - Translating between API formats. Google's OpenAI-compatible endpoint does that.
 - Live API, TTS, embeddings, image, video or music models.
 
@@ -77,7 +79,8 @@ Excluded:
 - Live API models. They use a separate real-time protocol, and using them for text
   would not be "the means described in the documentation".
 
-Quotas change. The registry lives in `config.yaml`, not in code.
+Quotas change. The registry lives in `config.yaml`, not in code. Another account, or this
+one after an upgrade, can have different models and limits; §19 covers what changes.
 
 ## 3. Architecture
 
@@ -107,6 +110,7 @@ The client picks a virtual model. Order is set in config; the defaults are:
 | `gemini-smart` | 4 Hydrogen → 3.8 Flash → 3.6 Flash → 3 Flash → 2.5 Flash → 3.5 Flash Lite → 3.1 Flash Lite → 2.5 Flash Lite | planning, debugging (Zoo Code Architect/Debug) |
 | `gemini-fast` | 3.5 Flash Lite → 3.1 Flash Lite → 2.5 Flash Lite → 2.5 Flash → 3 Flash | edits, tool loops (Zoo Code Code/Ask); never uses the top three smart models |
 
+The models named here are from the account in §2; other accounts route their own models.
 v1 ships only `gemini-fast`, with just its first candidate (§0). The full lists above
 are the target once v1 works. A `gemma-small` route for short prompts (Gemma 4 31B → 26B → `gemini-fast`)
 will be added after v1 if Phase 0 shows Gemma works well enough; it needs routes that can fall back into other routes.
@@ -425,6 +429,10 @@ The `input_limit`/`output_limit` values are the ones `models.list` reported in P
 
 Secrets go in `.env` (`GEMINI_API_KEY`, `PROXY_TOKEN`), never in `config.yaml`.
 
+A rate limit left empty (`rpm:`, `tpm_input:` or `rpd:` with no value) means the dashboard
+shows no limit for it; the proxy then skips that check. Token limits (`input_limit`,
+`output_limit`) are always required.
+
 ## 13. Alternatives considered
 
 | Option | Why not chosen |
@@ -519,7 +527,7 @@ requests, every model's quota can then be used without the user switching profil
 
 ### 16.2 Tiers and candidate order
 
-Config groups models into tiers, best first within each tier:
+Config groups models into tiers, best first within each tier (models from the §2 account, as an example):
 
 | Tier | Models (from §2) | Notes |
 |---|---|---|
@@ -712,3 +720,31 @@ few hundred series. Free-tier figures are a snapshot from 2026-11-21 and change 
 
 Prices come from secondary sources dated 2026 and changed several times that year; check
 them before choosing.
+
+## 19. Other accounts and billing — proposed, pending approval
+
+The model list and limits in §2 belong to one free-tier account. Another account type, or
+an upgrade of this one, changes them. Changing models and limits is a config edit and a
+restart: saved state is keyed by model ID, so RPD counts and tool affinity carry over, and
+the daily reset is still PT midnight. The 429 classifier matches "per day", "per minute"
+and "tokens" in quota IDs rather than the `-FreeTier` suffix, so paid-tier bodies should
+classify the same way (unverified until a real 429 is captured).
+
+### 19.1 Billing guard: never spend money
+
+The proxy exists to use the free quota a project already has. It must never cause spending,
+least of all without the user noticing: on a billed project, a fallback to a pricier model
+or a pace-upgrade to smart (§16.3) would do exactly that.
+
+- `billing` in `config.yaml`, default `free`. `billing: paid` is a startup error, with a
+  message saying the proxy only supports free-tier projects. This is permanent, not a v1 stopgap.
+- The proxy can't detect billing itself; it relies on this setting. The README says plainly:
+  use a key from a project without billing enabled.
+- To verify, and to state in the README: whether enabling billing moves the whole project off
+  free-tier limits, so that every call is charged.
+
+### 19.2 Setting up a new account
+
+`models.list` returns model IDs and token limits but no rate limits (Phase 0). A helper,
+`scripts/init_config.py`, lists the account's models with their token limits and writes a
+`config.yaml` skeleton; the user fills in RPM, input-TPM and RPD from AI Studio.

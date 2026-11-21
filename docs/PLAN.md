@@ -106,6 +106,8 @@ are done, and their decisions are in DESIGN §5.2.
 - Removing keys from logs and errors.
 - Observability (DESIGN §17): the JSON log line, `/metrics` with bounded labels, and the
   richer `/status`.
+- Config (DESIGN §12, §19.1): an empty `rpm`, `tpm_input` or `rpd` means no limit, and the
+  quota store skips that check; `billing` defaults to `free`, and `paid` is a startup error.
 - Contract with the Phase 1 router (from the Phase 1 review):
   - The `Upstream` callable maps every exception (httpx errors included) to an
     `UpstreamResult`; only cancellation propagates.
@@ -130,6 +132,8 @@ Tests (`respx` mocking upstream):
 - `/dashboard` with its cookie login (DESIGN §17.2), and an optional `monitoring` compose
   profile (Prometheus and Grafana with a provisioned dashboard), off by default.
 - README: reaching the proxy from other devices over Tailscale (DESIGN §18).
+- `scripts/init_config.py` (DESIGN §19.2), and README text saying the model list and limits
+  are per account, and that the key must come from a project without billing enabled.
 
 ## Phase 4: Review and live check
 
@@ -149,7 +153,7 @@ then tiers with spill and pacing, then rules (after a probe of the signals Zoo C
 then automatic adaptations, then a suggestion report. Each step gets its own plan entry,
 approved before code.
 
-Also after v1: alerts (DESIGN §17.2 layer 6), and a remote-hosting design (DESIGN §18)
+Also after v1: alerts (DESIGN §17.2 layer 6), a remote-hosting design (DESIGN §18)
 if the proxy is to run somewhere other than the user's machine.
 
 ## Validation commands
