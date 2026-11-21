@@ -603,9 +603,25 @@ preferred tier), `paced` (preferred model was ahead of pace), `pace-upgrade`, `p
 
 ### 16.5 Getting smarter over time
 
-Every turn start records one row in SQLite (kept 30 days): time, preferred tier and reason,
-serving model, input and output tokens, number of tools, status, latency, time to first byte,
-and later the number of steps in the turn and whether it ended with a tool error. No text.
+**Minimum-data rule.** Each learning feature keeps only what it needs, for only as long as
+it needs it. Nothing below holds prompt or completion text, tool names, tool-call IDs,
+system-prompt text or hashes, or exact timestamps (date and hour are enough).
+
+| Feature | Data kept | Where | Kept for | Used once |
+|---|---|---|---|---|
+| Demand curve | count of turn starts per (PT date, hour) | SQLite, 24 rows a day | 14 days | 7 days have data; days with no turns are left out of the average |
+| Reliability | per model, time and ok/fail of each attempt | memory only (lost on restart, which is fine) | 15 minutes | at least 4 attempts |
+| Token estimate | per model, the last 50 ratios of reported `prompt_tokens` to the estimate | SQLite, one row per model | rolling | 20 samples; until then the fixed 1.2 |
+| Suggestion report | one row per turn (below) | SQLite decision log | 30 days | a group has enough turns (below) |
+
+Decision log row: PT date and hour, the rule that matched (or `default`), preferred tier,
+serving tier and model, `x-route-reason`, number of tools, input and output tokens, number
+of steps in the turn, final status. About 200–600 rows a day at 1,000–3,000 requests, so
+1–2 MB over 30 days.
+
+Steps are counted without reading content: the affinity record (§5.1) also stores a random
+`turn_id` made by the proxy, so a follow-up request's tool-call IDs name its turn. This is a
+schema change after v1, applied as a migration keyed on SQLite's `PRAGMA user_version`.
 
 Adapted automatically, because the signal is direct and can't lower answer quality:
 
@@ -613,15 +629,23 @@ Adapted automatically, because the signal is direct and can't lower answer quali
   replace `working_hours` once 7 days of data exist.
 - **Reliability.** A model with a high recent 5xx or timeout rate (for example over half of
   at least 4 attempts in 15 minutes) moves later in the candidate list for a while.
-- **Token estimate.** The ratio of reported `prompt_tokens` to the estimate, per model,
-  sets that model's safety margin, kept between 1.05 and 2.0.
+- **Token estimate.** The 90th percentile of the ratio (not the mean, so the estimate errs
+  high and avoids TPM 429s) sets that model's safety margin, kept between 1.05 and 2.0.
 
-Not adapted automatically: which tier suits which kind of turn. The signals (steps per
-turn, tool errors, re-asked turns) are noisy and biased, because hard turns go to smart
-models. Instead a script (`scripts/route_report.py`) reads the log and suggests rule changes,
-for example "turns matching X on the fast tier needed 2.3× more steps". The user decides
-and edits `config.yaml`. Bounded automatic tuning is reconsidered only if the reports show
-stable patterns over weeks.
+Not adapted automatically: which tier suits which kind of turn. Steps per turn is noisy and
+biased, because hard turns go to smart models. Instead a script (`scripts/route_report.py`)
+reads the log and suggests rule changes, for example "turns matching X on the fast tier
+needed 2.3× more steps". The user decides and edits `config.yaml`. Bounded automatic tuning
+is reconsidered only if the reports show stable patterns over weeks.
+
+- The report shows a group (rule × tier) only once it has enough turns: about 15–20 to see a
+  2× difference in steps, about 60 for 1.5× (assuming the spread is about the mean). The
+  smart tier's ~20 turns a day fill a group in 1–4 days. More data doesn't remove the bias.
+- Signals dropped because they need content: whether a turn ended with a tool error (reads
+  the tool result) and whether a turn was re-asked (compares user messages).
+- The report reads SQLite with the standard library (`sqlite3`, `statistics`). At 6K–18K
+  rows its queries take milliseconds, so no analytics database (DuckDB or similar) is needed.
+  For ad hoc exploration, DuckDB's CLI can open the file read-only without being a dependency.
 
 ### 16.6 Order of work (after v1)
 
@@ -748,3 +772,166 @@ or a pace-upgrade to smart (§16.3) would do exactly that.
 `models.list` returns model IDs and token limits but no rate limits (Phase 0). A helper,
 `scripts/init_config.py`, lists the account's models with their token limits and writes a
 `config.yaml` skeleton; the user fills in RPM, input-TPM and RPD from AI Studio.
+
+## 20. HTTP layer details (Phase 2) — approved 2026-11-21
+
+The sections above fix what the HTTP layer does; these are the details of how. Items
+marked **(decide)** were open; each was approved as recommended on 2026-11-21.
+
+### 20.1 Startup
+
+- Settings from the environment (or `.env`): `GEMINI_API_KEY`, `PROXY_TOKEN`, `PROXY_HOST`
+  (default `127.0.0.1`), `PROXY_PORT` (default `4000`), `QR_CONFIG` (default `config.yaml`),
+  `PROXY_ALLOWED_HOSTS` (default empty, §20.3).
+- Startup errors: missing key; missing token, a token under 16 characters, or a known
+  placeholder (`changeme`, `your-token-here` and the like); invalid config (§12, §19.1).
+- **(decide)** `config.yaml` holds per-account limits, so git ignores it and the repo ships
+  `config.example.yaml` with the §12 content. Recommended: yes.
+- New config fields: `billing` (`free`, default; `paid` is a startup error) and
+  `max_body_bytes` (default 20 MB, §9).
+
+### 20.2 Empty rate limits
+
+`rpm`, `tpm_input` and `rpd` must be present but may be empty (YAML null): that limit is not
+checked. A missing key is still a startup error, so a typo can't silently remove a limit.
+`/status` and `/metrics` show an empty limit as `null` / no `qr_*_limit` sample.
+
+The midnight grace of §5.2 needs both numbers. **(decide)** Recommended: grace applies when
+`rpd` is empty (no known daily limit to protect), or when `rpm × 10 < rpd`; an empty `rpm`
+with a set `rpd` gets no grace (it could use its whole day in 10 minutes).
+
+### 20.3 Requests
+
+- All handlers are `async def`, so the SQLite connection is only used from the event-loop
+  thread (§7, `db.py`).
+- Browser guard, before auth, on every path (`/healthz` included). A web page in the user's
+  browser can send requests to `localhost`, directly or through DNS rebinding; the bearer
+  token stops that today, but the Phase 3 dashboard cookie would not.
+  - `Host` must be `localhost`, `127.0.0.1` or `[::1]` (any port), or a name listed in
+    `PROXY_ALLOWED_HOSTS` (comma-separated, empty by default; for a Tailscale name later, §18).
+  - If an `Origin` header is present, its host must pass the same check. Requests without
+    `Origin` (CLI tools, VS Code extensions, scripts) are unaffected; Phase 4 confirms Zoo
+    Code sends none.
+  - Otherwise 403 `forbidden_host` in OpenAI error format, counted in `qr_requests_total`.
+  - No CORS headers are ever sent, so a cross-origin page can't read a response or send a
+    preflighted `Authorization` header.
+- Auth: `Authorization: Bearer <PROXY_TOKEN>`, compared with `hmac.compare_digest`, on
+  every path except `/healthz`. 401 in OpenAI error format; counted in `qr_auth_failures_total`.
+- Body over `max_body_bytes` → 413; not a JSON object → 400 `invalid_request_error`.
+- The upstream request is the client's body with only two changes: `model` becomes the
+  real ID, and streams get `stream_options.include_usage: true` (§7). None of the client's
+  headers are forwarded; the proxy sends its own `Authorization: Bearer <GEMINI_API_KEY>`.
+- One shared `httpx.AsyncClient`: connect timeout 10 s; the router's per-attempt timeout
+  for the first byte (§9); after that, 120 s between stream chunks.
+
+### 20.4 Mapping upstream results (the router's `Upstream` contract)
+
+| Upstream | Result |
+|---|---|
+| 2xx, non-stream | `Served` with status, body and content type |
+| 2xx, stream, first SSE event is data | `Served`; the open stream and that first event go to the HTTP layer |
+| 2xx, stream, first SSE event is an `error` | **(decide)** recommended: treated by its code (429 → `RateLimited`, 5xx → `Unavailable`), since nothing has reached the client yet |
+| 429 | `RateLimited` with body and headers |
+| 500, 502, 503, 504; connect error; timeout before the first byte; any other exception | `Unavailable` |
+| 404 whose error status is `NOT_FOUND` and message mentions the model | `ModelNotFound` |
+| any other status | `Rejected` (returned unchanged, keys scrubbed) |
+
+Only `asyncio.CancelledError` propagates. Any response or stream not handed to the HTTP
+layer is closed before the callable returns.
+
+### 20.5 Responses
+
+- Served or passed through: upstream status and body, `content-type`, plus `x-served-model`,
+  `x-fallback-path` (comma-separated model IDs, in order), `x-turn-affinity` when set, and
+  `x-request-id`. No other upstream headers are forwarded.
+- Router failure: the router's status and OpenAI error body, `Retry-After` when it has one,
+  and `x-fallback-path`.
+- Non-stream: `Router.complete()` (usage, then tool-call IDs from
+  `choices[].message.tool_calls[].id`) runs before the response is returned.
+- Stream: chunks are forwarded as they arrive, each parsed for tool-call IDs and `usage`.
+  `complete()` runs before forwarding the chunk that carries `usage` (Phase 0: the last
+  content chunk), or else before `[DONE]`. If the stream ends any other way (upstream error,
+  client disconnect), `complete()` still runs once, with the estimate kept.
+- **(decide)** Mid-stream upstream failure: send one `data: {"error": {...}}` event (OpenAI
+  format, scrubbed) and close without `[DONE]`, so clients don't take a cut-off answer as
+  complete. Recommended: yes.
+- The open upstream stream is closed in every case, including when the client disconnects
+  before the first chunk is sent.
+
+### 20.6 Tool-call IDs
+
+The format of Google's tool-call IDs hasn't been recorded (Phase 0 kept only names and
+arguments). Affinity assumes an ID never repeats across responses.
+- When `complete()` records an ID already held by another live record, the proxy logs a
+  warning and counts it (`qr_tool_call_id_reused_total`), so a repeating format shows up.
+- **(decide)** Record the format with one live tool-call request (from the 500 RPD of
+  3.5 Flash Lite) once the server works, or wait for the Phase 4 live check. Recommended:
+  one request at the end of Phase 2, with your go-ahead.
+
+### 20.7 Logs, captures and scrubbing
+
+- All log output is JSON lines on stdout. The per-request line (`"event": "request"`) holds
+  the fields of §17.2 layer 2 plus `request_id` and `stream`; the route field is a
+  configured route or model ID, or `"unknown"`.
+- A scrubbing filter runs on every formatted log line and on every error body sent to a
+  client: the exact `GEMINI_API_KEY` and `PROXY_TOKEN` values, and anything shaped like a
+  Google key (`AIza…`), become `<redacted>`.
+- **(decide)** 429 bodies (scrubbed, with `retry-after` and status) are saved to
+  `data/429/<time>-<model>.json`, at most 50 files, so the classifier can be checked against
+  real ones (§6, PLAN Phase 0). Recommended: yes.
+
+### 20.8 `/status` and `/metrics`
+
+- `/status` (bearer token): per model, the quota snapshot (§17.2 layer 3) and its state;
+  the next PT reset; counts by status and reason since the PT day began; the last 20 errors
+  (time, route, status, reason, no text). Counts and errors are in memory and start again on
+  restart; `/status` says since when.
+- `/metrics` (bearer token): the §17.2 table, plus `qr_tool_call_id_reused_total`.
+  **(decide)** Written by hand (about 100 lines, no dependency) rather than with
+  `prometheus_client`. Recommended: by hand, to keep the dependency list short.
+- Label values come only from config and these fixed lists: status (`200`, `400`, `401`,
+  `403`, `404`, `413`, `429`, `503`, `other`), reason (`served`, `passthrough`, `quota`,
+  `unavailable`, `context_length_exceeded`, `no_enabled_model`, `model_not_found`,
+  `bad_request`, `unauthorized`, `forbidden_host`, `stream_error`, `client_disconnected`),
+  attempt outcome
+  (§17.2), model state, token kind.
+- `qr_first_byte_seconds` buckets: 0.5, 1, 2, 5, 10, 20, 30, 60, 120, 180 s.
+
+### 20.9 New dependencies
+
+Runtime: `fastapi`, `uvicorn`, `httpx` (exact versions pinned; hashes come in Phase 3).
+Tests: `respx`. Router changes stay small: a state-error counter for
+`qr_state_errors_total`, and the ID-reuse check in `complete()`.
+
+### 20.10 Housekeeping
+
+SQLite stays the store (one process, one user, a few MB at most; see §7). What keeps the
+proxy's state and logs bounded over weeks of running:
+
+- **Logs.** The proxy writes only to stdout and never to log files of its own; rotation is
+  left to whatever runs it. uvicorn's access log is off (the per-request line replaces it).
+  Phase 3's compose file rotates Docker's log at `max-size: 10m`, `max-file: 3`, about a
+  month at 1 MB a day; Docker's default driver never rotates.
+- **Pruning.** Today rows are pruned only at startup. Phase 2 adds a background task on the
+  event loop (so SQLite stays on that thread) that runs at startup and then hourly: RPD rows
+  older than 7 days, expired exhausted rows, affinity older than 24 hours. Later tables
+  (§16.5) add their own retention to the same task. A failed pass is logged and counted in
+  `qr_state_errors_total`, and the next pass tries again.
+- **Shutdown.** The connection is closed on shutdown, which folds the WAL file back into the
+  database.
+- **Schema version.** `PRAGMA user_version` is set to 1. At startup: 0 with the Phase 1
+  tables present means version 1 and is updated; a version newer than the code knows is a
+  startup error; migrations to later versions run in one transaction at startup.
+- **Damaged database.** At startup the proxy runs `PRAGMA quick_check` (milliseconds at this
+  size). If it fails, or the file isn't a database, the proxy refuses to start and the message
+  names the file and says deleting it is safe: only today's local counts (a hint, §7; Google's
+  429s still enforce the limit) and open tool-turn records are lost. It doesn't rename or
+  replace the file on its own.
+- **429 captures** (§20.7): at most 50 files of at most 64 KB each; once full, saving stops
+  and a warning is logged once per run.
+- **Where `data/` lives** (Phase 3): a Docker volume or the Linux filesystem, never under
+  `/mnt/c` in WSL, where SQLite's WAL locking isn't reliable.
+- **Not needed:** backups (the state is disposable), `VACUUM` (the file stays small and SQLite
+  reuses free pages), in-app log rotation.
+- **Optional, Phase 3:** GitHub Dependabot alerts on the pinned requirements (free for public
+  repos), so dependency updates are visible.

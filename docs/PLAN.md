@@ -121,12 +121,20 @@ Tests (`respx` mocking upstream):
 - every model out → 429 with the correct `Retry-After`
 - streaming: 429 before the first byte falls back; an error mid-stream sends an SSE error and no fallback
 - missing or wrong token → 401; the key never appears in any response or log line
+- foreign `Host` or `Origin` → 403 `forbidden_host` (also on `/healthz`); local hosts, any
+  port, and requests without `Origin` pass; no response carries CORS headers
+- housekeeping (DESIGN §20.10): the prune pass removes expired RPD, exhausted and affinity
+  rows and survives a SQLite error; a version-0 database with the Phase 1 tables becomes
+  version 1; a newer version, a damaged file or a non-database file is a startup error
+  naming the file; 429 captures stop at 50 files
 - log lines and metrics hold no prompt or completion text, tokens or tool-call IDs; every
   metric label value comes from config or a fixed list
 
 ## Phase 3: Packaging and docs
 
-- `Dockerfile` (non-root, pinned base image digest), `docker-compose.yml` bound to `127.0.0.1`.
+- `Dockerfile` (non-root, pinned base image digest), `docker-compose.yml` bound to `127.0.0.1`,
+  with log rotation (`max-size: 10m`, `max-file: 3`) and `data/` on a named volume (DESIGN §20.10).
+- Optional: Dependabot alerts on the pinned requirements.
 - `requirements.txt` with hashes. `.env.example`.
 - README: quick start, Zoo Code / Copilot / Cline setup (see DESIGN §15), `/status`, limits and disclaimers.
 - `/dashboard` with its cookie login (DESIGN §17.2), and an optional `monitoring` compose
