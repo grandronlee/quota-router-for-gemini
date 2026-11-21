@@ -18,7 +18,7 @@ direction, and is added only once v1 works and the probe supports it.
 - **One tested client**: Zoo Code.
 - **Tool turns are pinned** to the model that made the tool calls (§5.1). There is no handoff
   between models in v1.
-- Deferred until after v1: `gemini-smart`, Copilot Chat, Gemma.
+- Deferred until after v1: `gemini-smart`, `gemini-auto` (§16), Copilot Chat, Gemma.
 
 The configuration format stays general (any number of models and routes), so adding
 the deferred parts changes config, not code.
@@ -400,6 +400,8 @@ sequenceDiagram
 | `GET /v1/models` | lists the routes and the real model IDs that are enabled |
 | `GET /status` | for each model: RPM, TPM and RPD used/limit, cooldown and exhausted-until; next PT reset |
 | `GET /healthz` | liveness check |
+| `GET /metrics` | Prometheus metrics (§17), Phase 2 |
+| `GET /dashboard` | read-only status page with a cookie login (§17), Phase 3 |
 
 ## 12. Configuration (`config.yaml`)
 
@@ -495,3 +497,218 @@ Source: https://code.visualstudio.com/docs/agent-customization/language-models (
 Compatibility requirements this places on the proxy: `/v1/models` must list the routes
 (VS Code queries it when no `models` array is given), streaming must work, and tool-call
 fields must pass through unchanged.
+
+## 16. After v1: automatic routing (`gemini-auto`) — proposed, pending approval
+
+Goal: one route that decides for each turn which model serves it. With enough real
+requests, every model's quota can then be used without the user switching profiles.
+`gemini-fast` and `gemini-smart` stay available for clients that want to choose.
+
+### 16.1 Ground rules
+
+- **No request, no quota.** The proxy never sends a request of its own (no warm-up,
+  exploration or "use it up" calls). Quota nobody asks for is lost at the PT reset, which is fine.
+- **Pacing is a preference, never a refusal.** The final status rules of §5 step 5 are
+  unchanged: 429 only when every candidate is really out of quota.
+- **One decision per turn.** A turn starts with the first request after a user message.
+  Later steps of the turn are pinned as in §5.1, so the decision covers the whole turn.
+- **Visible.** Every response carries `x-route-tier` and `x-route-reason`; `/status`
+  shows pacing and anything the router has adapted.
+- **Metadata only.** Decisions and learning use sizes, counts, timings, the rule that
+  matched and the outcome, never prompt or completion text (§10).
+
+### 16.2 Tiers and candidate order
+
+Config groups models into tiers, best first within each tier:
+
+| Tier | Models (from §2) | Notes |
+|---|---|---|
+| `smart` | 4 Hydrogen, 3.8 Flash, 3.6 Flash, 3 Flash, 2.5 Flash | about 100 RPD in total |
+| `fast` | 3.5 Flash Lite, 3.1 Flash Lite, 2.5 Flash Lite | about 1,020 RPD in total |
+| `small` | Gemma 4 31B, 26B | only prompts within 16K input-TPM; after Gemma is probed |
+
+At the start of a turn the router picks a **preferred tier** (§16.4), then builds one
+candidate list across every tier, so the turn never has to fail while any model has quota:
+
+1. preferred tier's models, minus any that are ahead of pace (§16.3);
+2. the other tiers' models (smart turn: fast then small; fast turn: small for prompts that
+   fit, then smart);
+3. models that were ahead of pace, last.
+
+The existing loop (§5 step 4) walks this list unchanged: skips are free, at most
+`max_attempts` real calls, same deadline and same final status.
+
+### 16.3 Quota pacing (the pace line)
+
+The proxy doesn't run all day, and the user's working hours need not line up with the PT
+reset, so pacing follows demand rather than the clock. For each paced model (by default the
+`smart` tier):
+
+```
+pace(t) = rpd × demand_share(t)
+```
+
+- `demand_share(t)`: the share of a typical PT day's turn starts that happen before `t`, from
+  0 to 1. It starts from `working_hours` and `timezone` in config and is replaced by the
+  measured demand curve once 7 days of data exist (§16.5). Hours with no expected demand add
+  nothing, so the line reaches `rpd` at the end of the last working hour before the reset.
+- **Turns that prefer smart** (a rule matched) use the smart tier while its RPD used today is
+  below `pace(t) + burst`. Above that the model is **ahead of pace**: it moves to the end of
+  the candidate list (§16.2 step 3) and is never skipped (`x-route-reason: paced`).
+- **Turns that prefer fast** (the default) are upgraded to smart while its RPD used today is
+  below `pace(t) − burst × (1 − demand_share(t))` (`x-route-reason: pace-upgrade`). The margin
+  keeps the morning's smart quota for rule-matched turns and shrinks to zero at the end of
+  the working day, so nothing is held back once demand is over.
+
+Result: smart quota is spread over the hours actually worked and used up by the end of the
+working day, in any time zone. Rules decide which turns get smart first; the pace line
+decides how many do. `default_tier: fast` is only the tie-break.
+
+### 16.4 Choosing the preferred tier
+
+Ordered rules in config, first match wins, evaluated once per turn:
+
+```yaml
+routes:
+  gemini-auto:
+    tiers: { smart: [hydrogen, flash-3-8, flash-3-6, flash-3, flash-2-5],
+             fast: [lite-3-5, lite-3-1, lite-2-5], small: [gemma-31b, gemma-26b] }
+    rules:
+      - name: high-effort
+        when: { reasoning_effort: [high] }
+        tier: smart
+      - name: planning-mode
+        when: { system_matches: "<client mode text, to be confirmed>" }
+        tier: smart
+    default_tier: fast
+    pacing: { tiers: [smart], burst: 5, working_hours: "09:00-18:00", timezone: "<IANA zone>" }
+```
+
+Signals available without reading content for meaning: `reasoning_effort`, a regular
+expression on the system prompt (for client mode text), requested output size, number of
+tools, and whether this is the conversation's first user turn. Which mode text Zoo Code
+actually sends must be checked in a probe before any rule relies on it; client prompts
+change between versions.
+
+`x-route-reason` values: the matching rule's name, `default`, `spill` (served outside the
+preferred tier), `paced` (preferred model was ahead of pace), `pace-upgrade`, `pinned`.
+
+### 16.5 Getting smarter over time
+
+Every turn start records one row in SQLite (kept 30 days): time, preferred tier and reason,
+serving model, input and output tokens, number of tools, status, latency, time to first byte,
+and later the number of steps in the turn and whether it ended with a tool error. No text.
+
+Adapted automatically, because the signal is direct and can't lower answer quality:
+
+- **Demand curve.** Turn starts per hour of the PT day, smoothed over the last 14 days,
+  replace `working_hours` once 7 days of data exist.
+- **Reliability.** A model with a high recent 5xx or timeout rate (for example over half of
+  at least 4 attempts in 15 minutes) moves later in the candidate list for a while.
+- **Token estimate.** The ratio of reported `prompt_tokens` to the estimate, per model,
+  sets that model's safety margin, kept between 1.05 and 2.0.
+
+Not adapted automatically: which tier suits which kind of turn. The signals (steps per
+turn, tool errors, re-asked turns) are noisy and biased, because hard turns go to smart
+models. Instead a script (`scripts/route_report.py`) reads the log and suggests rule changes,
+for example "turns matching X on the fast tier needed 2.3× more steps". The user decides
+and edits `config.yaml`. Bounded automatic tuning is reconsidered only if the reports show
+stable patterns over weeks.
+
+### 16.6 Order of work (after v1)
+
+1. `gemini-smart` route and the decision log.
+2. `gemini-auto` with tiers, spill and pacing (default tier only, no rules).
+3. Rules, after a probe confirms which signals Zoo Code sends.
+4. Automatic adaptations (§16.5).
+5. Suggestion report.
+
+### 16.7 Settled in discussion (2026-11-21)
+
+- Default tier `fast`, with smart usage following the pace line (§16.3) instead of a fixed
+  window before the PT reset, because the proxy doesn't run all day.
+- `burst: 5` and the working hours are config values; the example uses 09:00–18:00 and each
+  user sets their own `timezone`.
+- Visibility and monitoring: §17. Hosting: §18.
+
+## 17. Observability — proposed, pending approval
+
+### 17.1 Principles
+
+- **Vendor-neutral.** The proxy exposes Prometheus text at `/metrics` and writes one JSON
+  line per request to stdout. Which tool collects them is deployment config, not code.
+- **Metadata only.** Telemetry carries route, model, status, reason, sizes and timings. Never
+  prompt or completion text, the API key, the proxy token, or tool-call IDs.
+- **Bounded labels.** Metric labels take values only from config and fixed lists (route,
+  model, status class, reason). Never request IDs, tool-call IDs or anything from the prompt:
+  each distinct value is a new series, which is how a free tier becomes a bill.
+- **Opt-in shipping.** Nothing is sent to an external service unless the user configures it.
+
+### 17.2 Layers
+
+1. **Response headers** (§5, §16.4): `x-served-model`, `x-fallback-path`, `x-turn-affinity`,
+   later `x-route-tier` and `x-route-reason`.
+2. **Log line** per request: time, route, served model, fallback path, status, reason, input
+   estimate, reported prompt and output tokens, latency, time to first byte, affinity.
+3. **`/status`** (JSON, bearer token): per model RPM, input-TPM and RPD used and limit,
+   cooldown and exhausted-until, disabled; next PT reset; today's counts by status and reason;
+   the last few errors (status and reason only). Later: the pace line per paced model.
+4. **`/dashboard`**: a read-only HTML page served by the proxy, drawing on `/status`: quota
+   bars, countdowns, pace line against actual use, decisions by reason, 5xx rate. A browser
+   can't easily send a bearer token, so a login form exchanges `PROXY_TOKEN` for an
+   `HttpOnly`, `SameSite=Strict` session cookie, valid only for `/dashboard` and `/status`.
+5. **`/metrics`** (Prometheus text, bearer token; if a host's scraper can't send one, a
+   separate port bound to an internal interface):
+
+   | Metric | Labels |
+   |---|---|
+   | `qr_requests_total` | route, status, reason |
+   | `qr_upstream_attempts_total` | model, outcome (`ok`, `429_rpm`, `429_tpm`, `429_rpd`, `429_unknown`, `5xx`, `timeout`, `404`, `4xx`) |
+   | `qr_rpd_used`, `qr_rpd_limit`, `qr_rpm_used`, `qr_tpm_input_used` | model |
+   | `qr_model_state` (1 for the current state) | model, state (`available`, `cooldown`, `exhausted`, `disabled`) |
+   | `qr_first_byte_seconds` (histogram) | route |
+   | `qr_tokens_total` | model, kind (`input`, `output`) |
+   | `qr_auth_failures_total`, `qr_state_errors_total` | none |
+
+6. **Alerts** (after v1): push notifications through ntfy or email, rate-limited, content-free.
+   Triggers: a tier fully exhausted, a burst of 5xx, an unknown 429 captured, repeated auth
+   failures, SQLite errors. Uptime and heartbeat checks only make sense on an always-on host;
+   locally they would fire every time the proxy is stopped on purpose.
+
+### 17.3 Where it is collected
+
+| Deployment | Metrics and dashboards | Uptime and alerts |
+|---|---|---|
+| Local Docker (v1) | `/dashboard`; optional compose profile `monitoring` with Prometheus and Grafana and a provisioned dashboard, off by default | ntfy for proxy alerts, optional |
+| Fly.io (§18) | Fly's managed Prometheus and Grafana scrape `/metrics` (about 15 days kept) | Better Stack free tier from outside; ntfy |
+| Any host, one place | Grafana Cloud free tier (10K series, 50 GB logs a month, 14 days) via its agent | Grafana alerting |
+
+Expected volume: about 1,000–3,000 requests a day, so under 100 MB of logs a month and a
+few hundred series. Free-tier figures are a snapshot from 2026-11-21 and change often.
+
+## 18. Hosting — proposed, pending approval
+
+- **v1: local Docker**, published on `127.0.0.1` only and not running all day. That is fine:
+  RPD counts, exhausted state and tool affinity are in SQLite, and the minute windows that
+  reset on restart are harmless (§7, §14).
+- **Other devices of the same user: Tailscale** (free Personal plan, unlimited devices). The
+  proxy stays off the public internet; it is reached over the tailnet, for example with
+  `tailscale serve` for HTTPS. Only while the host machine is on.
+- **Remote, if wanted later: Fly.io**, one shared-cpu-1x machine with 256 MB and a 1 GB volume
+  for SQLite, about US$2.35 a month as of 2026-11. Alternatives considered:
+
+  | Option | About, per month | Why not first choice |
+  |---|---|---|
+  | Google Cloud e2-micro (US regions) | US$3.65 (IPv4 address) | "Free" VM, but the IPv4 address and egress over 1 GB are billed |
+  | Oracle Always Free | US$0 | Limits cut in 2026; idle instances are reclaimed, and an idle proxy is one |
+  | Hetzner CX23 / CAX11 | €6 | EU only, often out of stock, more machine than needed |
+
+- **Before any remote deployment** (a design change to approve first):
+  - TLS, and a limit on failed authentication attempts; §10's `127.0.0.1` guarantee no longer holds.
+  - Exactly one instance (one worker, §7). No autoscaling to a second machine.
+  - The host region is one where the Gemini API is available.
+  - Secrets in the host's secret store, never in the image or `config.yaml`.
+  - Still one user and one key (COMPLIANCE.md); never shared with others.
+
+Prices come from secondary sources dated 2026 and changed several times that year; check
+them before choosing.

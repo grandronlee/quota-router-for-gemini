@@ -104,6 +104,8 @@ are done, and their decisions are in DESIGN §5.2.
 - FastAPI app: auth, `/v1/chat/completions` (streaming and non-streaming), `/v1/models`, `/status`, `/healthz`.
 - Fallback loop per DESIGN §5; streaming rules per §8; response headers.
 - Removing keys from logs and errors.
+- Observability (DESIGN §17): the JSON log line, `/metrics` with bounded labels, and the
+  richer `/status`.
 - Contract with the Phase 1 router (from the Phase 1 review):
   - The `Upstream` callable maps every exception (httpx errors included) to an
     `UpstreamResult`; only cancellation propagates.
@@ -117,12 +119,17 @@ Tests (`respx` mocking upstream):
 - every model out → 429 with the correct `Retry-After`
 - streaming: 429 before the first byte falls back; an error mid-stream sends an SSE error and no fallback
 - missing or wrong token → 401; the key never appears in any response or log line
+- log lines and metrics hold no prompt or completion text, tokens or tool-call IDs; every
+  metric label value comes from config or a fixed list
 
 ## Phase 3: Packaging and docs
 
 - `Dockerfile` (non-root, pinned base image digest), `docker-compose.yml` bound to `127.0.0.1`.
 - `requirements.txt` with hashes. `.env.example`.
 - README: quick start, Zoo Code / Copilot / Cline setup (see DESIGN §15), `/status`, limits and disclaimers.
+- `/dashboard` with its cookie login (DESIGN §17.2), and an optional `monitoring` compose
+  profile (Prometheus and Grafana with a provisioned dashboard), off by default.
+- README: reaching the proxy from other devices over Tailscale (DESIGN §18).
 
 ## Phase 4: Review and live check
 
@@ -134,6 +141,16 @@ Tests (`respx` mocking upstream):
   Include a restart of the proxy in the middle of the task.
   Copilot Chat and the second Zoo Code profile wait for `gemini-smart` after v1.
 - Pre-publish checklist (below).
+
+## After v1
+
+Automatic routing (`gemini-auto`), proposed in DESIGN §16: `gemini-smart` and a decision log,
+then tiers with spill and pacing, then rules (after a probe of the signals Zoo Code sends),
+then automatic adaptations, then a suggestion report. Each step gets its own plan entry,
+approved before code.
+
+Also after v1: alerts (DESIGN §17.2 layer 6), and a remote-hosting design (DESIGN §18)
+if the proxy is to run somewhere other than the user's machine.
 
 ## Validation commands
 
