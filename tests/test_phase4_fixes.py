@@ -316,30 +316,33 @@ def test_request_over_the_shared_budget_gets_503_busy_before_buffering():
     assert status["requests"]["by_reason"] == {"busy": 1}
 
 
-def test_scratch_copies_are_charged_before_the_estimate_runs(monkeypatch):
-    # Review finding: joining the chunks and the estimate's string-stripped copy allocated up
-    # to 2× more while the lease held only the raw size. The lease must cover 2× raw first,
-    # and a request that can't get it is busy before anything is copied.
+def test_body_is_parsed_only_once_its_estimate_is_held(monkeypatch):
+    # The lease holds the whole estimate when the body is parsed, and a request that can't
+    # get it is busy before the parse (DESIGN §20.3). That the join also comes after the
+    # estimate is held is pinned by test_reading_a_body_uses_no_more_memory_than_its_lease_holds.
     import quota_router.app as appmod
-    real = appmod.parsed_memory_estimate
-    seen: list[tuple[int, int]] = []
+    from quota_router.app import parsed_memory_estimate
+    real = appmod.json.loads
+    seen: list[tuple[bytes, int]] = []
 
-    def spy(raw):
-        seen.append((len(raw), p.body_budget.used))
-        return real(raw)
+    def spy(s, *a, **kw):
+        if isinstance(s, bytes) and s.startswith(b'{"model"'):
+            seen.append((s, p.body_budget.used))
+        return real(s, *a, **kw)
 
-    monkeypatch.setattr(appmod, "parsed_memory_estimate", spy)
+    monkeypatch.setattr(appmod.json, "loads", spy)
     p = small_budget_proxy()
     body = chat_body(content="x" * 500)
     with mocked(Upstream()), running(p) as c:
         assert post(c, body).status_code == 200
-        size, held = seen[-1]
-        assert held >= 2 * size
+        raw, held = seen[0]  # the request body's parse (the first; later ones are upstream's)
+        assert held == parsed_memory_estimate(raw)
         seen.clear()
-        p.body_budget.used = 12_000 - 1_000  # room for the raw body, not for 2× of it
+        p.body_budget.used = 12_000 - 3 * len(raw)  # room for 2× the raw body, not the estimate
         r = post(c, body)
+        held = p.body_budget.used
     assert r.status_code == 503 and r.json()["error"]["code"] == "server_busy"
-    assert seen == []  # refused before the estimate (and its copy) ran
+    assert seen == [] and held == 12_000 - 3 * len(raw)  # refused before the parse, nothing kept
 
 
 def test_chunked_body_over_the_budget_gets_503_busy():
@@ -512,3 +515,125 @@ def test_body_of_exactly_max_body_bytes_fits_a_budget_of_exactly_the_minimum():
     with mocked(Upstream({"model-a": [streamed(sse(chunk("ok", finish="stop")))]})), running(p) as c:
         r = c.post("/v1/chat/completions", content=raw, headers={**AUTH, "content-type": "application/json"})
     assert r.status_code == 200
+
+
+# ---- the estimate is streamed in bounded memory (DESIGN §20.3, 2026-11-21) ----
+
+def _whole_body_estimate(raw: bytes) -> int:
+    """The estimate as it was before streaming: strip every string of the joined body at once.
+    Kept as the reference the streamed estimate must equal."""
+    import re
+    from quota_router.app import _char_width
+    from quota_router.config import PARSED_BASE_FACTOR, PARSED_OVERHEAD, PARSED_WIDTH_FACTOR
+    s = re.sub(rb'"[^"\\]*(?:\\.[^"\\]*)*(?:"|\\?\Z)', b'""', raw, flags=re.S)
+    values = s.count(b",") + s.count(b"[") + s.count(b"{") + 1
+    factor = PARSED_BASE_FACTOR + PARSED_WIDTH_FACTOR * (_char_width(raw) - 1)
+    return (factor * len(raw) + PARSED_OVERHEAD
+            + 80 * values + 160 * s.count(b"{") + 64 * s.count(b":"))
+
+
+def test_streamed_estimate_equals_the_whole_body_estimate_however_it_is_split(monkeypatch):
+    # Strings, escapes, raw newlines and \u escapes cut at window and chunk edges, with tiny
+    # windows and empty chunks.
+    import random
+    import quota_router.app as appmod
+    rng = random.Random(7)
+    parts = [b'"', b'\\', b',', b'[', b'{', b':', b'}', b']', b'a', b'0', b' ', b'\n', b'\\u', b'D83D',
+             b'00e9', b'\xc4\x80', b'\xf0\x9f\x98\x80', b'\\"', b'\\\\']
+    for _ in range(4000):
+        raw = b"".join(rng.choice(parts) for _ in range(rng.randint(0, 60)))
+        monkeypatch.setattr(appmod, "ESTIMATE_WINDOW", rng.randint(1, 8))
+        est = appmod.BodyEstimate()
+        pos = 0
+        while pos < len(raw):
+            k = rng.randint(0, 10)  # empty chunks included
+            est.feed(raw[pos:pos + k])
+            pos += k
+        assert est.value == _whole_body_estimate(raw), raw
+
+
+def _big_bodies(size: int) -> dict[str, bytes]:
+    code = "def f(a, b):\n    return {'x': [a, b], 'y': \"q\\\"z\"}  # x, y: z\n" * (size // 60)
+    return {
+        "tiny strings": b'{"x": [' + b'"",0,' * (size // 5) + b'0]}',
+        "code": json.dumps({"model": "m", "messages": [{"role": "user", "content": code}]}).encode(),
+    }
+
+
+@pytest.mark.parametrize("shape", ["tiny strings", "code"])
+def test_estimate_scratch_memory_is_bounded_whatever_the_body_size(shape):
+    # Regression (second review of the parsed-size fix): stripping the whole body with one
+    # re.sub took ~44× its size for tiny strings and ~12× for code (the regex engine keeps
+    # state per escape inside one string), above the estimate it then charged.
+    import tracemalloc
+    from quota_router.app import parsed_memory_estimate
+    raw = _big_bodies(2_000_000)[shape]
+    tracemalloc.start()
+    try:
+        before = tracemalloc.get_traced_memory()[0]
+        value = parsed_memory_estimate(raw)
+        peak = tracemalloc.get_traced_memory()[1] - before
+    finally:
+        tracemalloc.stop()
+    assert peak < 512 * 1024, peak  # ~370 KB at most for the worst shapes measured
+    assert value == _whole_body_estimate(raw)  # same accuracy as before
+
+
+def _read_body_measured(raw: bytes, chunk_size: int, budget: int = 1 << 30):
+    """Feeds `raw` to _read_json in chunks made as they are received (as a server would) and
+    returns (result, lease, tracemalloc peak during the read)."""
+    import asyncio
+    import tracemalloc
+    from starlette.requests import Request
+    from quota_router.app import BodyBudget, _read_json
+    pos = 0
+
+    async def receive():
+        nonlocal pos
+        piece = raw[pos:pos + chunk_size]
+        pos += chunk_size
+        return {"type": "http.request", "body": piece, "more_body": pos < len(raw)}
+
+    lease = BodyBudget(budget).lease()
+    request = Request({"type": "http", "method": "POST", "path": "/", "headers": []}, receive)
+    tracemalloc.start()
+    try:
+        before = tracemalloc.get_traced_memory()[0]
+        result = asyncio.run(_read_json(request, 2_000_000, lease))
+        peak = tracemalloc.get_traced_memory()[1] - before
+    finally:
+        tracemalloc.stop()
+    return result, lease, peak
+
+
+@pytest.mark.parametrize("shape,size,chunk_size", [
+    ("tiny strings", 1_000_000, 65536), ("code", 1_000_000, 65536),
+])
+def test_reading_a_body_uses_no_more_memory_than_its_lease_holds(shape, size, chunk_size):
+    # Regression: the peak while the body is received, estimated, joined and parsed stays
+    # within what the request holds, plus the estimate's fixed scratch (DESIGN §20.3).
+    body, lease, peak = _read_body_measured(_big_bodies(size)[shape], chunk_size)
+    assert isinstance(body, dict)
+    assert peak <= lease.held + 512 * 1024, (peak, lease.held)
+
+
+def test_body_that_can_never_fit_gets_413_even_under_load():
+    # Review nit: the 2× join charge ran before the estimate, so under load a body that could
+    # never fit got 503 (and a client retrying it got 503 again) instead of its 413.
+    p = make_proxy(max_body_bytes=40_000, max_inflight_parsed_bytes=300_000)
+    up = Upstream()
+
+    def chunks():  # no Content-Length, so nothing is charged before the body is read
+        yield b'{"model": "fast", "messages": [{"role": "user", "content": "hi"}], "x": ['
+        for _ in range(6):
+            yield b"{}, " * 1_000
+        yield b"{}]}"
+
+    raw_len = sum(len(c) for c in chunks())
+    with mocked(up), running(p) as c:
+        p.body_budget.used = 300_000 - int(1.5 * raw_len)  # room for the bytes, not for 2× of them
+        r = c.post("/v1/chat/completions", content=chunks(),
+                   headers={**AUTH, "content-type": "application/json"})
+        held = p.body_budget.used
+    assert r.status_code == 413 and r.json()["error"]["code"] == "request_too_large"
+    assert held == 300_000 - int(1.5 * raw_len) and up.requests == []

@@ -548,10 +548,6 @@ class BodyLease:
             self.held = 0
 
 
-# A string, or an unterminated one running to the end. It always matches at the first quote,
-# so a body with an unclosed string is still one linear pass (a pattern that can fail there
-# is retried from every later quote: quadratic, found in review). re.S: `.` takes a raw newline.
-_JSON_STRING = re.compile(rb'"[^"\\]*(?:\\.[^"\\]*)*(?:"|\\?\Z)', re.S)
 # Python stores a string at its widest character's width; json.loads decodes the whole
 # document first, so one such character sets the width of that copy (found in review).
 _WIDTH_4 = re.compile(rb'[\xf0-\xf4]|\\u[dD][89abAB]')  # astral: UTF-8 lead or surrogate escape
@@ -564,16 +560,87 @@ def _char_width(raw: bytes) -> int:
     return 2 if _WIDTH_2.search(raw) else 1
 
 
-def parsed_memory_estimate(raw: bytes) -> int:
+# A string, or an unterminated one running to the end of the window. It always matches at the
+# first quote, so a window with an unclosed string is still one linear pass (a pattern that can
+# fail there is retried from every later quote: quadratic, found in review). re.S: `.` takes a
+# raw newline. Group 1 is the closing quote, so a string cut off at the window's end becomes
+# one unpaired quote in the stripped output: that is how the scan knows it ended inside one.
+_JSON_STRING_CLOSED = re.compile(rb'"[^"\\]*(?:\\.[^"\\]*)*(?:(")|\\?\Z)', re.S)
+# Inside a string: up to its closing quote, a lone backslash at the window's end, or the end.
+_STRING_REST = re.compile(rb'[^"\\]*(?:\\.[^"\\]*)*', re.S)
+# Scan window. Scratch is at most ~90 × this (a run of `"",`, or a string of escapes): ~370 KB.
+ESTIMATE_WINDOW = 4096
+_BACKSLASH = 0x5C
+
+
+class BodyEstimate:
     """Upper estimate of the memory a body takes while its request is in progress (DESIGN
-    §20.3): (3 + 3 × character width) × its size, plus a per-value cost counted on the
-    structure outside strings, which is what makes JSON of many tiny values 10–20× its size
-    once parsed. Calibrated against tracemalloc (2026-11-21)."""
-    s = _JSON_STRING.sub(b'""', raw)  # commas and braces inside strings are not values
-    values = s.count(b",") + s.count(b"[") + s.count(b"{") + 1
-    factor = PARSED_BASE_FACTOR + PARSED_WIDTH_FACTOR * (_char_width(raw) - 1)
-    return (factor * len(raw) + PARSED_OVERHEAD
-            + 80 * values + 160 * s.count(b"{") + 64 * s.count(b":"))
+    §20.3), built chunk by chunk as the body arrives: (3 + 3 × character width) × its size,
+    plus a per-value cost counted on the structure outside strings, which is what makes JSON
+    of many tiny values 10–20× its size once parsed. Calibrated against tracemalloc
+    (2026-11-21).
+
+    Each chunk is scanned in windows of ESTIMATE_WINDOW bytes, so the scan's scratch memory
+    is bounded whatever the body's size or shape. It never awaits, so one runs at a time.
+    The result equals stripping the joined body's strings in one pass."""
+
+    def __init__(self) -> None:
+        self.size = 0
+        self._in_string = False
+        self._escaped = False  # inside a string, the next byte is escaped by a lone backslash
+        self._tail = b""  # last bytes seen, for a \u escape split across chunks
+        self._width = 1
+        self._commas = self._opens = self._objects = self._colons = 0
+
+    @property
+    def value(self) -> int:
+        values = self._commas + self._opens + self._objects + 1
+        factor = PARSED_BASE_FACTOR + PARSED_WIDTH_FACTOR * (self._width - 1)
+        return (factor * self.size + PARSED_OVERHEAD
+                + 80 * values + 160 * self._objects + 64 * self._colons)
+
+    def feed(self, chunk: bytes) -> None:
+        n = len(chunk)
+        self.size += n
+        if self._width < 4:  # the patterns need at most 4 bytes, so 5 of carry is enough
+            self._width = max(self._width, _char_width(self._tail + chunk[:6]), _char_width(chunk))
+        self._tail = (self._tail + chunk[-5:])[-5:]
+        pos = 0
+        while pos < n:
+            end = min(pos + ESTIMATE_WINDOW, n)
+            if self._in_string:
+                if self._escaped:
+                    self._escaped = False
+                    pos += 1
+                    continue
+                stop = _STRING_REST.match(chunk, pos, end).end()  # bounded to the window
+                if stop == end:
+                    pos = end
+                elif chunk[stop] == _BACKSLASH:  # lone, as the window's last byte
+                    self._escaped = True
+                    pos = end
+                else:  # the closing quote
+                    self._in_string = False
+                    pos = stop + 1
+                continue
+            window = chunk[pos:end]
+            s = _JSON_STRING_CLOSED.sub(rb'"\1', window)  # commas and braces inside strings are not values
+            self._commas += s.count(b",")
+            self._opens += s.count(b"[")
+            self._objects += s.count(b"{")
+            self._colons += s.count(b":")
+            if s.count(b'"') % 2:  # the window ends inside a string
+                self._in_string = True
+                # the match took backslashes in pairs; an odd run escapes the next byte
+                self._escaped = (len(window) - len(window.rstrip(b"\\"))) % 2 == 1
+            pos = end
+
+
+def parsed_memory_estimate(raw: bytes) -> int:
+    """BodyEstimate of a whole body at once."""
+    estimate = BodyEstimate()
+    estimate.feed(raw)
+    return estimate.value
 
 
 def _busy() -> JSONResponse:
@@ -588,31 +655,28 @@ async def _read_json(request: Request, limit: int, lease: BodyLease) -> dict | R
     if declared and declared.isdigit() and not lease.grow_to(int(declared)):
         return _busy()  # before buffering anything
     chunks: list[bytes] = []
-    size = 0
+    estimate = BodyEstimate()
     try:
         async for chunk in request.stream():
-            size += len(chunk)
-            if size > limit:
+            if estimate.size + len(chunk) > limit:
                 return openai_error(413, "request_too_large", f"request body over {limit} bytes")
-            if not lease.grow_to(size):
+            estimate.feed(chunk)
+            # The estimate only grows, so once over the whole budget the body could never fit:
+            # 413 before any 503, whatever the load (DESIGN §20.3).
+            if estimate.value > lease.limit:
+                return openai_error(413, "request_too_large",
+                                    "request body would take too much memory once parsed (DESIGN §20.3)")
+            if not lease.grow_to(estimate.size):
                 return _busy()
             chunks.append(chunk)
-    except ClientDisconnect:  # gone while uploading; nothing was reserved
+    except ClientDisconnect:  # gone while uploading; the caller releases the bytes held so far
         return Response(status_code=499)
-    # Joining holds the chunks and the joined copy at once: charge 2× the raw size first
-    # (found in review). The estimate's own scratch memory is not covered yet (DESIGN §20.3,
-    # open item).
-    if not lease.grow_to(2 * size):
+    # Charged before joining and parsing. The estimate is at least 6× the size, so it also
+    # covers the join, which holds the chunks and the joined copy at once (found in review).
+    if not lease.grow_to(estimate.value):
         return _busy()
     raw = b"".join(chunks)
     del chunks
-    # Charged before parsing, since the parse is what can take many times the raw size.
-    need = parsed_memory_estimate(raw)
-    if need > lease.limit:  # could never fit, even with nothing else in progress
-        return openai_error(413, "request_too_large",
-                            "request body would take too much memory once parsed (DESIGN §20.3)")
-    if not lease.grow_to(need):
-        return _busy()
     try:
         body = json.loads(raw)
     except (ValueError, RecursionError):

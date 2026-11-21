@@ -1045,23 +1045,64 @@ after the Phase 4 review; it used to need `rpm × 10 < rpd`).
     to its close or to the end of the body. A pattern that could fail at an unclosed string was
     retried from every later quote: quadratic, and it blocked the event loop (second review).
   - It covers every measured shape (estimate ÷ peak 1.07–2.0) and takes under 1 ms for
-    agent-sized bodies, about 0.5 s at 20 MB.
-  - Before the chunks are joined, the share grows to 2 × the raw size, or the request gets
-    503 `server_busy`. That covers the join, which holds the chunks and the joined copy at
-    once (found in review).
-  - **Open (found in the second review of that fix, 2026-11-21):** the estimate itself isn't
-    covered. Its string-stripping `re.sub` builds a piece per string before joining, so it
-    briefly takes about 44× the raw size for a body of `"",0,` repeated, 28× for `"ab",12,`
-    and 10× for tool messages (tracemalloc, 2 MB bodies), above the estimate it then charges
-    (38×, 26×, 12×). A bounded-memory estimate is a design change to approve before code.
-  An estimate over the whole budget gets 413 `request_too_large`, because it could never fit;
-  one over what is left gets 503 `server_busy`, as above. The budget now counts estimated
-  memory, under a new key, `max_inflight_parsed_bytes`: the default is 128 MB. The old key,
-  `max_inflight_body_bytes` (64 MB of raw bytes in the old example), is still accepted but
-  ignored, with a startup warning naming the new key. Read as parsed memory, the old example's
-  value was below the minimum, so a copied config stopped the proxy (found in review). It must be at least
-  6 × `max_body_bytes` + 5 KB, so the largest plain-ASCII request (system and user messages,
-  stream options) is always accepted; a test checks it at exactly `max_body_bytes`. A body near
+    agent-sized bodies.
+  - **Streamed, in bounded memory (approved 2026-11-21).** This closes an
+    open item from the second review of the parsed-size fix. Stripping the whole body with one
+    `re.sub` took scratch memory beyond what it charged: it builds a piece per string before
+    joining, and the regex engine keeps state for each escape inside one string. On 2 MB bodies
+    (tracemalloc) the scratch peaked at 43.5× the raw size for `"",0,` repeated, 27.5× for
+    `"ab",12,`, 12.9× for tool messages and 11.7× for a code-heavy body. The estimates were
+    38×, 26×, 12.7× and 6×.
+    - The estimate is built as chunks arrive, not from the joined body. Each chunk is scanned
+      in 4 KB windows. The scan carries three facts from one window or chunk to the next:
+      whether it is inside a string, whether a lone backslash inside a string escapes the next
+      byte, and the last 5 bytes, so a `\u` escape split across chunks still sets the width.
+    - Inside a string, the scan only looks for the closing quote, with a match limited to the
+      window, so a string of any length costs the same scratch. Outside, strings in the window
+      are stripped as before. A string cut off at the window's end leaves an unpaired quote,
+      which is how the scan knows the window ended inside one.
+    - The result is the same number as stripping the whole body at once, so accuracy is
+      unchanged, code-heavy bodies (about 6×) included. This was checked ad hoc on every body
+      of up to 6 bytes at every split, and on 400,000 random bodies (raw newlines, empty
+      chunks, windows of 1–9 bytes). A test compares 4,000 random bodies on each run.
+    - Scratch is at most about 90 × the window, about 370 KB, for the worst shapes measured: a
+      run of `"",`, or a string of escapes. The scan runs synchronously between reads, never
+      across an await, so only one runs at a time across all requests. That fixed amount is
+      process overhead, like the interpreter's, and is not charged to requests.
+    - Rejected: counting with `finditer` and no copy. It was 30–40% slower, and it peaked at
+      25 MB on the 2 MB code body because of the regex engine's per-escape state. Also
+      rejected: charging a bound from raw counts before stripping, which counts commas in
+      code and so overcharges code-heavy bodies.
+    - Each scan blocks the event loop only for its chunk, at most about 5 ms per 64 KB (for
+      `""` repeated), instead of 0.8–1.3 s for a 20 MB body at once. Total time is up to 1.4×
+      the old pass: 0.75–1.43 s for 20 MB, depending on shape, against 0.79–1.29 s.
+  - **Order of checks (approved with the above).** For each chunk: over `max_body_bytes` → 413.
+    Then the running estimate over the whole budget → 413 `request_too_large`. The estimate
+    only grows as chunks arrive, so such a body could never fit. Then the request's share grows
+    to the bytes received, or the request gets 503 `server_busy`. During the upload the share
+    stays at the bytes received, not the running estimate, so slow uploads don't reserve parsed
+    memory early.
+  - Once the whole body has arrived, the share grows to the estimate, or the request gets
+    503. Only then are the chunks joined and parsed. The estimate is always at least 6× the
+    size, so it covers the join, which holds the chunks and the joined copy at once (2×, found
+    in review). The separate 2× charge goes.
+  - So a body that can never fit gets 413 as soon as the bytes received prove it, whatever the
+    load. Before that, it can still get 503 under load (found in review), in two cases:
+    - A declared `Content-Length` is charged before any of the body is read. Most clients,
+      the OpenAI SDK and httpx included, declare one.
+    - The budget can run out before the chunks that push the estimate over it arrive. An
+      example is plain text followed by many tiny values.
+
+    The streamed check can't know what comes later, so these stay. A body whose bytes alone
+    prove it can never fit no longer gets 503 from the old 2× charge.
+
+  The budget now counts estimated memory, under a new key, `max_inflight_parsed_bytes`: the
+  default is 128 MB. The old key, `max_inflight_body_bytes` (64 MB of raw bytes in the old
+  example), is still accepted but ignored, with a startup warning naming the new key. Read as
+  parsed memory, the old example's value was below the minimum, so a copied config stopped the
+  proxy (found in review). It must be at least 6 × `max_body_bytes` + 5 KB, so the largest
+  plain-ASCII request (system and user messages, stream options) is always accepted; a test
+  checks it at exactly `max_body_bytes`. A body near
   `max_body_bytes` that holds a wide character can get 413 at the default: at 20 MB with one emoji
   it really would take about 280 MB. Raise both limits together if such bodies are expected.
   A client that declares a large `Content-Length` and uploads slowly holds that much of the
