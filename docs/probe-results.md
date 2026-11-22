@@ -253,7 +253,12 @@ Task (read-only): read README.md, list docs/, read DESIGN §16.8, summarise hand
   `state_errors: 0`; the task finished with a correct answer.
 - Why: Zoo Code's bundled code (3.98.0) stores a response's signature under a provider-named
   key and reads it back from a `google` key when it sends the call back, so it can be dropped.
-  Not confirmed by inspecting a request (the proxy never logs bodies). This revises the Phase 0
-  conclusion below that Zoo Code preserves `extra_content`.
+  This revises the Phase 0 conclusion below that Zoo Code preserves `extra_content`.
+- Confirmed 2026-11-22 18:21 local: a temporary check, removed afterwards, logged only the field
+  names of assistant tool calls in the follow-up (never values; the proxy never logs bodies).
+  Zoo Code 3.98.0 on `gemini-fast` ("List the files in this folder") sent the call with only
+  `id`, `type`, `function.name` and `function.arguments`, and the message with only `role`,
+  `content` and `tool_calls`. The signature is dropped entirely, not moved to another key. That
+  request's `attempts` showed `restored: 1`, status 200.
 - Result: **PASS** for both clients (no 400, signatures restored); §23.7's expectation for Zoo
   Code was wrong and is corrected in DESIGN §23.8.

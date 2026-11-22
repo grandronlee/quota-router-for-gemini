@@ -1903,9 +1903,10 @@ being called (decided per candidate, since a handoff target gets a different bod
 **Live check (2026-11-22):** Copilot passed (one signature restored, no 400). Zoo Code 3.98.0 on
 `gemini-fast` also had one call restored, against §23.7's expectation of none. Its
 OpenAI-compatible provider reads `extra_content.google.thought_signature` from responses, but
-appears to look for it under a different key when sending the call back, so the signature can
-be lost (read from Zoo Code's bundled code, not confirmed by inspecting a request). Phase 0's
-"Zoo Code keeps signatures" was inferred from the absence of a 400. The restore covers both
+sends the call back without it. A temporary check that logged only field names (2026-11-22,
+removed afterwards) showed the follow-up's assistant tool call with only `id`, `type`,
+`function.name` and `function.arguments`: no `extra_content` under any key, and nothing extra
+on the message. Phase 0's "Zoo Code keeps signatures" was inferred from the absence of a 400. The restore covers both
 clients, so nothing changes in the design; the docs that said otherwise are corrected.
 
 **Not adopted:** a fingerprint of each call (function and arguments) checked before restoring.
