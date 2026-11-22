@@ -21,6 +21,7 @@ from .affinity import AffinityRecord, AffinityStore, Recorded
 from .classify import classify_429
 from .clock import Clock
 from .config import Config, ModelConfig
+from .pacing import DemandCurve, Pacer, PaceView
 from .quota import Blocked, QuotaStore, Reservation
 from .turns import TurnReason, TurnRef, new_turn_id
 
@@ -38,6 +39,9 @@ _STOP = object()  # sentinel: the last-resort pass has no attempts or time left
 
 Reason = Literal["disabled", "too_large", "quota", "unavailable", "not_tried"]
 Affinity = Literal["pinned", "unknown", "mixed", "handoff"]
+# gemini-auto's x-route-reason values (DESIGN §16.9.4).
+RouteReason = Literal["default", "pace-upgrade", "spill", "pinned", "handoff"]
+ROUTE_REASONS = ("default", "pace-upgrade", "spill", "pinned", "handoff")
 
 # Google's documented signature for history "transferred from a different model" (DESIGN §16.8).
 PLACEHOLDER_SIGNATURE = "skip_thought_signature_validator"
@@ -178,6 +182,8 @@ class RouteServed:
     handoff_from: str | None = None  # the turn's owner, when another model served it
     turn: TurnRef | None = None  # its decision-log turn (DESIGN §16.8 1d)
     attempt: Attempt | None = None  # this call's log entry, finished when a stream ends
+    route_tier: str | None = None  # gemini-auto only: x-route-tier and x-route-reason (§16.9.5)
+    route_reason: RouteReason | None = None
 
 
 @dataclass
@@ -193,6 +199,8 @@ class RoutePassthrough:
     turn: TurnRef | None = None
     restored: int = 0  # stored signatures put back in the body sent (DESIGN §23.4)
     placeholder: int = 0  # placeholders for calls sent without a signature and no usable record
+    route_tier: str | None = None
+    route_reason: RouteReason | None = None
 
 
 @dataclass
@@ -206,6 +214,8 @@ class RouteFailed:
     candidates: list[Candidate] = field(default_factory=list)
     handoff_from: str | None = None  # the owner, when a handoff target was tried and failed too
     turn: TurnRef | None = None  # None only for an unknown model or route
+    route_tier: str | None = None
+    route_reason: RouteReason | None = None
 
     def error_body(self) -> dict:
         etype = {400: "invalid_request_error", 404: "invalid_request_error",
@@ -425,6 +435,42 @@ class Router:
         # Thought-signature counts since start, for /status (DESIGN §23.6); never values.
         self.signatures: dict[str, int] = dict.fromkeys(SIGNATURE_ACTIONS, 0)
         self.on_signature: SignatureHook | None = None  # set by the HTTP layer for /metrics
+        # gemini-auto's upgrade test (DESIGN §16.9.2); its demand curve reads the decision log.
+        self._pacer: Pacer | None = None
+        if config.auto is not None:
+            curve = DemandCurve(store.conn, config.auto, on_error=self._count_state_error)
+            self._pacer = Pacer(config, store, curve)
+
+    def _count_state_error(self) -> None:
+        self.state_errors += 1
+
+    def is_auto(self, name: Any) -> bool:
+        return self._config.auto is not None and name == self._config.auto.name
+
+    def pace_view(self) -> PaceView | None:
+        """The pace now, for /status and /metrics; None without gemini-auto or if today's
+        counts can't be read (logged and counted)."""
+        if self._pacer is None:
+            return None
+        try:
+            return self._pacer.view(self._clock.now())
+        except sqlite3.Error:
+            self.state_errors += 1
+            log.exception("could not read the pace")
+            return None
+
+    def _decide(self) -> tuple[str, RouteReason]:
+        """A gemini-auto turn start's preferred tier and reason (DESIGN §16.9.2). A failed state
+        read gives the default tier: it keeps smart quota back, and spill still works (§16.9.6)."""
+        auto = self._config.auto
+        assert auto is not None and self._pacer is not None
+        try:
+            if self._pacer.view(self._clock.now()).upgrade:
+                return auto.pacing.tier, "pace-upgrade"
+        except sqlite3.Error:
+            self.state_errors += 1
+            log.exception("could not read the pace; not upgrading this turn")
+        return auto.default_tier, "default"
 
     def resolve(self, name: Any) -> list[ModelConfig] | None:
         if not isinstance(name, str):
@@ -470,40 +516,46 @@ class Router:
 
     @staticmethod
     def _turn(request: Mapping[str, Any], affinity: Affinity | None, turn_id: str | None,
-              started: float) -> TurnRef:
+              started: float, decision: RouteReason | None = None,
+              tier: str | None = None) -> TurnRef:
         """The request's decision-log turn. A request with no tool calls in its active turn
         starts one; a follow-up continues the turn its calls name, or starts a row (`unknown`
         when none of its calls is known). A known call whose model is no longer configured is
-        routed as `unknown` but still names its turn, so that row is `pinned`."""
+        routed as `unknown` but still names its turn, so that row is `pinned`. A gemini-auto
+        turn start's reason is its decision (DESIGN §16.9.5)."""
         tools = request.get("tools")
         n_tools = len(tools) if isinstance(tools, list) else 0
         if affinity is None:
-            reason: TurnReason = "first"
+            reason: TurnReason = decision or "first"
         elif affinity == "unknown" and turn_id is None:
             reason = "unknown"
         else:
             reason = "pinned"
-        return TurnRef(turn_id or new_turn_id(), reason, n_tools, started)
+        return TurnRef(turn_id or new_turn_id(), reason, n_tools, started, tier)
 
-    @staticmethod
-    def _served_turn(turn: TurnRef, resolved: list[ModelConfig], model: ModelConfig,
+    def _served_turn(self, turn: TurnRef, resolved: list[ModelConfig], model: ModelConfig,
                      handoff_from: str | None) -> TurnRef:
         """`turn` with the reason this request's serving model gives, in case it creates
-        the row: a turn start served after the route's first model is a spill."""
+        the row: a turn start served after the route's first model is a spill, and so is a
+        gemini-auto turn start served outside its preferred tier."""
         if turn.reason == "first" and model.id != resolved[0].id:
+            return replace(turn, reason="spill")
+        if turn.reason in ("default", "pace-upgrade") and self._config.tier_of(model.id) != turn.tier:
             return replace(turn, reason="spill")
         if turn.reason == "pinned" and handoff_from is not None:
             return replace(turn, reason="handoff")
         return turn
 
     def _handoff_targets(self, name: Any, resolved: list[ModelConfig],
-                         owner: ModelConfig) -> list[ModelConfig]:
-        """The route's other models listed in `handoff_targets`, in route order. A request
-        for a real model ID gets none (DESIGN §16.8)."""
+                         owner: ModelConfig, tier: str | None = None) -> list[ModelConfig]:
+        """The route's other models listed in `handoff_targets`, in route order; for
+        gemini-auto, the owner's tier first (DESIGN §16.9.4). A request for a real model ID
+        gets none (DESIGN §16.8)."""
         if not (isinstance(name, str) and name in self._config.routes and self._config.handoff_targets):
             return []
         allowed = set(self._config.handoff_targets)
-        return [m for m in resolved if m.key in allowed and m.id != owner.id]
+        order = self._config.tier_models(tier) if self.is_auto(name) and tier is not None else resolved
+        return [m for m in order if m.key in allowed and m.id != owner.id]
 
     def _may_hand_off(self, owner: Candidate) -> bool:
         """Hand off only if the owner can't take the request within handoff_after_s: it
@@ -537,10 +589,33 @@ class Router:
         if resolved is None:
             return RouteFailed(404, "model_not_found", f"unknown model or route: {name!r}", None)
         candidates, affinity, records, turn_id = self._pin(request, resolved)
-        turn = self._turn(request, affinity, turn_id, started)
+        # gemini-auto (DESIGN §16.9.4): a turn start (or a follow-up with no known call) is
+        # decided once, here; a pinned turn keeps its owner's tier and isn't paced again.
+        auto = self.is_auto(name)
+        tier: str | None = None
+        decision: RouteReason | None = None
+        if auto:
+            if affinity in ("pinned", "mixed"):
+                tier = self._config.tier_of(candidates[0].id)
+            else:
+                tier, decision = self._decide()
+                candidates = self._config.tier_models(tier)
+        turn = self._turn(request, affinity, turn_id, started, decision, tier)
         owner = candidates[0] if affinity in ("pinned", "mixed") else None
         if owner is not None:
-            candidates = [owner, *self._handoff_targets(name, resolved, owner)]
+            candidates = [owner, *self._handoff_targets(name, resolved, owner, tier)]
+
+        def labelled(out, model: ModelConfig | None, handoff_from: str | None):
+            """The outcome with gemini-auto's x-route-tier and x-route-reason (§16.9.5)."""
+            if auto:
+                out.route_tier = tier
+                if owner is not None:
+                    out.route_reason = "handoff" if handoff_from is not None else "pinned"
+                elif model is not None and self._config.tier_of(model.id) != tier:
+                    out.route_reason = "spill"
+                else:
+                    out.route_reason = decision
+            return out
         input_tokens = estimate_input_tokens(request)
         output_tokens = requested_output_tokens(request)
 
@@ -631,17 +706,18 @@ class Router:
                 if not result.stream:
                     self._store.on_recovered(model, res)
                 self._note_handoff(owner, model, "served")
-                return RouteServed(model, result.payload, res, path, served_affinity, handoff_from,
-                                   turn=self._served_turn(turn, resolved, model, handoff_from),
-                                   attempt=entry)
+                return labelled(RouteServed(model, result.payload, res, path, served_affinity, handoff_from,
+                                            turn=self._served_turn(turn, resolved, model, handoff_from),
+                                            attempt=entry), model, handoff_from)
             if isinstance(result, Rejected):
                 if result.status in RECOVERY_STATUSES:
                     self._store.on_recovered(model, res)
                 self._note_handoff(owner, model, "rejected")
-                return RoutePassthrough(model, result.payload, res, path, served_affinity, handoff_from,
-                                        rewritten=signed.foreign > 0,
-                                        turn=self._served_turn(turn, resolved, model, handoff_from),
-                                        restored=signed.restored, placeholder=signed.placeholder)
+                return labelled(RoutePassthrough(model, result.payload, res, path, served_affinity,
+                                                 handoff_from, rewritten=signed.foreign > 0,
+                                                 turn=self._served_turn(turn, resolved, model, handoff_from),
+                                                 restored=signed.restored, placeholder=signed.placeholder),
+                                model, handoff_from)
             self._note_handoff(owner, model, "failed")
             if isinstance(result, RateLimited):
                 cls = classify_429(result.body, result.headers)
@@ -749,7 +825,7 @@ class Router:
         out.turn = turn
         if owner is not None and any(m != owner.id for m in path):
             out.handoff_from = owner.id  # a target was called and failed too
-        return out
+        return labelled(out, None, out.handoff_from)
 
     def _safely(self, fn, *args, failed: Any = None, **kwargs):
         """Run a state update after an upstream call; a SQLite error is logged, not raised,

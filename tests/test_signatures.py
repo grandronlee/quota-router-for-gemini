@@ -605,7 +605,7 @@ def test_migration_2_to_3_keeps_rows_as_unknown(tmp_path):
     path = tmp_path / "v2.sqlite3"
     version_2_file(path)
     conn = connect(path)
-    assert SCHEMA_VERSION == 3 and conn.execute("PRAGMA user_version").fetchone()[0] == 3
+    assert SCHEMA_VERSION == 4 and conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
     store = AffinityStore(conn, FakeClock(T0))
     assert store.lookup_records(["v2-call"]) == {"v2-call": AffinityRecord("model-a", "ab", None)}
     conn.close()
@@ -632,7 +632,7 @@ def test_migration_1_to_3_and_a_new_file(tmp_path):
     c.close()
     for path in (v1, tmp_path / "new.sqlite3"):
         conn = connect(path)
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 3
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
         cols = [r[1] for r in conn.execute("PRAGMA table_info(affinity)")]
         assert cols == ["tool_call_id", "model_id", "created_at", "turn_id", "signature"]
         conn.close()

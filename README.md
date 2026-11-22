@@ -5,8 +5,9 @@ has free-tier quota. It switches models automatically when one hits its rate lim
 within Google's published limits for your own single project and key.
 
 **Status: in development.** Two routes, both tested live with Zoo Code: `gemini-fast`, and
-`gemini-smart`, which can hand a tool turn to another model when its own runs out. Automatic
-routing and more clients come later ([plan](docs/PLAN.md)).
+`gemini-smart`, which can hand a tool turn to another model when its own runs out. A third,
+`gemini-auto`, picks the tier for each turn; it passes the offline tests but hasn't had its
+live check yet. More clients come later ([plan](docs/PLAN.md)).
 
 - [Design](docs/DESIGN.md) · [Implementation plan](docs/PLAN.md) · [Terms of service notes](docs/COMPLIANCE.md)
 - License: [MIT](LICENSE)
@@ -120,6 +121,16 @@ The response then has the header `x-turn-affinity: handoff`. List a model there 
 passes `python3 -I scripts/probe.py --handoffs` ([DESIGN §16.8](docs/DESIGN.md)); the example
 config lists the ones that passed on the author's account.
 
+To stop switching profiles by hand, uncomment the `auto:` block in `config.yaml` and use one
+profile with model ID `gemini-auto` in every mode. Each turn starts on the fast models, unless
+the smart models have more quota left than the rest of your day is expected to use. In that
+case it starts on smart, and the response has `x-route-reason: pace-upgrade`. A turn that
+can't be served in its tier moves to the other one (`spill`). The proxy learns when you work
+from the last 14 days of turn starts (dates, hours and counts only), once 7 of those days have
+any. Until then it uses `working_hours` and `timezone`, so set those to your own. Without them
+it assumes even use over the Pacific day, and much of the smart quota can go unused
+([DESIGN §16.9](docs/DESIGN.md)).
+
 ### Cline / Kilo Code
 
 Provider **OpenAI Compatible**, same base URL and key. Plan mode `gemini-smart` (or
@@ -174,6 +185,9 @@ Whether the dashboard sign-in works through `tailscale serve` is checked in Phas
 - Each route is an ordered list of models. A request goes to the first one with room for it
   (requests per minute, input tokens per minute, requests per day); on a rate-limit reply it
   moves to the next. At most 3 attempts within 180 seconds.
+- `gemini-auto` decides once per turn which tier comes first, and never refuses a turn for
+  pacing: it still tries every model before replying 429. Its responses carry
+  `x-route-tier` and `x-route-reason`, and `/status` shows the pace under `auto`.
 - When every model is out for the day, the reply is 429 with `Retry-After` pointing at the
   next midnight Pacific, when Google resets daily quotas.
 - A request too large for every model's context gets 400 `context_length_exceeded` without

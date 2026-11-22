@@ -16,7 +16,7 @@ from pathlib import Path
 
 log = logging.getLogger("quota_router")
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS rpd (
@@ -67,6 +67,11 @@ MIGRATIONS: dict[int, list[str]] = {
     # keep NULL (not known), so their calls get the placeholder, as in a handoff before.
     2: [
         "ALTER TABLE affinity ADD COLUMN signature TEXT",
+    ],
+    # 3 -> 4: the preferred tier of a gemini-auto turn (DESIGN §16.9.5). NULL on other routes
+    # and on rows from version 3.
+    3: [
+        "ALTER TABLE turns ADD COLUMN tier TEXT",
     ],
 }
 

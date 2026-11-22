@@ -64,6 +64,14 @@ function renderModels() {
   body.replaceChildren(...rows);
   const routes = Object.entries(data.routes).map(([r, ms]) => `${r} → ${ms.join(", ")}`);
   document.getElementById("routes").textContent = routes.length ? `Routes: ${routes.join(" · ")}` : "";
+  // gemini-auto's pace (DESIGN §16.9.5): turns are upgraded while `left` is above the threshold.
+  const pace = data.auto && data.auto.pace;
+  document.getElementById("pace").textContent = pace
+    ? `Pace (${data.auto.route}, ${pace.tier}): ${num(pace.left)} of ${num(pace.capacity)} left · ` +
+      `upgrades while above ${num(Math.round(pace.upgrade_above * 10) / 10)} · ` +
+      `${Math.round(pace.share * 100)}% of the day's demand gone (${pace.source})` +
+      (pace.upgrade_now ? " · upgrading now" : "")
+    : "";
 }
 
 function renderCounts(id, counts) {

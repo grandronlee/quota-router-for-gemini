@@ -37,8 +37,9 @@ from .db import connect
 from .logs import REQUEST_LOGGER
 from .metrics import OUTCOMES, STATUSES, Metrics, RequestStats, bounded
 from .quota import QuotaStore
-from .router import (Attempt, ModelNotFound, RateLimited, Rejected, RouteFailed, RoutePassthrough,
-                     RouteServed, Router, Served, Unavailable, UpstreamResult, estimate_input_tokens)
+from .router import (ROUTE_REASONS, Attempt, ModelNotFound, RateLimited, Rejected, RouteFailed,
+                     RoutePassthrough, RouteServed, Router, Served, Unavailable, UpstreamResult,
+                     estimate_input_tokens)
 from .scrub import Scrubber
 from .settings import Settings, normalize_host
 from .turns import TurnLog, TurnRef
@@ -211,10 +212,26 @@ class Proxy:
             "recent_errors": [{"at": _iso(e.at), "route": e.route, "status": e.status, "reason": e.reason}
                               for e in reversed(self.stats.recent)],
             "turns_today": self._turns_today(),
+            "auto": self._auto_view(),
             "state_errors": self.router.state_errors,
             # Capture and restore counts since start (DESIGN §23.6); never values.
             "signatures": dict(self.router.signatures),
         }
+
+    def _auto_view(self) -> dict | None:
+        """gemini-auto's pace and today's turns by reason (DESIGN §16.9.5); None without it."""
+        auto = self.config.auto
+        if auto is None:
+            return None
+        pace = self.router.pace_view()
+        try:
+            by_reason: dict[str, int] | None = self.turns.starts_today_by_reason(auto.name)
+        except sqlite3.Error:
+            self.router.state_errors += 1
+            log.exception("could not read the turn log")
+            by_reason = None
+        return {"route": auto.name, "pace": pace.status() if pace else None,
+                "turn_starts_today_by_reason": by_reason}
 
     def _turns_today(self) -> dict[str, int] | None:
         try:
@@ -631,8 +648,14 @@ class ManagedStream(StreamingResponse):
 
 
 def _response_headers(request_id: str, path: list[str], affinity: str | None,
-                      served_model: str | None = None, handoff_from: str | None = None) -> dict[str, str]:
+                      served_model: str | None = None, handoff_from: str | None = None, *,
+                      outcome: Any = None) -> dict[str, str]:
     h = {"x-request-id": request_id}
+    # gemini-auto only (DESIGN §16.9.5): the turn's preferred tier and why it was served where it was.
+    if outcome is not None and getattr(outcome, "route_reason", None):
+        if outcome.route_tier:
+            h["x-route-tier"] = outcome.route_tier
+        h["x-route-reason"] = outcome.route_reason
     if served_model:
         h["x-served-model"] = served_model
     if path:
@@ -956,6 +979,10 @@ def create_app(proxy: Proxy) -> FastAPI:
             state = model_state(s)
             for st in ("available", "cooldown", "exhausted", "disabled"):
                 gauges["qr_model_state"].append(({"model": model_id, "state": st}, 1 if st == state else 0))
+        pace = p.router.pace_view()  # DESIGN §16.9.5
+        if pace is not None:
+            gauges["qr_pace_left"] = [({"tier": pace.tier}, pace.left)]
+            gauges["qr_pace_upgrade_above"] = [({"tier": pace.tier}, round(pace.upgrade_above, 2))]
         text = p.metrics.render(gauges, {
             "qr_auth_failures_total": p.auth_failures,
             "qr_state_errors_total": p.router.state_errors,
@@ -1036,10 +1063,13 @@ def create_app(proxy: Proxy) -> FastAPI:
                                 {"x-request-id": request_id})
         served_payload = outcome.payload if isinstance(outcome, RouteServed) else None
         await handles.close_except(served_payload)
+        if outcome.route_reason is not None:  # gemini-auto (DESIGN §16.9.5)
+            p.metrics.inc("qr_route_decisions_total", reason=bounded(outcome.route_reason, ROUTE_REASONS),
+                          tier=outcome.route_tier or "none")
 
         if isinstance(outcome, RouteFailed):
             headers = _response_headers(request_id, outcome.path, outcome.affinity,
-                                        handoff_from=outcome.handoff_from)
+                                        handoff_from=outcome.handoff_from, outcome=outcome)
             if outcome.retry_after_s is not None:
                 headers["Retry-After"] = str(outcome.retry_after_s)
             reason = {429: "quota", 400: "context_length_exceeded", 404: "model_not_found"}.get(outcome.status)
@@ -1056,7 +1086,7 @@ def create_app(proxy: Proxy) -> FastAPI:
         if isinstance(outcome, RoutePassthrough):
             b: Body = outcome.payload
             headers = _response_headers(request_id, outcome.path, outcome.affinity, outcome.model.id,
-                                        outcome.handoff_from)
+                                        outcome.handoff_from, outcome=outcome)
             if outcome.rewritten and b.status == 400:
                 # Likely a placeholder signature the model won't accept (DESIGN §16.8): returned
                 # unchanged, never retried elsewhere. The fix is to remove it from handoff_targets.
@@ -1081,7 +1111,7 @@ def create_app(proxy: Proxy) -> FastAPI:
 
         assert isinstance(outcome, RouteServed)
         headers = _response_headers(request_id, outcome.path, outcome.affinity, outcome.model.id,
-                                    outcome.handoff_from)
+                                    outcome.handoff_from, outcome=outcome)
         payload = outcome.payload
         if isinstance(payload, Stream):
             session = StreamSession(p, outcome, payload, request_id=request_id, route=route,

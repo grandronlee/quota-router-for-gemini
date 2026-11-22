@@ -40,6 +40,10 @@ SMART_ORDER = ("gemini-4-hydrogen", "gemini-3.6-flash", "gemini-3-flash-preview"
 # Passed the multi-step handoff probe with the placeholder signature (DESIGN §16.8 1a).
 HANDOFF_PASSED = ("gemini-3-flash-preview", "gemini-2.5-flash", "gemini-3.5-flash-lite",
                   "gemini-2.5-flash-lite")
+# gemini-auto's tiers (DESIGN §16.9.1), best first, from the same probed models.
+AUTO_TIERS = {"smart": ("gemini-4-hydrogen", "gemini-3.6-flash", "gemini-3-flash-preview",
+                        "gemini-2.5-flash"),
+              "fast": ("gemini-3.5-flash-lite", "gemini-2.5-flash-lite")}
 
 
 def read_key(environ=os.environ, env_file: Path = ROOT / ".env") -> str:
@@ -160,8 +164,23 @@ def render(models: list[dict], chosen: list[str]) -> str:
             if handoff
             else "           # models whose handoff probe passed (DESIGN §16.8)")
     lines += ["", f"handoff_targets: []{hint}",
-              "handoff_after_s: 60           # hand a tool turn off only if its model is blocked longer",
-              ""]
+              "handoff_after_s: 60           # hand a tool turn off only if its model is blocked longer"]
+    tiers = {t: [mid for mid in ms if mid in by_id] for t, ms in AUTO_TIERS.items()}
+    if all(tiers.values()):
+        lines += ["",
+                  "# One route that picks the tier for each turn (DESIGN §16.9). To use it, uncomment",
+                  "# these models above, fill in their limits, uncomment the block and set your timezone.",
+                  "# auto:",
+                  "#   name: gemini-auto",
+                  "#   tiers:                     # best first within each tier",
+                  *(f"#     {t}: [{', '.join(ms)}]" for t, ms in tiers.items()),
+                  "#   default_tier: fast",
+                  "#   pacing:",
+                  "#     tier: smart",
+                  "#     reserve: 5               # requests kept back, shrinking to 0 as the day's demand ends",
+                  '#     working_hours: "09:00-18:00"   # used until 7 days of demand are measured',
+                  f'#     timezone: "{FILL_ME}"           # your IANA time zone, e.g. "Europe/Paris"']
+    lines.append("")
     return "\n".join(lines)
 
 

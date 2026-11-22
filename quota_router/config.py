@@ -6,9 +6,11 @@ Any problem is a startup error (ConfigError). Secrets never live here.
 from __future__ import annotations
 
 import logging
+import re
 from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import urlsplit
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, PositiveInt, ValidationError, model_validator
@@ -61,6 +63,41 @@ class ModelConfig(_Strict):
     output_limit: PositiveInt
 
 
+_TIER_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z")
+_WORKING_HOURS = re.compile(r"^([01]\d|2[0-3]):([0-5]\d)-([01]\d|2[0-3]):([0-5]\d)$")
+
+
+def parse_working_hours(text: str) -> tuple[int, int]:
+    """`HH:MM-HH:MM` as (start, end) minutes after local midnight. The end may be earlier than
+    the start (the hours wrap past midnight), but not equal to it."""
+    m = _WORKING_HOURS.match(text)
+    if not m:
+        raise ValueError(f"working_hours {text!r} must be HH:MM-HH:MM (24-hour clock)")
+    start = int(m[1]) * 60 + int(m[2])
+    end = int(m[3]) * 60 + int(m[4])
+    if start == end:
+        raise ValueError(f"working_hours {text!r} must not start and end at the same time")
+    return start, end
+
+
+class PacingConfig(_Strict):
+    """Pacing of one tier (DESIGN §16.9.2)."""
+    tier: str
+    # Requests kept back for explicit use, shrinking to 0 as the day's demand ends.
+    reserve: int = Field(default=5, ge=0)
+    # Used until 7 days of demand are measured (DESIGN §16.9.3).
+    working_hours: str | None = None
+    timezone: str | None = None
+
+
+class AutoConfig(_Strict):
+    """The automatic route (DESIGN §16.9.1). `tiers` is best first within each tier."""
+    name: str = Field(min_length=1)
+    tiers: dict[str, list[str]]
+    default_tier: str
+    pacing: PacingConfig
+
+
 class Config(_Strict):
     upstream_base_url: str = "https://generativelanguage.googleapis.com/v1beta/openai/"
     # The API key goes to upstream_base_url. Anything other than Google over HTTPS needs this
@@ -86,6 +123,9 @@ class Config(_Strict):
     # List only models whose multi-step handoff probe passed (DESIGN §16.8 1a).
     handoff_targets: list[str] = Field(default_factory=list)
     handoff_after_s: float = Field(default=60, ge=0)
+    # The automatic route (DESIGN §16.9). After validation it is also in `routes`, its tiers
+    # in config order, so /v1/models, handoffs, /status and the dashboard see it as a route.
+    auto: AutoConfig | None = None
 
     @model_validator(mode="before")
     @classmethod
@@ -155,7 +195,75 @@ class Config(_Strict):
                 raise ValueError(f"route {route!r} uses unknown model(s): {', '.join(unknown)}")
             if len(set(members)) != len(members):
                 raise ValueError(f"route {route!r} lists a model twice")
+        if self.auto is not None:
+            self._check_auto(self.auto, ids)
+            object.__setattr__(self, "routes", {**self.routes, self.auto.name: [
+                k for members in self.auto.tiers.values() for k in members]})
         return self
+
+    def _check_auto(self, auto: AutoConfig, ids: dict[str, str]) -> None:
+        """DESIGN §16.9.1."""
+        if auto.name in self.routes:
+            raise ValueError(f"auto route {auto.name!r} has the same name as a route")
+        if auto.name in ids:
+            raise ValueError(f"auto route {auto.name!r} has the same name as a model ID")
+        if len(auto.tiers) < 2:
+            raise ValueError("auto needs at least two tiers")
+        seen: dict[str, str] = {}
+        for tier, members in auto.tiers.items():
+            # It goes into the x-route-tier header after the model has been called, so a name
+            # the header can't carry would fail a served request (found in review).
+            if not _TIER_NAME.match(tier):
+                raise ValueError(f"auto tier name {tier!r} must be letters, digits, '.', '_' or '-' "
+                                 "(ASCII, starting with a letter or digit): it is sent in the "
+                                 "x-route-tier header")
+            if not members:
+                raise ValueError(f"auto tier {tier!r} has no models")
+            unknown = [k for k in members if k not in self.models]
+            if unknown:
+                raise ValueError(f"auto tier {tier!r} uses unknown model(s): {', '.join(unknown)}")
+            for k in members:
+                if k in seen:
+                    raise ValueError(f"model {k!r} is in auto tiers {seen[k]!r} and {tier!r}; "
+                                     "a model may be in one tier only")
+                seen[k] = tier
+        if auto.default_tier not in auto.tiers:
+            raise ValueError(f"auto default_tier {auto.default_tier!r} is not a tier")
+        pacing = auto.pacing
+        if pacing.tier not in auto.tiers:
+            raise ValueError(f"auto pacing tier {pacing.tier!r} is not a tier")
+        if pacing.tier == auto.default_tier:
+            raise ValueError("auto pacing tier must differ from default_tier: turns are "
+                             "upgraded from the default tier to the paced one")
+        unpaced = [k for k in auto.tiers[pacing.tier] if self.models[k].rpd is None]
+        if unpaced:
+            raise ValueError(f"paced model(s) {', '.join(unpaced)} need a numeric rpd: a model "
+                             "without a daily limit can't be paced")
+        if pacing.working_hours is not None:
+            parse_working_hours(pacing.working_hours)
+            if not pacing.timezone:
+                raise ValueError("auto pacing working_hours needs a timezone (an IANA name)")
+        if pacing.timezone is not None:
+            try:
+                ZoneInfo(pacing.timezone)
+            except (ZoneInfoNotFoundError, ValueError):
+                raise ValueError(f"auto pacing timezone {pacing.timezone!r} is not a known "
+                                 "IANA time zone") from None
+
+    def tier_of(self, model_id: str) -> str | None:
+        """The auto tier of a model (by its real ID), or None."""
+        if self.auto is None:
+            return None
+        for tier, members in self.auto.tiers.items():
+            if any(self.models[k].id == model_id for k in members):
+                return tier
+        return None
+
+    def tier_models(self, first: str) -> list[ModelConfig]:
+        """Every auto tier's models, tier `first` first, then the others in config order."""
+        assert self.auto is not None
+        order = [first, *(t for t in self.auto.tiers if t != first)]
+        return [self.models[k] for t in order for k in self.auto.tiers[t]]
 
     def _check_upstream(self) -> None:
         url = self.upstream_base_url

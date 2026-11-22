@@ -363,6 +363,26 @@ class QuotaStore:
         st.soft_until = 0.0
         return True
 
+    def pool(self, models: Iterable[ModelConfig]) -> tuple[int, int]:
+        """(capacity, left) of a paced tier (DESIGN §16.9.2): capacity sums the enabled models'
+        RPD; left sums what each has left today, counting nothing for an exhausted one (Google's
+        count wins). Cooldowns and RPM waits don't lower `left`. Reads today's count from SQLite
+        at a new PT date, so it can raise sqlite3.Error."""
+        now = self._clock.now()
+        capacity = left = 0
+        for m in models:
+            if m.rpd is None or self._state[m.id].disabled:
+                continue
+            st = self._get(m, now)
+            capacity += m.rpd
+            if st.exhausted_until <= now:
+                left += max(0, m.rpd - st.rpd)
+        return capacity, left
+
+    @property
+    def conn(self) -> sqlite3.Connection:
+        return self._conn
+
     def disable(self, model: ModelConfig) -> None:
         self._state[model.id].disabled = True
 

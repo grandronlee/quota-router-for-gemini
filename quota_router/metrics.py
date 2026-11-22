@@ -32,6 +32,11 @@ HELP = {
                                                "(stored, none, too_large, invalid, conflict, evicted) "
                                                "or for calls sent without one (restored, placeholder); "
                                                "DESIGN §23.6."),
+    "qr_route_decisions_total": ("counter", "Routed gemini-auto requests by x-route-reason and "
+                                            "x-route-tier; DESIGN §16.9.5."),
+    "qr_pace_left": ("gauge", "Requests the paced tier has left today (exhausted models count 0)."),
+    "qr_pace_upgrade_above": ("gauge", "A gemini-auto turn is upgraded to the paced tier while "
+                                       "qr_pace_left is above this."),
     "qr_auth_failures_total": ("counter", "Requests rejected for a missing or wrong token."),
     "qr_state_errors_total": ("counter", "SQLite errors while reading or writing quota state."),
     "qr_tool_call_id_reused_total": ("counter", "Tool-call IDs recorded twice (DESIGN §20.6)."),
@@ -93,7 +98,7 @@ class Metrics:
             lines.append(f"# TYPE {name} {kind}")
 
         for name in ("qr_requests_total", "qr_upstream_attempts_total", "qr_tokens_total",
-                     "qr_handoff_total", "qr_thought_signatures_total"):
+                     "qr_handoff_total", "qr_thought_signatures_total", "qr_route_decisions_total"):
             head(name)
             for labels, v in sorted(self._counters.get(name, {}).items()):
                 lines.append(f"{name}{_labels(labels)} {_num(v)}")

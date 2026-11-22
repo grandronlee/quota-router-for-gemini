@@ -11,7 +11,7 @@ from apphelpers import (AUTH, Upstream, chat_body, chunk, make_proxy, mocked, ok
 from helpers import T0, FailingConn, pt
 from quota_router import db as dbmod
 from quota_router.clock import FakeClock
-from quota_router.db import SCHEMA, StateDBError, connect
+from quota_router.db import SCHEMA, SCHEMA_VERSION, StateDBError, connect
 
 COLS = ("turn_id, day, hour, route, first_model, last_model, reason, tools, input_tokens, "
         "output_tokens, steps, errors, handoffs, last_status")
@@ -56,14 +56,14 @@ def test_migration_from_version_1_keeps_affinity_and_adds_the_turn_log(tmp_path)
     path = tmp_path / "q.sqlite3"
     version_1_file(path)
     conn = connect(path)
-    assert conn.execute("PRAGMA user_version").fetchone()[0] == 3
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
     assert conn.execute("SELECT tool_call_id, model_id, turn_id FROM affinity ORDER BY tool_call_id"
                         ).fetchall() == [("old-1", "model-a", None), ("old-2", "model-b", None)]
     assert conn.execute("SELECT count FROM rpd").fetchone()[0] == 4
     assert conn.execute("SELECT COUNT(*) FROM turns").fetchone()[0] == 0
     conn.close()
     again = connect(path)  # a second start runs nothing
-    assert again.execute("PRAGMA user_version").fetchone()[0] == 3
+    assert again.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
     again.close()
 
 
@@ -283,7 +283,7 @@ def test_failed_migration_is_retried_at_the_next_start(tmp_path, monkeypatch):
             connect(path)
         monkeypatch.setitem(dbmod.MIGRATIONS, 1, good)
         conn = connect(path)
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 3, name
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION, name
         assert "turn_id" in [r[1] for r in conn.execute("PRAGMA table_info(affinity)")], name
         assert conn.execute("SELECT COUNT(*) FROM turns").fetchone()[0] == 0, name
         conn.close()

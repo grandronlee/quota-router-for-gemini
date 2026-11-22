@@ -950,7 +950,10 @@ auto:
 
 - A new top-level `auto:` block, not an entry under `routes:` as the §16.4 sketch had it.
   `routes` stays `name → [models]`, so existing configs and their validation don't change.
-- Validation: `name` must not match a route or a model ID. Tier members must be known model
+- Validation: `name` must not match a route or a model ID. A tier name is ASCII letters,
+  digits, `.`, `_` or `-`, because it is sent in the `x-route-tier` header after the model has
+  been called. (Found in review, 2026-11-22: a name like `智能` made a served request fail
+  with a 500.) Tier members must be known model
   keys, and no model may be in two tiers (a model may still be in other routes). There must be
   at least two tiers. `default_tier` and `pacing.tier` must name tiers and must differ. Every
   paced model needs a numeric `rpd`, because a model without a limit can't be paced.
@@ -1020,7 +1023,12 @@ taken from the first of these sources that applies:
   rows. If the query fails, the last curve is kept (the cold-start source if there is none
   yet), and the failure is logged and counted in `state_errors`.
 - DST: hours are PT wall-clock hours. On the spring-forward day the curve skips an hour. On the
-  fall-back day `share` is held at its highest value so far, so it never goes back down.
+  fall-back day the repeated hour (the second 01:xx) stays at the end of that hour, so `share`
+  never goes back down. Each source's share depends only on the time and the counts, not on
+  what it gave before, so it is the same after a restart. (Found in review, 2026-11-22: an
+  in-memory high-water mark was lost on a restart in the repeated hour, and the share fell
+  from 45.8% to 29.2%. It also held a cold-start value over a lower measured one after a
+  failed read.)
 - The curve uses timing only (date and hour), as the minimum-data rule requires (§16.5).
 
 #### 16.9.4 Candidate order
@@ -1049,13 +1057,17 @@ taken from the first of these sources that applies:
 - **Headers** on every `gemini-auto` response, errors included: `x-route-tier` (the turn's
   preferred tier; for a follow-up, its owner's tier) and `x-route-reason` (table above). The
   model that served it is still in `x-served-model`. Other routes don't get these headers.
+  A follow-up whose owner is in no tier (its turn began on another route) gets no
+  `x-route-tier`, a NULL `tier` and the metric label `tier="none"`, and its handoff targets
+  follow the route order (settled in review, 2026-11-22).
 - **Decision log:** migration 3→4 adds `tier TEXT` to `turns` (the preferred tier; NULL on other
   routes and on old rows). `reason` gains `default` and `pace-upgrade`, and `spill` keeps its
   meaning: served outside the preferred tier. Together, `tier` and `reason` tell an upgrade that
   spilled to fast apart from a fast turn that ran out.
 - **`/status`** gets an `auto` object: `capacity`, `left`, `share`, the share's `source`
   (`measured`, `working_hours` or `flat`), the `upgrade_above` threshold, and today's turn
-  starts by reason.
+  starts by reason (`turn_starts_today_by_reason`; rows a follow-up created are left out, as in
+  the demand curve).
 - **Metrics:** `qr_route_decisions_total{reason,tier}`, plus gauges `qr_pace_left` and
   `qr_pace_upgrade_above`. The dashboard gets a pace row. Labels stay low-cardinality.
 

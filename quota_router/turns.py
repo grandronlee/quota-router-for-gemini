@@ -23,7 +23,11 @@ from .clock import PT, Clock
 
 TURN_RETENTION_DAYS = 30
 
-TurnReason = Literal["first", "spill", "pinned", "handoff", "unknown"]
+# `default` and `pace-upgrade` are gemini-auto turn starts (DESIGN §16.9.5); `spill` is a turn
+# start served outside its preferred tier, or after the route's first model on other routes.
+TurnReason = Literal["first", "spill", "pinned", "handoff", "unknown", "default", "pace-upgrade"]
+# Rows that a follow-up created, not a turn start (the demand curve leaves them out, §16.9.3).
+FOLLOW_UP_REASONS = ("pinned", "handoff", "unknown")
 
 
 def new_turn_id() -> str:
@@ -39,6 +43,7 @@ class TurnRef:
     reason: TurnReason
     tools: int
     started_at: float
+    tier: str | None = None  # gemini-auto's preferred tier (the owner's, for a follow-up)
 
 
 def _pt(t: float) -> dt.datetime:
@@ -68,8 +73,8 @@ class TurnLog:
         step = served_model is not None
         self._conn.execute(
             "INSERT INTO turns (turn_id, day, hour, route, first_model, last_model, reason, tools, "
-            "input_tokens, output_tokens, steps, errors, handoffs, last_status) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+            "input_tokens, output_tokens, steps, errors, handoffs, last_status, tier) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
             "ON CONFLICT (turn_id) DO UPDATE SET "
             "first_model = COALESCE(turns.first_model, excluded.first_model), "
             "last_model = COALESCE(excluded.last_model, turns.last_model), "
@@ -81,7 +86,17 @@ class TurnLog:
             "last_status = excluded.last_status",
             (turn.turn_id, start.date().isoformat(), start.hour, route, served_model, served_model,
              turn.reason, turn.tools, prompt_tokens or 0, output_tokens or 0,
-             int(step), int(not step), int(handoff), status))
+             int(step), int(not step), int(handoff), status, turn.tier))
+
+    def starts_today_by_reason(self, route: str) -> dict[str, int]:
+        """Turn starts today (PT) on `route`, by reason, for /status (DESIGN §16.9.5). Rows a
+        follow-up created are left out, as in the demand curve (found in review)."""
+        day = _pt(self._clock.now()).date().isoformat()
+        excluded = ", ".join("?" for _ in FOLLOW_UP_REASONS)
+        rows = self._conn.execute("SELECT reason, COUNT(*) FROM turns WHERE day = ? AND route = ? "
+                                  f"AND reason NOT IN ({excluded}) GROUP BY reason ORDER BY reason",
+                                  (day, route, *FOLLOW_UP_REASONS))
+        return dict(rows.fetchall())
 
     def today_by_route(self) -> dict[str, int]:
         """Turns started today (PT) per route, for /status."""

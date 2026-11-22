@@ -234,6 +234,20 @@ as one pool, the demand curve read from the decision log, the measured curve aft
 8. Live check: one working day of Zoo Code on `gemini-auto`. Check the headers, see `/status`
    `left` fall with `share`, and see most of the smart pool used by the end of working hours.
 
+Done 2026-11-22: steps 1–7. Offline validation used `.venv/bin/python -m pytest -q` and
+`docker compose run --build --rm test` (566 passed in both), then `code-reviewer`. The review
+found no bugs. It raised one risk, which is now fixed with a regression test: the monotone share
+was held across a change of source, after a failed curve read. The no-tier owner case is now
+documented (DESIGN §16.9.5). A second review found three more problems, now fixed, each with a
+regression test that fails on the old code:
+- Tier names must be header-safe: a non-ASCII name made a served request a 500, after its quota
+  was used.
+- The measured share now depends only on the time, so a restart in the repeated fall-back hour
+  no longer lowers it. This replaces the in-memory high-water mark.
+- `/status` leaves follow-up rows out of today's turn starts.
+
+The dashboard line has not been checked visually. Step 8 is pending.
+
 Also after v1: alerts (DESIGN §17.2 layer 6), a remote-hosting design (DESIGN §18)
 if the proxy is to run somewhere other than the user's machine.
 

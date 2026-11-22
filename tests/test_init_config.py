@@ -127,6 +127,58 @@ def test_example_config_loads_with_the_probed_smart_route():
     assert ids(cfg.routes["gemini-fast"]) == ("gemini-3.5-flash-lite",)
 
 
+def uncomment_auto(text: str, timezone: str = "UTC") -> str:
+    """Uncomment the `# auto:` block (DESIGN §16.9.1) and set its timezone."""
+    out, inside = [], False
+    for line in text.splitlines():
+        if line == "# auto:":
+            inside = True
+        elif inside and not line.startswith("#  "):
+            inside = False
+        if inside:
+            line = line[2:]
+            if line.lstrip().startswith("timezone:"):
+                line = f'    timezone: "{timezone}"'
+        out.append(line)
+    return "\n".join(out)
+
+
+def test_offered_auto_route_loads_once_uncommented(tmp_path):
+    models = ic.generation_models([native(m) for m in ic.SMART_ORDER])
+    text = ic.render(models, list(ic.SMART_ORDER))  # every model enabled, so only the block is off
+    assert "#     smart: [gemini-4-hydrogen, gemini-3.6-flash, gemini-3-flash-preview, gemini-2.5-flash]" in text
+    assert "#     fast: [gemini-3.5-flash-lite, gemini-2.5-flash-lite]" in text
+    path = tmp_path / "config.yaml"
+    path.write_text(fill_limits(text))
+    assert load_config(path).auto is None
+    path.write_text(fill_limits(uncomment_auto(text, timezone=ic.FILL_ME)))
+    with pytest.raises(ConfigError, match="timezone 'FILL_ME' is not a known IANA"):
+        load_config(path)
+    path.write_text(fill_limits(uncomment_auto(text)))
+    cfg = load_config(path)
+    assert cfg.routes["gemini-auto"] == list(ic.AUTO_TIERS["smart"] + ic.AUTO_TIERS["fast"])
+
+
+def test_auto_route_is_offered_only_with_both_tiers():
+    text = ic.render(ic.generation_models([native("gemini-3.5-flash-lite")]), [])
+    assert "# auto:" not in text
+
+
+def test_example_config_auto_block_loads_once_uncommented(tmp_path):
+    example = (Path(__file__).resolve().parent.parent / "config.example.yaml").read_text()
+    assert load_config_text(tmp_path, example).auto is None
+    cfg = load_config_text(tmp_path, uncomment_auto(example, "America/New_York"))
+    ids = lambda keys: tuple(cfg.models[k].id for k in keys)  # noqa: E731
+    assert ids(cfg.auto.tiers["smart"]) == ic.AUTO_TIERS["smart"]
+    assert ids(cfg.auto.tiers["fast"]) == ic.AUTO_TIERS["fast"]
+
+
+def load_config_text(tmp_path, text):
+    path = tmp_path / "c.yaml"
+    path.write_text(text)
+    return load_config(path)
+
+
 def test_nothing_chosen_writes_only_comments_for_models(tmp_path):
     text = ic.render(ic.generation_models([native("gemini-a")]), [])
     assert "  # gemini-fast:" in text and "gemini-a: {" in text
