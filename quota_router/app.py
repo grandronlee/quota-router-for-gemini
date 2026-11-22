@@ -152,6 +152,29 @@ def attempt_outcome(result: UpstreamResult) -> str:
     return "error"
 
 
+LIMITS = frozenset({"rpm", "tpm", "rpd", "exhausted", "cooldown_429", "cooldown_5xx", "recovering",
+                    "upstream_429_rpm", "upstream_429_tpm", "upstream_429_rpd", "upstream_429_unknown"})
+
+
+def outcome_log_fields(outcome: Any, now: float) -> dict:
+    """The request log's route fields (DESIGN §24.1): gemini-auto's x-route-tier and
+    x-route-reason, and for a 429 or 503 the proxy produced, the Retry-After it sent and, per
+    candidate, its reason, limits (a fixed list; anything else is `other`) and seconds until
+    ready. Metadata only: never detail text."""
+    out: dict = {}
+    if getattr(outcome, "route_reason", None):
+        out["route_tier"] = outcome.route_tier
+        out["route_reason"] = outcome.route_reason
+    if isinstance(outcome, RouteFailed) and outcome.status in (429, 503):
+        out["retry_after_s"] = outcome.retry_after_s
+        out["blocked"] = [{
+            "model": c.model.id, "reason": c.reason,
+            "limits": list(dict.fromkeys(x if x in LIMITS else "other" for x in c.limits)),
+            "ready_in_s": None if c.ready_at is None else max(0, math.ceil(c.ready_at - now)),
+        } for c in outcome.candidates]
+    return out
+
+
 def model_state(snap: dict) -> str:
     if snap["disabled"]:
         return "disabled"
@@ -257,8 +280,11 @@ class Proxy:
                affinity: str | None = None, input_estimate: int | None = None,
                prompt_tokens: int | None = None, output_tokens: int | None = None,
                first_byte_s: float | None = None, http_path: str | None = None,
-               handoff_from: str | None = None, attempts: list[Attempt] | None = None) -> None:
-        """One request's metrics, /status counts and its JSON log line (DESIGN §17.2)."""
+               handoff_from: str | None = None, attempts: list[Attempt] | None = None,
+               outcome: Any = None) -> None:
+        """One request's metrics, /status counts and its JSON log line (DESIGN §17.2). With the
+        route `outcome`, the line also gets gemini-auto's route fields and, for a 429 or 503 the
+        proxy produced, its Retry-After and what blocked each candidate (DESIGN §24.1)."""
         now = self.clock.now()
         self.metrics.inc("qr_requests_total", route=route, status=bounded(status, STATUSES), reason=reason)
         self.stats.record(now, route, status, reason)
@@ -283,6 +309,8 @@ class Proxy:
             fields["path"] = http_path[:200]
         if handoff_from is not None:
             fields["handoff_from"] = handoff_from
+        if outcome is not None:
+            fields.update(outcome_log_fields(outcome, now))
         request_log.info("request", extra={"fields": fields})
 
     def note_turn(self, turn: TurnRef | None, *, route: str, status: int, served_model: str | None = None,
@@ -616,7 +644,7 @@ class StreamSession:
                       path=self.served.path, affinity=self.served.affinity,
                       input_estimate=self.input_estimate, prompt_tokens=self.prompt_tokens,
                       output_tokens=self.output_tokens, first_byte_s=self.first_byte_s,
-                      handoff_from=self.served.handoff_from, attempts=self.attempts)
+                      handoff_from=self.served.handoff_from, attempts=self.attempts, outcome=self.served)
 
 
 class ManagedStream(StreamingResponse):
@@ -1078,7 +1106,7 @@ def create_app(proxy: Proxy) -> FastAPI:
             reason = reason or "unavailable"
             p.record(request_id=request_id, route=route, status=outcome.status, reason=reason, stream=stream,
                      started=started, path=outcome.path, affinity=outcome.affinity, input_estimate=estimate,
-                     handoff_from=outcome.handoff_from, attempts=attempts)
+                     handoff_from=outcome.handoff_from, attempts=attempts, outcome=outcome)
             p.note_turn(outcome.turn, route=route, status=outcome.status, handoff_from=outcome.handoff_from)
             return JSONResponse(p.scrubber.obj(outcome.error_body()),
                                 status_code=outcome.status, headers=headers)
@@ -1104,7 +1132,7 @@ def create_app(proxy: Proxy) -> FastAPI:
             p.record(request_id=request_id, route=route, status=b.status, reason="passthrough", stream=stream,
                      started=started, served_model=outcome.model.id, path=outcome.path,
                      affinity=outcome.affinity, input_estimate=estimate, handoff_from=outcome.handoff_from,
-                     attempts=attempts)
+                     attempts=attempts, outcome=outcome)
             p.note_turn(outcome.turn, route=route, status=b.status, handoff_from=outcome.handoff_from)
             headers["content-type"] = b.content_type
             return Response(b.content, status_code=b.status, headers=headers)
@@ -1142,7 +1170,7 @@ def create_app(proxy: Proxy) -> FastAPI:
                  started=started, served_model=outcome.model.id, path=outcome.path,
                  affinity=outcome.affinity, input_estimate=estimate, prompt_tokens=prompt_tokens,
                  output_tokens=output_tokens, first_byte_s=first_byte, handoff_from=outcome.handoff_from,
-                 attempts=attempts)
+                 attempts=attempts, outcome=outcome)
         headers["content-type"] = b.content_type
         return Response(b.content, status_code=b.status, headers=headers)
 

@@ -84,6 +84,14 @@ class Blocked:
     # Only the soft part of a 5xx cooldown, or a recovery attempt in flight, keeps the model
     # out: the router may still try it in its last-resort pass (DESIGN §22.2).
     deferred: bool = False
+    # What blocks it, from a fixed list, for the request log (DESIGN §24.1): rpm, tpm, rpd,
+    # exhausted, cooldown_429, cooldown_5xx, recovering.
+    limits: tuple[str, ...] = ()
+
+
+# Blocked.detail parts → the request log's fixed limit names (DESIGN §24.1).
+_LIMIT_NAMES = {"exhausted": "exhausted", "429 cooldown": "cooldown_429", "rpm": "rpm",
+                "rpd": "rpd", "tpm": "tpm"}
 
 
 @dataclass
@@ -182,17 +190,24 @@ class QuotaStore:
         if hard:
             ready = max(ready, st.unavailable_cooldown_until)
 
+        limits = [_LIMIT_NAMES[q] for q in quota]
+        if hard or soft:
+            limits.append("cooldown_5xx")
+        elif recovering:
+            limits.append("recovering")
         if quota:
             # Kept with a quota reason too, so a failing owner still hands off (§16.8, §22.2).
-            return Blocked("quota", ready, ", ".join(quota), cooling_down=hard or soft or recovering)
+            return Blocked("quota", ready, ", ".join(quota), cooling_down=hard or soft or recovering,
+                           limits=tuple(limits))
         if hard:
-            return Blocked("unavailable", ready, "5xx cooldown", cooling_down=True)
+            return Blocked("unavailable", ready, "5xx cooldown", cooling_down=True, limits=tuple(limits))
         # Deferred models are ready now as a last resort, so they don't stretch Retry-After.
         if soft and not last_resort:
-            return Blocked("unavailable", now, "5xx cooldown, tried last", cooling_down=True, deferred=True)
+            return Blocked("unavailable", now, "5xx cooldown, tried last", cooling_down=True, deferred=True,
+                           limits=tuple(limits))
         if recovering:
             return Blocked("unavailable", now + RECOVERY_RETRY_S, "recovery attempt in flight",
-                           cooling_down=True, deferred=True)
+                           cooling_down=True, deferred=True, limits=tuple(limits))
         return None
 
     @staticmethod

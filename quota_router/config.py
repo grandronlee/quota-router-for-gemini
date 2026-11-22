@@ -61,6 +61,9 @@ class ModelConfig(_Strict):
     rpd: PositiveInt | None
     input_limit: PositiveInt
     output_limit: PositiveInt
+    # Optional wait for the first byte, instead of 120 s (DESIGN §24.2). A timed-out request
+    # keeps its RPD reservation, so set it only well above the model's real first-byte time.
+    first_byte_timeout_s: float | None = Field(default=None, ge=1, le=120)
 
 
 _TIER_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z")

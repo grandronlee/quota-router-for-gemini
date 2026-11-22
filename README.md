@@ -196,8 +196,12 @@ Whether the dashboard sign-in works through `tailscale serve` is checked in Phas
   restarts), since Gemini's thought signatures only work with the same model. The exception
   is a handoff (see Zoo Code above): the proxy then swaps the other model's signatures for
   the placeholder Google documents for history from a different model.
+- A model that hangs is waited on for up to 120 seconds before the next one is tried. A model
+  can set a shorter `first_byte_timeout_s`. A timed-out request still uses one of that model's
+  daily requests, so set it only well above the `first_byte_ms` of its successful answers.
 - Prompts and replies are never logged. Each request logs one JSON line with route, model,
-  status, token counts and timings. The first few rate-limit replies are saved, with keys
+  status, token counts and timings. A 429 or 503 from the proxy also logs its `retry_after_s`
+  and what blocked each model (`blocked`: `rpm`, `rpd`, a cooldown and so on). The first few rate-limit replies are saved, with keys
   removed, in `data/429/` so their format can be checked.
 
 ## Troubleshooting

@@ -170,6 +170,8 @@ class Candidate:
     # request's own 429 counts in full however long the bookkeeping after it took, and the
     # time the 429 took to arrive doesn't count at all.
     checked_at: float | None = None
+    # What blocked it, from a fixed list, for the request log (DESIGN §24.1); never free text.
+    limits: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -656,15 +658,17 @@ class Router:
                     c.reason, c.detail = "unavailable", "quota state error"
                     c.ready_at = self._clock.now() + STATE_ERROR_RETRY_S
                     c.unhealthy = True
+                    c.limits = ["other"]
                     return None
             if isinstance(res, Blocked):
                 c.reason, c.ready_at, c.detail = res.reason, res.ready_at, res.detail
                 c.unhealthy = res.cooling_down
+                c.limits = list(res.limits)
                 if res.deferred and not last_resort:
                     deferred.append((c, signed, tokens))
                 return None
             if res is None:  # eligible, but no attempts or time left
-                c.reason, c.ready_at = "not_tried", self._clock.now()
+                c.reason, c.ready_at, c.limits = "not_tried", self._clock.now(), []
                 return None
             try:  # from here on, the recovery slot `res` may hold is freed on every path
                 # The reservation's SQLite write can wait (up to 1 s): measure again, and give the
@@ -672,17 +676,23 @@ class Router:
                 left = deadline - self._clock.now()
                 if not (left > 0 if tried == 0 else left >= MIN_ATTEMPT_S):
                     self._safely(self._store.release, res)
-                    c.reason, c.ready_at = "not_tried", self._clock.now()
+                    c.reason, c.ready_at, c.limits = "not_tried", self._clock.now(), []
                     return _STOP if last_resort else None
 
                 tried += 1
                 path.append(model.id)
-                full_timeout = min(ATTEMPT_TIMEOUT_CAP_S, self._config.request_deadline_s)
+                # The model's own first-byte budget, if it has one (DESIGN §24.2): also the "full
+                # budget" a timeout must use to count, and what "cut short" is measured against.
+                cap = model.first_byte_timeout_s if model.first_byte_timeout_s is not None \
+                    else ATTEMPT_TIMEOUT_CAP_S
+                full_timeout = min(cap, self._config.request_deadline_s)
                 # The time left measured after reserving (> 0 here), so never zero or negative.
                 timeout = min(full_timeout, left)
                 # Clearly cut short by the request deadline, by an earlier attempt or a slow upload
-                # (the deadline counts from arrival, DESIGN §20.3): at least MIN_ATTEMPT_S less than usual.
-                shortened = timeout <= full_timeout - MIN_ATTEMPT_S
+                # (the deadline counts from arrival, DESIGN §20.3): at least MIN_ATTEMPT_S less than usual,
+                # or a quarter of a shorter per-model budget (§24.2; found in review: with a budget of
+                # 5 s or less, a 5 s margin could never apply).
+                shortened = timeout <= full_timeout - min(MIN_ATTEMPT_S, full_timeout / 4)
                 # Only a timeout with the whole usual budget counts towards the streak (§22.1).
                 full_budget = timeout >= full_timeout
                 attempt_started = self._clock.now()
@@ -724,6 +734,7 @@ class Router:
                 if cls.kind == "unknown":
                     log.warning("unrecognised 429 from %s; cooling down", model.id)
                 c.reason, c.detail = "quota", f"429 {cls.kind}"
+                c.limits = [f"upstream_429_{cls.kind}"]  # rpm, tpm, rpd or unknown (DESIGN §6)
                 # The cooldown runs from when the 429 is applied, so the handoff gate measures
                 # from here: a 429 that took 45 s to arrive with a 20 s delay is a 20 s wait,
                 # not 65 s (found in review). Read before applying it, so a 60 s cooldown still
@@ -736,7 +747,9 @@ class Router:
                 c.reason, c.detail = "unavailable", result.detail
                 c.unhealthy = True  # kept even if the merge below relabels it "quota"
                 # ...and the timeout is that budget running out, not an early network timeout.
-                ran_out = self._clock.now() - attempt_started >= timeout - 1.0
+                # A tolerance of 1 s, or a tenth of a shorter budget, so a small per-model budget
+                # isn't counted as used up halfway through (§24.2, found in review).
+                ran_out = self._clock.now() - attempt_started >= timeout - min(1.0, timeout / 10)
                 timed_out = result.detail == "timeout"
                 if result.not_sent:
                     # This machine's network, not the model: today's 30 s, no streak (DESIGN §22.1).
@@ -760,7 +773,7 @@ class Router:
                 log.error("model %s not found upstream; disabled until restart", model.id)
                 self._store.disable(model)
                 self._safely(self._store.refund_rpd, res)
-                c.reason = "disabled"
+                c.reason, c.limits = "disabled", []
                 return None
             else:
                 raise TypeError(f"unexpected upstream result: {result!r}")
@@ -771,8 +784,15 @@ class Router:
                 c.ready_at = now + STATE_ERROR_RETRY_S
                 # Unhealthy only after a 5xx; a 429 with an unreadable state stays a short wait.
                 c.unhealthy = c.reason == "unavailable"
+                c.limits.append("other")
                 return None
             c.ready_at = blocked.ready_at if blocked else now
+            # What holds it now, after this call's outcome was applied (DESIGN §24.1), replaces
+            # labels from before the call (a deferred model's `recovering`); only this call's own
+            # 429 kind is kept (found in review). Empty: nothing holds it, as after a timeout the
+            # deadline cut short.
+            c.limits = [*(x for x in c.limits if x.startswith("upstream_429_")),
+                        *(blocked.limits if blocked else ())]
             if blocked and blocked.reason == "quota" and c.reason == "unavailable":
                 c.reason, c.detail = "quota", f"{c.detail}; {blocked.detail}"
             return None
@@ -799,7 +819,7 @@ class Router:
             c = Candidate(model)
             results.append(c)
             if self._store.is_disabled(model):
-                c.reason = "disabled"
+                c.reason, c.limits = "disabled", []
                 continue
             if not fits(model, tokens, output_tokens):
                 c.reason = "too_large"
@@ -813,7 +833,7 @@ class Router:
         # A pinned owner comes first here, after its handoff targets have failed.
         for c, signed, tokens in deferred:
             if self._store.is_disabled(c.model):
-                c.reason = "disabled"
+                c.reason, c.limits = "disabled", []
                 continue
             out = await attempt(c, signed, tokens, last_resort=True)
             if out is _STOP:

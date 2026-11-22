@@ -30,7 +30,7 @@ their own status. Code and docs cite sections as "DESIGN §N".
 | 15 | [Clients](#15-clients) | core |
 | 16 | [After v1: automatic routing (`gemini-auto`)](#16-after-v1-automatic-routing-gemini-auto--proposed-pending-approval) | proposed; step 1 (§16.8) approved and implemented; step 2 (§16.9) approved |
 | 16.8 | ↳ [Step 1 in detail: `gemini-smart`, handoffs and the decision log](#168-step-1-in-detail-gemini-smart-handoffs-and-the-decision-log--approved-2026-11-21) |  |
-| 16.9 | ↳ [Step 2 in detail: `gemini-auto` with tiers, spill and pacing](#169-step-2-in-detail-gemini-auto-with-tiers-spill-and-pacing--approved-2026-11-22) | approved 2026-11-22 |
+| 16.9 | ↳ [Step 2 in detail: `gemini-auto` with tiers, spill and pacing](#169-step-2-in-detail-gemini-auto-with-tiers-spill-and-pacing--approved-2026-11-22) | approved 2026-11-22; amendment §16.9.8 deferred |
 | 17 | [Observability](#17-observability--layers-15-and-local-collection-approved-2026-11-21-21-alerts-and-remote-rows-proposed) | layers 1–5 approved; alerts and remote rows proposed |
 | 18 | [Hosting](#18-hosting--local-docker-and-tailscale-approved-2026-11-21-21-remote-hosting-proposed) | local Docker and Tailscale approved; remote hosting proposed |
 | 19 | [Other accounts and billing](#19-other-accounts-and-billing--approved-2026-11-21) | approved |
@@ -39,6 +39,7 @@ their own status. Code and docs cite sections as "DESIGN §N".
 | 22 | [Overloaded models: a growing 5xx cooldown](#22-overloaded-models-a-growing-5xx-cooldown--approved-2026-11-21-with-adjustments-implemented-2026-11-21) | approved with adjustments; implemented |
 | 23 | [Restoring thought signatures that clients drop](#23-restoring-thought-signatures-that-clients-drop--approved-2026-11-21-implemented-2026-11-21) | approved; implemented (amendments in §23.8) |
 | 23.8 | ↳ [After review](#238-after-review--fixes-settled-2026-11-22-amendments-approved-and-implemented-2026-11-22) |  |
+| 24 | [Request-log detail and a per-model first-byte timeout](#24-request-log-detail-and-a-per-model-first-byte-timeout--approved-2026-11-22) | approved 2026-11-22 |
 
 ## 0. v1 scope
 
@@ -1119,6 +1120,86 @@ taken from the first of these sources that applies:
 3. The measured curve is used once 7 PT days in the last 14 have turns (as in §16.5).
 4. `reserve: 5`, and a top-level `auto:` block in place of an entry under `routes:`.
 
+#### 16.9.8 Amendment: handing a turn back to its own tier — deferred 2026-11-22
+
+**Deferred** on team feedback (2026-11-22). The handoff policy stays as it is for now. All ten
+429s in the run below recovered when the client retried, and the proxy already sends
+`Retry-After`. First check, with §24.1's request-log fields, whether Zoo Code honors that
+hint. Moving turns more readily would trade some waiting for more model switches inside a tool
+turn. The proposal is kept below for when that check is done.
+
+**What the first live run showed (2026-11-22).** A Zoo Code Code-mode task on `gemini-auto` was
+decided `default` and started on 3.5 Flash Lite. At its fourth step, 3.5 Flash Lite and
+2.5 Flash Lite both answered 503 at once, so the turn was handed off to 3 Flash (§16.8). A
+handed-off turn is pinned to its new owner from then on (`mixed`, §5.1). 3 Flash therefore served
+the remaining 20 steps, although the Lite models had most likely recovered within 30 s. One fast
+turn used 20 of the day's 80 smart requests, a quarter of the pool. It also hit 3 Flash's 5 RPM
+ten times, and each time the client waited about 45 s for a 429's `Retry-After`. The task took
+about 3.5 minutes. §16.9.4 says a handoff doesn't check the pace again, which is what made this
+possible.
+
+**Change.** On `gemini-auto` only, a turn has a **home tier**: the tier of the model that made
+the oldest known tool call in its active turn. While the turn's current owner is outside that
+tier, its candidates are:
+
+1. the home tier's models that are in `handoff_targets`, in tier order;
+2. the current owner;
+3. the other handoff targets, as today (§16.9.4).
+
+- A home-tier model is tried first whenever it can take the request now. The `handoff_after_s`
+  gate (§16.8) doesn't apply to moving back, because the owner is not failing: the turn is
+  returning to the tier it was decided for. Skipping a home-tier model costs nothing, as usual,
+  so a Lite model still in its hard 30 s 5xx cooldown, or out of RPM room, is passed over and
+  the current owner serves the step. A model that is only in the soft part of its cooldown waits
+  for the last-resort pass, as today (§22.2), so a model that keeps failing isn't taken back early.
+- The model that takes the turn back is sent the body exactly as for a handoff (§16.8). Its own
+  earlier calls keep their real signatures, or get them back from the record (§23.4). The
+  current owner's calls get the placeholder. No new signature path is needed. Every model in
+  `handoff_targets` passed the probe with placeholders, and the source model doesn't matter
+  (§16.8 1b).
+- After it serves, the home-tier model owns the turn again, through the existing `mixed` rule
+  (pin to the latest call's model). If it fails again, the turn can be handed off again. Each
+  move happens only when a step needs it, so the turn can't switch back and forth on its own.
+- The same rule applies to an upgraded turn whose smart models all ran out and handed off to
+  fast. It returns to smart when a smart model can take it, so the decision still covers the
+  whole turn.
+- The home tier comes from the active turn's affinity records, which `_pin` already reads, so
+  nothing new is stored. If the oldest call's record was lost or expired, the oldest known one
+  is used. If none is known, the turn isn't pinned and is decided as a turn start (§16.9.4).
+  If the home tier's model is no longer configured, or is in no tier, nothing changes.
+- Other routes and direct model IDs don't change. On `gemini-smart`, a handed-off turn still
+  stays with its new owner (§16.8).
+
+**Visibility.** A response served by a home-tier model after a hand-back gets
+`x-route-reason: handback`, and `x-turn-affinity: handoff` and `x-handoff-from: <owner>` as for
+any handoff. `qr_handoff_total` counts it like any handoff, from the owner to the home-tier model.
+The decision log's `handoffs` counter counts it too. `ROUTE_REASONS` gains `handback`.
+
+**Failure paths.**
+- A failed affinity lookup gives `unknown`, as today.
+- A home-tier model that answers 429 or 5xx is recorded as usual, and the loop goes on to the
+  current owner in the same request. So a hand-back that fails costs at most one attempt out of
+  `max_attempts`, and no more quota than any failed attempt.
+- A 400 about a signature after a hand-back is returned unchanged and logged, as after any
+  handoff (§16.8). That model should then be removed from `handoff_targets`.
+
+**Cost.** No new requests. The hand-back spends the home tier's quota, for a turn that was
+decided for that tier, instead of the other tier's.
+
+**Tests.**
+- A default turn handed off to smart moves back to Lite once Lite can take a request.
+- It stays on the smart owner while Lite is in its hard cooldown or out of RPM room, and Lite in a
+  soft cooldown is tried only as a last resort.
+- An upgraded turn handed off to fast moves back to smart.
+- Calls of the model that took the turn back keep their signatures, and the owner's calls get the
+  placeholder.
+- The headers and counters on a hand-back.
+- No hand-back on `gemini-smart` or for a direct model ID.
+- If the oldest record is missing, the oldest known one decides.
+
+**Not in this amendment:** Zoo Code's task-title requests taking upgrades (a step 3 rule), and
+4 Hydrogen's timeouts (the §22 cooldown already handles them; watch it for a day).
+
 ## 17. Observability — layers 1–5 and local collection approved 2026-11-21 (§21); alerts and remote rows proposed
 
 ### 17.1 Principles
@@ -2127,3 +2208,82 @@ clients, so nothing changes in the design; the docs that said otherwise are corr
 It only matters if a model reuses a 64-bit ID within 24 h for a different call, which
 `qr_tool_call_id_reused_total` would show. It would cost a stored column and a hash per call.
 Reconsider if that counter ever goes above 0.
+
+## 24. Request-log detail and a per-model first-byte timeout — approved 2026-11-22
+
+Two changes from team feedback on the first `gemini-auto` live run (2026-11-22). The quick fix,
+3.6 Flash ahead of 4 Hydrogen in the live `gemini-auto` smart tier, is config only and is
+already applied. 4 Hydrogen caused both two-minute stalls in that run, timing out at 120 s,
+and 3.6 Flash then answered the same requests in 1.5–3.4 s.
+
+### 24.1 More detail in the request log
+
+The decision log (§16.8 1d) records where a turn started. The request log line (§17.2, §22.4)
+should also explain each request, so the proxy's `Retry-After` hint can be compared with when the
+client actually retried. Metadata only, as everywhere in the log (§10, §20.7).
+
+- **`route_tier`, `route_reason`:** the values sent as `x-route-tier` and `x-route-reason`
+  (§16.9.5), on `gemini-auto` requests only. They are left out on other routes, as `handoff_from` is.
+- **`retry_after_s`:** on a 429 or 503 the proxy produced (§5 step 5), the `Retry-After` it sent.
+  A 503 is included because its hint is built the same way.
+- **`blocked`:** on the same responses, one entry per candidate: `model`, `reason` (§5 step 5:
+  `quota`, `unavailable`, `not_tried`, `disabled`, `too_large`), `limits` and `ready_in_s`.
+  - `limits` is the limiting dimension, from a fixed list: `rpm`, `tpm`, `rpd`, `exhausted`
+    (a per-day 429), `cooldown_429`, `cooldown_5xx`, `recovering` (§22.2) and `upstream_429`
+    (it answered 429 on this request, with the kind from §6: `upstream_429_rpm` and so on).
+    A candidate can have several.
+  - `ready_in_s` is seconds until its `ready_at`, rounded up, or null.
+  - The values come from the router's existing `Candidate` result (`reason`, `ready_at`). Its
+    `detail` text is never logged.
+  - Settled in implementation (2026-11-22): `QuotaStore` gives the limits as fixed names
+    alongside its blocking reason (`Blocked.limits`), so no text has to be parsed. The router
+    adds `upstream_429_<kind>` after a 429, and uses `other` for an unreadable quota state.
+    Anything outside the list is logged as `other`.
+  - After a call, `limits` holds what blocks the model at that moment, plus that call's
+    `upstream_429_<kind>`. It can be empty, for example after a timeout the deadline cut short,
+    which sets no cooldown. A model disabled by a 404 has none (found in review, 2026-11-22).
+- Example (illustrative values) for one of the run's ten 429s on a turn pinned to 3 Flash:
+  `"retry_after_s": 45, "blocked": [{"model": "gemini-3-flash-preview", "reason": "quota",
+  "limits": ["rpm"], "ready_in_s": 45}]`. In the run, the client's next request on that turn
+  came 41–46 s after each 429. The hint itself wasn't logged, which is the gap this closes.
+- **Cost:** a few hundred bytes on error lines only. Served requests get just the two route
+  fields. No new metric: `qr_requests_total` already counts 429s, and the limits are
+  per-request detail, not series.
+
+### 24.2 An optional per-model first-byte timeout
+
+Today every attempt waits up to `min(120 s, request_deadline_s)` for the first byte (§9), on
+every model. A model that hangs costs the whole 120 s before the fallback can start.
+
+- Config: an optional `first_byte_timeout_s` on a model, between 1 and 120. Without it the model
+  keeps today's 120 s.
+- The attempt's timeout becomes `min(first_byte_timeout_s or 120, request_deadline_s, time
+  left)`, so the request deadline still bounds everything (§9).
+- §22.1 and §5.2 use this as the model's full budget: a timeout counts towards its failure streak
+  only if it used the model's own full timeout, and "cut short by the deadline" is measured
+  against that budget too. For a budget under 20 s, the 5 s margin of §5.2 becomes a quarter of
+  the budget, and the 1 s tolerance for "ran out" becomes a tenth. Otherwise a 3 s model cut to
+  2 s would get a 30 s cooldown (found in review, 2026-11-22).
+- **Caveat, in the README and the example config:** a timed-out request keeps its RPD
+  reservation, because Google may have counted it (§5 step 4). A timeout set below a model's
+  real first-byte time spends a request on every attempt and returns nothing. Set one only after
+  the log's `first_byte_ms` shows the model's successful answers arrive well under it. This
+  run had no successful 4 Hydrogen answer to compare with.
+- Nothing changes for models without the setting. After the quick fix, `gemini-auto` reaches
+  4 Hydrogen only after 3.6 Flash. So the setting matters mainly for `gemini-smart`, where
+  Hydrogen stays first.
+
+### 24.3 Tests
+
+- **24.1:**
+  - The route fields appear on `gemini-auto` lines and nowhere else.
+  - A 429 from an RPM-blocked pinned owner logs `retry_after_s` and a `blocked` entry with
+    `limits: ["rpm"]` and the matching `ready_in_s`.
+  - A 429 answered upstream logs its kind. A 503 logs `cooldown_5xx`.
+  - Unrecognised detail gives `other`. No message text appears.
+- **24.2:**
+  - The configured timeout bounds the attempt, and the fallback starts after it.
+  - The deadline still wins when less time is left.
+  - A timeout that used the model's own full budget grows the streak. One cut short by the
+    deadline doesn't.
+  - Values outside 1–120 are rejected. Models without the setting keep 120 s.

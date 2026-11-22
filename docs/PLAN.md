@@ -248,6 +248,26 @@ regression test that fails on the old code:
 
 The dashboard line has not been checked visually. Step 8 is pending.
 
+Live run 1 (2026-11-22), and what followed from it:
+- **The run:** 4 Hydrogen timed out at 120 s twice. A fast turn was handed off to 3 Flash after
+  both Lite models returned 503, and stayed there for 20 steps, with ten 429s from its 5 RPM.
+- **Config:** on team feedback, 3.6 Flash now goes before 4 Hydrogen in the live `gemini-auto`
+  smart tier. This is in the local config only.
+- **Handoff:** the hand-back amendment (DESIGN §16.9.8) is deferred until the logs show whether
+  Zoo Code honors `Retry-After`.
+
+Done 2026-11-22: DESIGN §24 (approved 2026-11-22):
+- **Request log:** route fields, plus `retry_after_s` and per-candidate `blocked` limits on the
+  proxy's 429s and 503s.
+- **Timeout:** an optional per-model `first_byte_timeout_s`.
+- **Validation:** `.venv/bin/python -m pytest -q` and `docker compose run --build --rm test`
+  (588 passed in both), then `code-reviewer`. The review found no bugs. Its fixes, each with a
+  regression test:
+  - A budget of 5 s or less cut short by the deadline is no longer cooled down.
+  - The "ran out" tolerance scales with the budget.
+  - Stale `limits` are cleared after a last-resort call or a 404.
+- **Still to do:** compare `retry_after_s` with Zoo Code's actual retry timing.
+
 Also after v1: alerts (DESIGN §17.2 layer 6), a remote-hosting design (DESIGN §18)
 if the proxy is to run somewhere other than the user's machine.
 

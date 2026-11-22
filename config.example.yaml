@@ -3,6 +3,9 @@
 #
 # rpm / tpm_input / rpd: leave a value empty (e.g. `rpd:`) only if AI Studio shows no limit;
 # the key itself must stay. input_limit / output_limit come from models.list.
+# first_byte_timeout_s (optional, 1-120, default 120): how long to wait for a model's first
+# byte before falling back (DESIGN §24.2). A timed-out request still uses one of the model's
+# daily requests, so set it only well above the first_byte_ms of its successful answers.
 
 upstream_base_url: https://generativelanguage.googleapis.com/v1beta/openai/
 custom_upstream: false        # the API key goes to upstream_base_url; true only for an endpoint you trust
