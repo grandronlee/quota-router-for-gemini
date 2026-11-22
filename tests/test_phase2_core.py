@@ -127,7 +127,7 @@ def test_scrubber():
 
 def test_new_and_phase1_databases_get_the_current_schema_version(tmp_path):
     fresh = connect(tmp_path / "new.sqlite3")
-    assert fresh.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION == 2
+    assert fresh.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION == 3
     fresh.close()
     old = sqlite3.connect(tmp_path / "old.sqlite3")
     old.executescript(SCHEMA)
@@ -135,7 +135,7 @@ def test_new_and_phase1_databases_get_the_current_schema_version(tmp_path):
     old.commit()
     old.close()
     conn = connect(tmp_path / "old.sqlite3")
-    assert conn.execute("PRAGMA user_version").fetchone()[0] == 2
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
     assert conn.execute("SELECT count FROM rpd").fetchone()[0] == 3
 
 

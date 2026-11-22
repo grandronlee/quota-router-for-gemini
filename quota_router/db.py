@@ -9,10 +9,14 @@ a damaged file or one from a newer version is a startup error (`StateDBError`).
 
 from __future__ import annotations
 
+import logging
+import os
 import sqlite3
 from pathlib import Path
 
-SCHEMA_VERSION = 2
+log = logging.getLogger("quota_router")
+
+SCHEMA_VERSION = 3
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS rpd (
@@ -59,6 +63,11 @@ MIGRATIONS: dict[int, list[str]] = {
         )""",
         "CREATE INDEX turns_day ON turns (day)",
     ],
+    # 2 -> 3: each tool call's thought-signature state (DESIGN §23.2). Rows from version 2
+    # keep NULL (not known), so their calls get the placeholder, as in a handoff before.
+    2: [
+        "ALTER TABLE affinity ADD COLUMN signature TEXT",
+    ],
 }
 
 _CHECK_ACCESS = ("Check its permissions and free disk space, and that no other proxy is using it.")
@@ -77,20 +86,72 @@ def connect(path: str | Path, *, check_same_thread: bool = True) -> sqlite3.Conn
     `check_same_thread=False` lets the app open the file before the event loop starts;
     it is still used only from that loop's thread.
     """
+    on_disk = str(path) != ":memory:"
     try:
-        if str(path) != ":memory:":
-            Path(path).parent.mkdir(parents=True, exist_ok=True)
+        if on_disk:
+            folder = Path(path).parent
+            created = not folder.exists()
+            folder.mkdir(mode=0o700, parents=True, exist_ok=True)
+            _folder_owner_only(folder, created)
+            # Created owner-only, so its content is never readable by others even briefly.
+            os.close(os.open(path, os.O_RDWR | os.O_CREAT, 0o600))
+            for f in _files(path):
+                _file_owner_only(f)
         # autocommit (explicit BEGIN where needed); a short lock wait, since a wait blocks the event loop
         conn = sqlite3.connect(str(path), isolation_level=None, timeout=1.0,
                                check_same_thread=check_same_thread)
+    except StateDBError:
+        raise
     except (OSError, sqlite3.Error) as e:
         raise StateDBError(f"cannot open state database {path}: {e}. " + _CHECK_ACCESS) from None
     try:
         _open(conn, path)
+        if on_disk:  # SQLite gives new -wal and -shm files the database's mode; check anyway
+            for f in _files(path):
+                _file_owner_only(f)
     except BaseException:
         conn.close()
         raise
     return conn
+
+
+# The database holds content-derived data (thought signatures, DESIGN §23.3, §23.8 amendment 3).
+DEFAULT_STATE_DIR = "data"
+
+
+def _files(path: str | Path) -> list[Path]:
+    """The database file and whichever of its -wal and -shm files exist."""
+    main = Path(path)
+    return [main] + [p for p in (Path(f"{path}-wal"), Path(f"{path}-shm")) if p.exists()]
+
+
+def _file_owner_only(path: Path) -> None:
+    """Make the file 0600 whatever the umask, or refuse to start: signatures must not be kept
+    in a file others can read."""
+    try:
+        os.chmod(path, 0o600)
+        mode = os.stat(path).st_mode & 0o777
+    except OSError as e:
+        raise StateDBError(f"cannot make state database file {path} owner-only (0600): "
+                           f"{e.strerror}. " + _CHECK_ACCESS) from None
+    if mode & 0o077:  # a filesystem that ignores chmod
+        raise StateDBError(f"state database file {path} stays readable by others (mode "
+                           f"{oct(mode)}) after chmod 0600; use a filesystem that keeps Unix "
+                           "permissions (DESIGN §20.10).")
+
+
+def _folder_owner_only(folder: Path, created: bool) -> None:
+    """Tighten the folder to 0700 only if it is the default data/ or connect() created it: a
+    custom db_path may sit in the working directory or a shared one. Elsewhere, warn if
+    others can read it; the 0600 file already protects the content."""
+    try:
+        if created or folder.resolve() == Path(DEFAULT_STATE_DIR).resolve():
+            os.chmod(folder, 0o700)
+        elif os.stat(folder).st_mode & 0o044:
+            log.warning("the state database's folder %s is readable by others; the database "
+                        "file itself is owner-only", folder)
+    except OSError as e:
+        log.warning("could not make %s owner-only: %s", folder, e.strerror)
 
 
 def _open(conn: sqlite3.Connection, path: str | Path) -> None:

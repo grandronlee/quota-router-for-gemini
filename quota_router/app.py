@@ -28,7 +28,7 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 from starlette.datastructures import Headers
 from starlette.requests import ClientDisconnect
 
-from .affinity import AffinityStore
+from .affinity import AffinityStore, signature_state
 from .classify import classify_429
 from .clock import Clock, SystemClock, next_pt_midnight
 from .config import PARSED_BASE_FACTOR, PARSED_OVERHEAD, PARSED_WIDTH_FACTOR, Config, ModelConfig
@@ -77,18 +77,57 @@ def usage_tokens(usage: Any) -> tuple[int | None, int | None]:
     return prompt, output
 
 
-def tool_call_ids(obj: Any, part: str) -> list[str]:
-    """IDs from choices[].<part>.tool_calls[].id, where part is "message" or "delta"."""
-    ids: list[str] = []
+def tool_call_parts(obj: Any, part: str) -> list[tuple[tuple[int, int], str | None, Any]]:
+    """Each call in choices[].<part>.tool_calls[] (part is "message" or "delta") as
+    ((choice index, tool_call index), ID or None, raw `extra_content.google.thought_signature`).
+    The indexes come from the `index` fields, else the positions: in a stream only a call's
+    first delta has to carry its ID (DESIGN §23.1)."""
+    out: list[tuple[tuple[int, int], str | None, Any]] = []
     choices = obj.get("choices") if isinstance(obj, dict) else None
-    for ch in choices if isinstance(choices, list) else []:
-        inner = ch.get(part) if isinstance(ch, dict) else None
+    for cn, ch in enumerate(choices if isinstance(choices, list) else []):
+        if not isinstance(ch, dict):
+            continue
+        ci = ch.get("index")
+        ci = ci if isinstance(ci, int) and not isinstance(ci, bool) else cn
+        inner = ch.get(part)
         calls = inner.get("tool_calls") if isinstance(inner, dict) else None
-        for tc in calls if isinstance(calls, list) else []:
-            tc_id = tc.get("id") if isinstance(tc, dict) else None
-            if isinstance(tc_id, str) and tc_id:
-                ids.append(tc_id)
-    return ids
+        for tn, tc in enumerate(calls if isinstance(calls, list) else []):
+            if not isinstance(tc, dict):
+                continue
+            ti = tc.get("index")
+            ti = ti if isinstance(ti, int) and not isinstance(ti, bool) else tn
+            tc_id = tc.get("id")
+            extra = tc.get("extra_content")
+            google = extra.get("google") if isinstance(extra, dict) else None
+            raw = google.get("thought_signature") if isinstance(google, dict) else None
+            out.append(((ci, ti), tc_id if isinstance(tc_id, str) and tc_id else None, raw))
+    return out
+
+
+def message_signatures(obj: Any) -> tuple[list[str], dict[str, str | None], list[str]]:
+    """A non-streamed response's tool calls (DESIGN §23.1): their IDs, each ID's signature
+    state to store, and the capture actions that store nothing (too_large, invalid,
+    conflict), one per call. A call with no signature is "" (the response had none)."""
+    ids: list[str] = []
+    states: dict[str, str | None] = {}
+    dropped: list[str] = []
+    bad: set[str] = set()
+    for _, tc_id, raw in tool_call_parts(obj, "message"):
+        if tc_id is None:
+            continue
+        state, action = signature_state(raw)
+        if tc_id not in states:
+            ids.append(tc_id)
+            states[tc_id] = state
+            if state is None:
+                bad.add(tc_id)
+                dropped.append(action)
+        elif tc_id not in bad and state != states[tc_id]:
+            # One ID twice in one response with different signatures: not resolvable.
+            states[tc_id] = None
+            bad.add(tc_id)
+            dropped.append(action if state is None else "conflict")
+    return ids, states, dropped
 
 
 def attempt_outcome(result: UpstreamResult) -> str:
@@ -140,6 +179,8 @@ class Proxy:
         self.router = Router(config, self.store, self.affinity, self.clock)
         self.router.on_handoff = lambda src, dst, result: self.metrics.inc(
             "qr_handoff_total", **{"from": src, "to": dst, "result": result})
+        self.router.on_signature = lambda model, action, n: self.metrics.inc(
+            "qr_thought_signatures_total", n, model=model, action=action)
         self.scrubber = Scrubber([settings.gemini_api_key, settings.proxy_token])
         self.metrics = Metrics()
         self.stats = RequestStats(self.clock.now())
@@ -171,6 +212,8 @@ class Proxy:
                               for e in reversed(self.stats.recent)],
             "turns_today": self._turns_today(),
             "state_errors": self.router.state_errors,
+            # Capture and restore counts since start (DESIGN §23.6); never values.
+            "signatures": dict(self.router.signatures),
         }
 
     def _turns_today(self) -> dict[str, int] | None:
@@ -327,6 +370,27 @@ class Guard:
         await self.app(scope, receive, send)
 
 
+class _StreamCall:
+    """One streamed tool call's signature as its deltas arrive (DESIGN §23.1). Matched by
+    (choice index, tool_call index), since only a call's first delta has to carry its ID."""
+
+    __slots__ = ("id", "value", "bad", "recorded_at", "settled")
+
+    def __init__(self) -> None:
+        self.id: str | None = None
+        self.value: str | None = None  # the valid signature seen
+        self.bad: str | None = None  # too_large, invalid or conflict: stays unknown (NULL)
+        # created_at of the unknown (NULL) record complete() wrote: its write generation.
+        # None: not recorded (no ID yet, or the record failed).
+        self.recorded_at: float | None = None
+        self.settled = False
+
+    @property
+    def state(self) -> str | None:
+        """What is known now: the signature, or None (unknown)."""
+        return None if self.bad else self.value
+
+
 class StreamSession:
     """Forwards one served stream and settles it exactly once (DESIGN §8, §20.5)."""
 
@@ -347,6 +411,8 @@ class StreamSession:
         self.finished = False
         self.seen_ids: set[str] = set()
         self.pending_ids: list[str] = []
+        self.calls: dict[tuple[int, int], _StreamCall] = {}  # by (choice, tool_call) index
+        self.calls_by_id: dict[str, _StreamCall] = {}
         self.prompt_tokens: int | None = None
         self.output_tokens: int | None = None
         self.first_byte_s: float | None = None
@@ -363,17 +429,80 @@ class StreamSession:
             self.p.note_turn(self.served.turn, route=self.route, status=200,
                              served_model=self.served.model.id, prompt_tokens=self.prompt_tokens,
                              output_tokens=self.output_tokens, handoff_from=self.served.handoff_from)
-        self.p.router.complete(self.served, prompt_tokens, ids or None)
+        # Every call is recorded as unknown (NULL): a value is written only once the stream
+        # ends with [DONE] (DESIGN §23.8 amendment 1), and counted then.
+        recorded = self.p.router.complete(self.served, prompt_tokens, ids or None, None, count=False)
+        if recorded is not None and recorded.at is not None:
+            for i in ids:
+                call = self.calls_by_id[i]
+                if call.recorded_at is None:
+                    call.recorded_at = recorded.at
         self.settled = True
 
     def _complete_if_needed(self) -> None:
         """Before the last bytes of any ending (router contract): settle with the estimate
-        if usage never came, and record tool-call IDs still pending."""
+        if usage never came, record tool-call IDs still pending, then settle their signatures."""
         if not self.settled or self.pending_ids:
             self._complete(None)
+        self._settle_signatures()
+
+    def _track(self, key: tuple[int, int], tc_id: str | None) -> _StreamCall:
+        call = self.calls.get(key)
+        if call is None or (tc_id is not None and call.id is not None and call.id != tc_id):
+            call = self.calls[key] = _StreamCall()  # a new call at this index
+        if tc_id is not None and call.id is None:
+            first = self.calls_by_id.get(tc_id)
+            if first is None:
+                call.id = tc_id
+                self.calls_by_id[tc_id] = call
+            else:
+                # One ID at a second index: one call, so two different signatures for it are a
+                # conflict (NULL), as in a non-streamed response (DESIGN §23.1).
+                if call.bad and not first.bad:
+                    first.bad = call.bad  # already counted
+                elif call.value is not None:
+                    self._see_signature(first, call.value)
+                call = self.calls[key] = first
+        return call
+
+    def _see_signature(self, call: _StreamCall, raw: Any) -> None:
+        state, action = signature_state(raw)
+        if action == "none" or call.bad:
+            return
+        if state is None:
+            call.bad = action  # too_large or invalid: never cut short, never stored
+        elif call.value is None:
+            call.value = state
+            return
+        elif call.value == state:
+            return  # the same value repeated is fine
+        else:
+            call.bad = "conflict"  # two values: not resolvable, so the placeholder
+        self.p.router.note_signatures(self.served.model.id, call.bad)
+
+    def _settle_signatures(self) -> None:
+        """The settling write (DESIGN §23.1, §23.8 amendment 1). Only a stream that ended with
+        [DONE] shows which calls carry no signature: then every recorded call gets its
+        signature, or "" if none came. Any other ending (error event, cut-off, disconnect)
+        leaves its calls unknown (NULL), so they get the placeholder. A call with a conflicting
+        or unstorable value stays unknown either way. One write, run once."""
+        updates: list[tuple[str, str | None, str | None, float]] = []
+        for tc_id, call in self.calls_by_id.items():
+            if call.recorded_at is None or call.settled:
+                continue
+            call.settled = True
+            if self.done and not call.bad:
+                updates.append((tc_id, call.value or "", None, call.recorded_at))
+        if updates:
+            self.p.router.settle_signatures(self.served, updates)  # never raises; counts what it writes
+
+    @property
+    def _scrub(self):
+        """The proxy's secrets plus the signatures restored into this call (DESIGN §23.8)."""
+        return self.stream.scrubber or self.p.scrubber
 
     def _error_event(self, message: str) -> bytes:
-        err = {"error": {"message": self.p.scrubber.text(message), "type": "upstream_error",
+        err = {"error": {"message": self._scrub.text(message), "type": "upstream_error",
                          "code": "stream_error", "param": None}}
         return b"data: " + json.dumps(err).encode("utf-8") + b"\n\n"
 
@@ -384,7 +513,7 @@ class StreamSession:
         raw = (ev.data or "").encode("utf-8")
         if kind == "rate_limited" and self.p.captures:
             try:
-                self.p.captures.save(self.served.model.id, 429, {}, raw)
+                self.p.captures.save(self.served.model.id, 429, {}, raw, self._scrub)
             except Exception:  # a capture must never stop the error event reaching the client
                 log.exception("could not save a mid-stream 429 capture")
         self.p.router.stream_error(self.served, kind, raw, code)  # never raises
@@ -392,8 +521,8 @@ class StreamSession:
     def _handle(self, ev: SSEEvent) -> tuple[bytes | None, bool]:
         """Process one upstream event; returns (bytes to send, stop)."""
         if ev.is_done:
+            self.done = True  # a clean end: the settling write may store "" (DESIGN §23.8)
             self._complete_if_needed()  # before [DONE] reaches the client (router contract)
-            self.done = True
             self.outcome = ("stream_complete", self.status)
             self.p.router.stream_done(self.served)  # the model recovered (DESIGN §22.1); never raises
             return ev.raw, True
@@ -402,12 +531,15 @@ class StreamSession:
             self.reason = "stream_error"
             self._complete_if_needed()
             self._record_stream_error(err, ev)
-            payload = self.p.scrubber.obj({"error": err})
-            return b"data: " + self.p.scrubber.text(json.dumps(payload)).encode("utf-8") + b"\n\n", True
+            payload = self._scrub.obj({"error": err})
+            return b"data: " + self._scrub.text(json.dumps(payload)).encode("utf-8") + b"\n\n", True
         obj = ev.json()
         if isinstance(obj, dict):
-            for i in tool_call_ids(obj, "delta"):
-                if i not in self.seen_ids:
+            for key, i, raw in tool_call_parts(obj, "delta"):
+                call = self._track(key, i)
+                if raw is not None:
+                    self._see_signature(call, raw)
+                if i is not None and i not in self.seen_ids:
                     self.seen_ids.add(i)
                     self.pending_ids.append(i)
             usage = obj.get("usage")
@@ -928,11 +1060,17 @@ def create_app(proxy: Proxy) -> FastAPI:
             if outcome.rewritten and b.status == 400:
                 # Likely a placeholder signature the model won't accept (DESIGN §16.8): returned
                 # unchanged, never retried elsewhere. The fix is to remove it from handoff_targets.
-                log.error("HTTP 400 from %s on a tool turn sent with placeholder signatures (%s); "
-                          "if it is about a thought signature, remove %s from handoff_targets",
+                log.error("HTTP 400 from %s on a tool turn sent with placeholder signatures for "
+                          "another model's calls (%s; restored %d, placeholder %d); if it is about "
+                          "a thought signature, remove %s from handoff_targets",
                           outcome.model.id,
                           f"handed off from {outcome.handoff_from}" if outcome.handoff_from
-                          else "mixed turn", outcome.model.key)
+                          else "mixed turn", outcome.restored, outcome.placeholder, outcome.model.key)
+            elif (outcome.restored or outcome.placeholder) and b.status == 400:
+                # Returned unchanged and never retried elsewhere (DESIGN §5.1, §23.4). Counts only.
+                log.error("HTTP 400 from %s on a tool turn sent with restored or placeholder "
+                          "signatures (restored %d, placeholder %d)", outcome.model.id,
+                          outcome.restored, outcome.placeholder)
             p.record(request_id=request_id, route=route, status=b.status, reason="passthrough", stream=stream,
                      started=started, served_model=outcome.model.id, path=outcome.path,
                      affinity=outcome.affinity, input_estimate=estimate, handoff_from=outcome.handoff_from,
@@ -954,17 +1092,21 @@ def create_app(proxy: Proxy) -> FastAPI:
         b = payload
         prompt_tokens = output_tokens = None
         ids: list[str] = []
+        states: dict[str, str | None] = {}
         try:
             obj = json.loads(b.content)
         except (ValueError, RecursionError):
             obj = None
         if isinstance(obj, dict):
             prompt_tokens, output_tokens = usage_tokens(obj.get("usage"))
-            ids = tool_call_ids(obj, "message")
+            ids, states, dropped = message_signatures(obj)  # read with the IDs (DESIGN §23.1)
+            for action in dropped:
+                p.router.note_signatures(outcome.model.id, action)
         # The turn row before the tool calls that let a follow-up find it (DESIGN §16.8 1d).
         p.note_turn(outcome.turn, route=route, status=b.status, served_model=outcome.model.id,
                     prompt_tokens=prompt_tokens, output_tokens=output_tokens, handoff_from=outcome.handoff_from)
-        p.router.complete(outcome, prompt_tokens, ids or None)  # before the response is returned
+        # Before the response is returned; the signatures go in the same transaction.
+        p.router.complete(outcome, prompt_tokens, ids or None, states)
         first_byte = time.monotonic() - started
         p.record(request_id=request_id, route=route, status=b.status, reason="served", stream=stream,
                  started=started, served_model=outcome.model.id, path=outcome.path,

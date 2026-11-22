@@ -12,7 +12,8 @@ from helpers import Env, ScriptedUpstream, chat, make_config, model_dict
 from quota_router.classify import Classification
 from quota_router.config import ConfigError
 from quota_router.router import (PLACEHOLDER_SIGNATURE, Rejected, RouteFailed, RoutePassthrough,
-                                 RouteServed, Unavailable, with_placeholder_signatures)
+                                 RouteServed, Unavailable, with_signatures)
+from quota_router.affinity import AffinityRecord
 
 def call(i: str, sig: str | None = "REAL-SIG", **extra) -> dict:
     tc = {"id": i, "type": "function", "function": {"name": "read_file", "arguments": "{}"}}
@@ -28,6 +29,15 @@ def turn(*steps: list[dict], prefix: list[dict] | None = None) -> list[dict]:
         msgs += [{"role": "tool", "tool_call_id": c["id"], "content": "ok"} for c in calls]
         msgs.append({"role": "user", "content": "<environment_details>"})  # Zoo Code's shape
     return msgs
+
+
+def recs(owners: dict[str, str]) -> dict[str, AffinityRecord]:
+    return {i: AffinityRecord(m, None) for i, m in owners.items()}
+
+
+def placeholdered(req, serving: str, owners: dict[str, str]):
+    """The §16.8 rewrite: a handoff target or a mixed turn's latest owner."""
+    return with_signatures(req, serving, recs(owners), foreign=True).body
 
 
 def sigs(body: dict) -> dict[str, str | None]:
@@ -370,7 +380,7 @@ def test_rewrite_touches_only_the_active_turn_and_keeps_other_fields():
     req = {"model": "fast", "messages": turn([call("s1", other=1), call("s2", None), call("b1", "B")],
                                              prefix=old_turn)}
     before = copy.deepcopy(req)
-    out = with_placeholder_signatures(req, "model-b", {"s1": "model-a", "b1": "model-b"})
+    out = placeholdered(req, "model-b", {"s1": "model-a", "b1": "model-b"})
     assert req == before
     assert sigs(out) == {"old": "REAL-SIG", "s1": PLACEHOLDER_SIGNATURE, "s2": PLACEHOLDER_SIGNATURE, "b1": "B"}
     s1 = next(tc for m in out["messages"] for tc in m.get("tool_calls") or [] if tc["id"] == "s1")
@@ -380,9 +390,9 @@ def test_rewrite_touches_only_the_active_turn_and_keeps_other_fields():
 
 def test_rewrite_returns_the_same_object_when_nothing_changes():
     req = {"model": "fast", "messages": turn([call("s1", PLACEHOLDER_SIGNATURE)])}
-    assert with_placeholder_signatures(req, "model-b", {"s1": "model-a"}) is req
+    assert placeholdered(req, "model-b", {"s1": "model-a"}) is req
     req2 = {"model": "fast", "messages": turn([call("b1", "B")])}
-    assert with_placeholder_signatures(req2, "model-b", {"b1": "model-b"}) is req2
+    assert placeholdered(req2, "model-b", {"b1": "model-b"}) is req2
 
 
 def test_rewrite_tolerates_odd_shapes():
@@ -391,12 +401,12 @@ def test_rewrite_tolerates_odd_shapes():
         {"role": "assistant", "tool_calls": ["not-a-dict", {"id": 5}, {"type": "function"}]},
         {"role": "assistant", "tool_calls": [{"id": "s1", "extra_content": "junk"}]},
         "garbage"]}
-    out = with_placeholder_signatures(odd, "model-b", {})
+    out = placeholdered(odd, "model-b", {})
     calls = [tc for m in out["messages"] if isinstance(m, dict) for tc in m.get("tool_calls") or []]
     assert calls[0] == "not-a-dict"
     assert all(tc["extra_content"]["google"]["thought_signature"] == PLACEHOLDER_SIGNATURE
                for tc in calls[1:])
-    assert with_placeholder_signatures({"messages": "nope"}, "m", {}) == {"messages": "nope"}
+    assert placeholdered({"messages": "nope"}, "m", {}) == {"messages": "nope"}
 
 
 # ---- config ------------------------------------------------------------------------

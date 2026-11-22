@@ -13,9 +13,18 @@ _CONSUMER = re.compile(r"(\"consumer\"\s*:\s*\")[^\"]+")
 
 
 class Scrubber:
-    def __init__(self, secrets: Iterable[str]) -> None:
-        # Longest first, so a secret that contains another is removed whole.
-        self._secrets = sorted({s for s in secrets if s and len(s) >= 8}, key=len, reverse=True)
+    def __init__(self, secrets: Iterable[str], extra: Iterable[str] = ()) -> None:
+        # Longest first, so a secret that contains another is removed whole. `extra` values
+        # are scrubbed whatever their length (restored signatures, see with_extra).
+        kept = {s for s in secrets if s and len(s) >= 8} | {v for v in extra if v}
+        self._secrets = sorted(kept, key=len, reverse=True)
+
+    def with_extra(self, values: Iterable[str]) -> "Scrubber":
+        """This scrubber plus `values`, for one upstream call: the thought signatures the
+        proxy restored into its body (DESIGN §23.8 amendment 2), at any length (found in
+        review: a short stored value went unscrubbed). Returns self when none."""
+        extra = [v for v in values if v]
+        return Scrubber(self._secrets, extra) if extra else self
 
     def text(self, s: str) -> str:
         for secret in self._secrets:

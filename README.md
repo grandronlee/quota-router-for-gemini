@@ -86,7 +86,9 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 ```
 
 It reads `.env` and `config.yaml` from the current folder and keeps state in `data/`. In WSL,
-keep `data/` on the Linux filesystem: SQLite's locking isn't reliable under `/mnt/c`.
+keep `data/` on the Linux filesystem: SQLite's locking isn't reliable under `/mnt/c`. The
+proxy also refuses to start if it can't make its database file owner-only (`0600`), which
+happens on filesystems that ignore Unix permissions, such as `/mnt/c` and some network mounts.
 
 ## Clients
 
@@ -105,7 +107,8 @@ and your `PROXY_TOKEN` as the API key. Set the context window to about **200000*
 5. Pick a profile in each mode (Zoo Code remembers the profile last used in each one):
    Architect, Debug and Orchestrator on `gemini-smart`; Code and Ask on `gemini-fast`.
 
-Zoo Code 3.98.0 keeps Gemini's thought signatures across tool calls, which tool loops need.
+Tool loops need Gemini's thought signatures. Zoo Code 3.98.0 doesn't always send them back
+(seen in a live check, 2026-11-22); the proxy restores them, as for Copilot.
 Both profiles were checked live. For `gemini-smart` that was one read-only Architect task with
 a forced handoff from 3 Flash to 2.5 Flash; the later tool turns stayed on 2.5 Flash with no
 error ([probe results](docs/probe-results.md)). Debug and Orchestrator modes weren't tried.
@@ -128,8 +131,12 @@ Provider **OpenAI Compatible**, same base URL and key. Plan mode `gemini-smart` 
 **Chat Completions**, URL `http://localhost:4000/v1`, key `PROXY_TOKEN`, model `gemini-fast`.
 Turn on tool calling for it (otherwise it doesn't appear in agent mode) and set max input
 tokens to about 200000. Inline completions keep using Copilot's own model. Business and
-Enterprise plans need the "Bring Your Own Language Model Key in VS Code" policy. Not tested
-yet; Copilot comes after v1 ([DESIGN §15](docs/DESIGN.md#15-clients)).
+Enterprise plans need the "Bring Your Own Language Model Key in VS Code" policy.
+Copilot drops the thought signatures from the tool calls it sends back, which Gemini 3 and
+later reject. The proxy stores each signature when the response passes through and puts it
+back on the follow-up ([DESIGN §15](docs/DESIGN.md#15-clients), §23). Checked live in agent
+mode on `gemini-smart` (2026-11-22): the tool turn's follow-up got its signature back and
+returned 200.
 
 ## Watching it
 

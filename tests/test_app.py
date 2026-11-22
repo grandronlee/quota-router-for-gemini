@@ -12,7 +12,7 @@ from apphelpers import (AUTH, KEY, TOKEN, Chunks, Upstream, captured_logs, chat_
                         error_body, make_proxy, mocked, ok, rate_limited, running, sse, streamed, unavailable)
 from helpers import model_dict
 from quota_router.metrics import OUTCOMES, REASONS, STATES, STATUSES
-from quota_router.router import RouteServed
+from quota_router.router import SIGNATURE_ACTIONS, RouteServed
 
 
 def post(client, body, headers=None, **kw):
@@ -389,7 +389,7 @@ def test_logs_and_metrics_hold_no_content_and_bounded_labels():
     allowed = {"route": {"fast", "only-b", "unknown", "model-a", "model-b"},
                "model": {"model-a", "model-b"}, "status": set(STATUSES) | {"other"},
                "reason": set(REASONS), "outcome": set(OUTCOMES), "state": set(STATES),
-               "kind": {"input", "output"}, "le": None}
+               "kind": {"input", "output"}, "action": set(SIGNATURE_ACTIONS), "le": None}
     for name, value in re.findall(r'(\w+)="([^"]*)"', metrics):
         assert name in allowed, name
         if allowed[name] is not None:

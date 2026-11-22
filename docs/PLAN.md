@@ -192,9 +192,12 @@ Partial evidence (2026-11-21, during the first Copilot Chat live test on `gemini
 120 s timeout. `attempts` told the two apart, both counted, and the cooldown held it at streak 2
 (2 min). Still open: seeing later requests skip it during the cooldown and its recovery.
 
-Approved 2026-11-21, not yet implemented: restoring thought signatures that clients drop
-(DESIGN §23), found in the first Copilot Chat live test (every `gemini-smart` tool turn got a
-400 for a missing signature). In order:
+Done 2026-11-22 (steps 1–7): restoring thought signatures
+that clients drop (DESIGN §23, approved 2026-11-21), found in the first Copilot Chat live test
+(every `gemini-smart` tool turn got a 400 for a missing signature). Offline validation used
+`.venv/bin/python -m pytest -q` and `docker compose run --build --rm test`, then
+`code-reviewer-deep`. The review fixes and three amendments (DESIGN §23.8, approved 2026-11-22)
+are implemented too. In order:
 
 1. Schema migration 2→3 (`affinity.signature`), the limits (16,384 characters each, 16 MiB in
    total), database file `0600`.
@@ -208,7 +211,8 @@ Approved 2026-11-21, not yet implemented: restoring thought signatures that clie
 6. Validation: `.venv/bin/python -m pytest -q`, `docker compose run --build --rm test`, then
    `code-reviewer-deep` (two-step stream write, ID reuse).
 7. Live check: the Copilot agent-mode request on `gemini-smart` from DESIGN §23.7, then a short
-   Zoo Code task. Results go into probe-results.md.
+   Zoo Code task. Results go into probe-results.md. Done 2026-11-22: both passed with no 400;
+   Zoo Code also had a signature restored, so it doesn't always keep them (DESIGN §23.8).
 
 Also after v1: alerts (DESIGN §17.2 layer 6), a remote-hosting design (DESIGN §18)
 if the proxy is to run somewhere other than the user's machine.

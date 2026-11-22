@@ -4,6 +4,41 @@ Status: **revision 2, approved 2026-11-20** (after the first Phase 0 probe run a
 external reviews). Phase 1 (core logic, no HTTP) is implemented in `quota_router/`.
 Project name: `quota-router-for-gemini`. License: MIT.
 
+## Contents
+
+Sections 0–15 are the core design (revision 2, approved 2026-11-20). Later sections carry
+their own status. Code and docs cite sections as "DESIGN §N".
+
+| § | Section | Status |
+|---|---|---|
+| 0 | [v1 scope](#0-v1-scope) | core |
+| 1 | [Problem](#1-problem) | core |
+| 2 | [Quota inventory (one project, free tier, observed 2026-11-20)](#2-quota-inventory-one-project-free-tier-observed-2026-11-20) | core |
+| 3 | [Architecture](#3-architecture) | core |
+| 4 | [Routes (virtual models)](#4-routes-virtual-models) | core |
+| 5 | [Request flow](#5-request-flow) | core |
+| 5.1 | ↳ [Tool loops and thought signatures](#51-tool-loops-and-thought-signatures) |  |
+| 6 | [Classifying 429s](#6-classifying-429s) | core |
+| 7 | [Quota accounting](#7-quota-accounting) | core |
+| 8 | [Streaming](#8-streaming) | core |
+| 9 | [Timeouts and limits](#9-timeouts-and-limits) | core |
+| 10 | [Security](#10-security) | core |
+| 11 | [Endpoints](#11-endpoints) | core |
+| 12 | [Configuration (`config.yaml`)](#12-configuration-configyaml) | core |
+| 13 | [Alternatives considered](#13-alternatives-considered) | core |
+| 14 | [Failure-mode summary](#14-failure-mode-summary) | core |
+| 15 | [Clients](#15-clients) | core |
+| 16 | [After v1: automatic routing (`gemini-auto`)](#16-after-v1-automatic-routing-gemini-auto--proposed-pending-approval) | proposed; step 1 (§16.8) approved and implemented |
+| 16.8 | ↳ [Step 1 in detail: `gemini-smart`, handoffs and the decision log](#168-step-1-in-detail-gemini-smart-handoffs-and-the-decision-log--approved-2026-11-21) |  |
+| 17 | [Observability](#17-observability--layers-15-and-local-collection-approved-2026-11-21-21-alerts-and-remote-rows-proposed) | layers 1–5 approved; alerts and remote rows proposed |
+| 18 | [Hosting](#18-hosting--local-docker-and-tailscale-approved-2026-11-21-21-remote-hosting-proposed) | local Docker and Tailscale approved; remote hosting proposed |
+| 19 | [Other accounts and billing](#19-other-accounts-and-billing--approved-2026-11-21) | approved |
+| 20 | [HTTP layer details (Phase 2)](#20-http-layer-details-phase-2--approved-2026-11-21) | approved |
+| 21 | [Packaging, dashboard and setup (Phase 3)](#21-packaging-dashboard-and-setup-phase-3--approved-2026-11-21) | approved |
+| 22 | [Overloaded models: a growing 5xx cooldown](#22-overloaded-models-a-growing-5xx-cooldown--approved-2026-11-21-with-adjustments-implemented-2026-11-21) | approved with adjustments; implemented |
+| 23 | [Restoring thought signatures that clients drop](#23-restoring-thought-signatures-that-clients-drop--approved-2026-11-21-implemented-2026-11-21) | approved; implemented (amendments in §23.8) |
+| 23.8 | ↳ [After review](#238-after-review--fixes-settled-2026-11-22-amendments-approved-and-implemented-2026-11-22) |  |
+
 ## 0. v1 scope
 
 v1 is deliberately small. Everything else in this document is the intended
@@ -276,6 +311,9 @@ rule below.
 - Tool-call fields, including `extra_content`, pass through unchanged. If Phase 0 shows
   that Zoo Code drops `extra_content`, the fallback plan is for the proxy to store each
   signature with its affinity record and re-attach it. That would be a design change to approve first.
+  Copilot Chat drops them, and Zoo Code 3.98.0 doesn't always keep them (live check, 2026-11-22),
+  so §23 (implemented 2026-11-21) does exactly
+  that: a call the client sends without a signature gets the stored one of the model that made it.
 
 ### 5.2 Details settled in Phase 1 (pending approval)
 
@@ -556,6 +594,9 @@ Source: https://code.visualstudio.com/docs/agent-customization/language-models (
   in VS Code" turned on.
 - Optional: point `chat.utilityModel` / `chat.utilitySmallModel` at `gemini-fast`.
   Those are small, frequent calls (titles, commit messages).
+- Copilot drops `extra_content.google.thought_signature` from the tool calls it sends back,
+  so every agent-mode tool turn got Google's 400 (live check, 2026-11-21). The proxy now
+  restores the stored signatures (§23).
 
 Compatibility requirements this places on the proxy: `/v1/models` must list the routes
 (VS Code queries it when no `models` array is given), streaming must work, and tool-call
@@ -765,7 +806,8 @@ are not offered.
 - When B serves a handed-off turn, every tool call in the active turn that B didn't make
   (from the affinity record) has its signature replaced with the placeholder in the body sent
   upstream. B's own calls keep their real signatures. Unknown IDs also get the placeholder.
-  This is the only place the proxy changes a request body other than `model`.
+  This and §23's restoring of signatures the client dropped are the only places the proxy
+  changes a request body other than `model`.
   - The same rewrite applies to a `mixed` turn served by its latest owner, since the client
     still sends the earlier model's real signatures (settled in implementation, 2026-11-21).
   - An owner serving a turn that holds only its own known calls sends the body unchanged,
@@ -1157,8 +1199,10 @@ after the Phase 4 review; it used to need `rpm × 10 < rpd`).
   A client that declares a large `Content-Length` and uploads slowly holds that much of the
   budget until the request deadline.
 - The upstream request is the client's body with only two changes: `model` becomes the
-  real ID, and streams get `stream_options.include_usage: true` (§7). The one exception is a
-  handed-off tool turn, whose other models' calls get the placeholder signature (§16.8). None of the client's
+  real ID, and streams get `stream_options.include_usage: true` (§7). The exceptions are
+  thought signatures in the active turn: a handed-off or mixed tool turn's other models' calls
+  get the placeholder signature (§16.8), and calls the client sent without a signature get the
+  serving model's stored one back, or the placeholder (§23.4). None of the client's
   headers are forwarded; the proxy sends its own `Authorization: Bearer <GEMINI_API_KEY>`.
 - One shared `httpx.AsyncClient`: connect timeout 10 s; the router's per-attempt timeout
   for the first byte (§9); after that, 120 s between stream chunks.
@@ -1271,7 +1315,7 @@ proxy's state and logs bounded over weeks of running:
   tables present means version 1 and is updated; a version newer than the code knows is a
   startup error; migrations to later versions run in one transaction at startup. Version 2
   (§16.8 1d) adds `affinity.turn_id` and the `turns` table. An older proxy refuses a version-2
-  file, so going back to it means deleting the file.
+  file, so going back to it means deleting the file. Version 3 (§23.2) adds `affinity.signature`.
 - **Damaged database.** At startup the proxy runs `PRAGMA quick_check` (milliseconds at this
   size). If it fails, or the file isn't a database, the proxy refuses to start and the message
   names the file and says deleting it is safe: only today's local counts (a hint, §7; Google's
@@ -1575,7 +1619,7 @@ busy healthy model still gets today's 30 s cooldown from a 503 that arrives afte
    400/401/403/422 end a streak; the one-at-a-time rule also applies after the cooldown ends;
    the send phase comes from httpx's `trace` extension, and an unknown phase doesn't count.
 
-## 23. Restoring thought signatures that clients drop — approved 2026-11-21
+## 23. Restoring thought signatures that clients drop — approved 2026-11-21; implemented 2026-11-21
 
 **Problem** (live check, 2026-11-21). VS Code Copilot Chat (custom endpoint, Chat Completions,
 route `gemini-smart`) fails every tool turn. Copilot read a file with its `read_file` tool and
@@ -1623,7 +1667,9 @@ those calls without a signature today and Google accepts them, so the proxy leav
     it, §20.5), the signature seen so far is written with it, or `NULL` if none yet.
   - Before the stream's last bytes go to the client (`[DONE]`, an error event, or the cut-off
     error event, where `_complete_if_needed()` runs today), one more write settles every
-    recorded call still at `NULL`: the signature if one arrived late, `''` if none did. It runs
+    recorded call still at `NULL`: the signature if one arrived late, `''` if none did.
+    (Amended in §23.8: calls are recorded as `NULL`, and values are written only at `[DONE]`;
+    other endings leave them `NULL`.) It runs
     only if such a call exists, which in Gemini's case means calls with no signature.
   - A call whose deltas carry two different signatures is stored as `NULL` (not resolvable, so
     it gets the placeholder) and counted as `conflict`. Repeating the same value is fine. The
@@ -1673,7 +1719,9 @@ like prompt text (§17.1), not like metadata:
   set to `0600` and its directory to `0700`, as for 429 captures. SQLite creates the `-wal` and
   `-shm` files with the database's permissions.
 - Scrubbing (§20.7) needs no new rule, since a signature never reaches a log or an error body.
-  The tests check that, including the exception paths.
+  The tests check that, including the exception paths. (Amended in §23.8: restored values are
+  scrubbed per request from passed-on upstream errors and 429 captures; the directory rule is
+  narrowed and the file's `0600` is enforced.)
 
 ### 23.4 Restoring
 
@@ -1691,7 +1739,8 @@ being called (decided per candidate, since a handoff target gets a different bod
 | none | unknown ID, no ID, or the lookup failed | the placeholder (`placeholder`) |
 
 - **A signature the client sent always wins** over a stored one. The client is the source of the
-  history, and Zoo Code's requests stay exactly as today.
+  history, and Zoo Code's requests stay exactly as today. (Corrected by the live check in §23.8:
+  Zoo Code 3.98.0 sometimes sends a call back without its signature, which then gets restored.)
 - **Only the signature of the model that made the call.** "This model" means the configured
   model ID in the affinity record equals the candidate's ID. A stored signature is never sent to
   another model: a handoff target gets the placeholder for the owner's calls (§16.8) and its own
@@ -1808,3 +1857,58 @@ being called (decided per candidate, since a handoff target gets a different bod
 6. No config switch.
 7. Review at implementation: `code-reviewer-deep`, since the stream capture is a two-step write
    that can partly fail and depends on how ID reuse is handled.
+
+### 23.8 After review — fixes settled 2026-11-22; amendments approved and implemented 2026-11-22
+
+**Settled in implementation (fixes within §23 as approved, each with a regression test):**
+
+- **The settling write's guard includes the write generation:** the record's `created_at` and
+  `turn_id` as this stream wrote them. Without it, two streams from one model that reused an ID
+  and both recorded it as `NULL` let the older stream's settle land on the newer record and
+  block the newer one's own settle (§23.5's promise).
+- **One ID at two indexes of one stream is one call:** its signatures are merged, so two
+  different values are a `conflict` (`NULL`), as in a non-streamed response. Before, the second
+  index was ignored and the call could settle as `''`.
+- **A stream counts `stored` and `none` only when it settles:** a signature recorded at the
+  usage chunk and contradicted later counted as both `stored` and `conflict`.
+- **A call whose record names a model no longer configured** (an `unknown` turn) is counted as
+  `placeholder`. Before, it was counted as another model's call, so it showed in no metric,
+  and a 400 advised removing the serving model from `handoff_targets`.
+- **An ID-less call gets the placeholder even when no call in the turn has an ID.** Before, the
+  body went unchanged in that case.
+
+**Amendments (approved 2026-11-22, implemented):**
+
+1. **An incomplete stream leaves its calls `NULL`.** Replaces §23.1's "`''` if none did" for
+   the error-event, cut-off and disconnect endings. `''` means "the response carries none", which
+   only a clean `[DONE]` shows; after a cut-off, the honest state is unknown, and the
+   placeholder is safe where `''` is a certain 400 on Gemini 3 if the signature never arrived.
+   The usage-chunk record writes `NULL` for every call, and the signature or `''` is written only
+   at `[DONE]`. That also closes the case where a failed clearing write leaves a contradicted
+   signature in place. Cost: the settling write runs for every stream with tool calls, not
+   only for calls with no signature (one UPDATE per such stream).
+2. **Request-scoped scrubbing of restored values.** Reverses §23.3's "scrubbing needs no new
+   rule". The signatures restored into a request are added, for that request only, to the
+   values scrubbed from what the proxy passes on or keeps from that upstream call: a
+   passed-through 4xx body, a mid-stream error event, and a 429 capture. The client already
+   received each signature in the original response, so the gap is mainly the capture files
+   and logs. Google hasn't been seen echoing request content in its errors.
+3. **Permissions limited and enforced.** Replaces approved choice 5's "its directory to
+   `0700`": the directory is tightened only when it is the default `data/` or `connect()`
+   created it. Any other directory gets a warning if others can read it, since the `0600` file
+   already protects the content and a custom `db_path` may point at the working directory or
+   a shared one. If the database file (or an existing `-wal`/`-shm`) can't be made `0600`, the
+   proxy refuses to start with a `StateDBError` that names the file, instead of today's warning.
+
+**Live check (2026-11-22):** Copilot passed (one signature restored, no 400). Zoo Code 3.98.0 on
+`gemini-fast` also had one call restored, against §23.7's expectation of none. Its
+OpenAI-compatible provider reads `extra_content.google.thought_signature` from responses, but
+appears to look for it under a different key when sending the call back, so the signature can
+be lost (read from Zoo Code's bundled code, not confirmed by inspecting a request). Phase 0's
+"Zoo Code keeps signatures" was inferred from the absence of a 400. The restore covers both
+clients, so nothing changes in the design; the docs that said otherwise are corrected.
+
+**Not adopted:** a fingerprint of each call (function and arguments) checked before restoring.
+It only matters if a model reuses a 64-bit ID within 24 h for a different call, which
+`qr_tool_call_id_reused_total` would show. It would cost a stored column and a hash per call.
+Reconsider if that counter ever goes above 0.

@@ -17,7 +17,7 @@ import time
 from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Literal, Mapping, Protocol
 
-from .affinity import AffinityStore
+from .affinity import AffinityRecord, AffinityStore, Recorded
 from .classify import classify_429
 from .clock import Clock
 from .config import Config, ModelConfig
@@ -42,6 +42,10 @@ Affinity = Literal["pinned", "unknown", "mixed", "handoff"]
 # Google's documented signature for history "transferred from a different model" (DESIGN §16.8).
 PLACEHOLDER_SIGNATURE = "skip_thought_signature_validator"
 HandoffHook = Callable[[str, str, str], None]  # (from model ID, to model ID, result)
+SignatureHook = Callable[[str, str, int], None]  # (model ID, action, count)
+# qr_thought_signatures_total's actions (DESIGN §23.6): capture, then restore.
+SIGNATURE_ACTIONS = ("stored", "none", "too_large", "invalid", "conflict", "evicted",
+                     "restored", "placeholder")
 
 
 # ---- upstream results (supplied by the HTTP layer) -----------------------
@@ -110,13 +114,18 @@ class Attempt:
     outcome: str = "client_cancelled"
     status: int | None = None
     ms: int | None = None
+    # Restored and placeholder counts for the body sent, when either is above 0 (DESIGN §23.6).
+    signatures: dict[str, int] | None = None
 
     def finish(self, outcome: str, status: int | None) -> None:
         self.outcome, self.status = outcome, status
         self.ms = round((time.monotonic() - self.started) * 1000)
 
     def log(self) -> dict:
-        return {"model": self.model, "outcome": self.outcome, "status": self.status, "ms": self.ms}
+        out = {"model": self.model, "outcome": self.outcome, "status": self.status, "ms": self.ms}
+        if self.signatures:
+            out["signatures"] = dict(self.signatures)
+        return out
 
 
 def log_outcome(result: UpstreamResult) -> str:
@@ -180,8 +189,10 @@ class RoutePassthrough:
     path: list[str]
     affinity: Affinity | None
     handoff_from: str | None = None
-    rewritten: bool = False  # sent with placeholder signatures (DESIGN §16.8)
+    rewritten: bool = False  # held placeholders for another model's calls (DESIGN §16.8)
     turn: TurnRef | None = None
+    restored: int = 0  # stored signatures put back in the body sent (DESIGN §23.4)
+    placeholder: int = 0  # placeholders for calls sent without a signature and no usable record
 
 
 @dataclass
@@ -262,38 +273,114 @@ def active_turn_start(messages: list) -> int:
     return last_user
 
 
-def with_placeholder_signatures(request: Mapping[str, Any], serving_id: str,
-                                owners: Mapping[str, str]) -> Mapping[str, Any]:
-    """The request with every active-turn tool call that `serving_id` didn't make (by the
-    affinity record; unknown and ID-less calls included) carrying the placeholder signature
-    (DESIGN §16.8). Changed messages and calls are copied; the client's request is untouched.
-    Returns `request` itself when nothing needs changing."""
+@dataclass(frozen=True)
+class SignedBody:
+    """The body one candidate is sent, and what was done to its active-turn signatures."""
+    body: Mapping[str, Any]
+    restored: int = 0  # calls sent without a signature that got this model's stored one back
+    placeholder: int = 0  # calls sent without one that got the placeholder: no usable record
+    foreign: int = 0  # calls of another model (by the record) that carry the placeholder (§16.8)
+
+    def counts(self) -> dict[str, int] | None:
+        """For the log line's `attempts` entry (DESIGN §23.6): counts only, never values."""
+        if self.restored or self.placeholder:
+            return {"restored": self.restored, "placeholder": self.placeholder}
+        return None
+
+
+def _client_signature(tc: Mapping[str, Any]) -> str | None:
+    extra = tc.get("extra_content")
+    google = extra.get("google") if isinstance(extra, dict) else None
+    sig = google.get("thought_signature") if isinstance(google, dict) else None
+    return sig if isinstance(sig, str) and sig else None
+
+
+def restored_signatures(client: Mapping[str, Any], sent: Mapping[str, Any]) -> set[str]:
+    """Signature values in the body sent upstream that the client didn't send: the ones the
+    proxy restored (DESIGN §23.8 amendment 2). The placeholder is public and left out."""
+    if sent is client:
+        return set()
+    return _signatures_in(sent) - _signatures_in(client) - {PLACEHOLDER_SIGNATURE}
+
+
+def _signatures_in(body: Mapping[str, Any]) -> set[str]:
+    out: set[str] = set()
+    messages = body.get("messages")
+    for m in messages if isinstance(messages, list) else []:
+        calls = m.get("tool_calls") if isinstance(m, dict) else None
+        for tc in calls if isinstance(calls, list) else []:
+            sig = _client_signature(tc) if isinstance(tc, dict) else None
+            if sig is not None:
+                out.add(sig)
+    return out
+
+
+def _with_signature(tc: Mapping[str, Any], sig: str) -> dict:
+    extra = tc.get("extra_content")
+    extra = extra if isinstance(extra, dict) else {}
+    google = extra.get("google")
+    google = google if isinstance(google, dict) else {}
+    return {**tc, "extra_content": {**extra, "google": {**google, "thought_signature": sig}}}
+
+
+def with_signatures(request: Mapping[str, Any], serving_id: str,
+                    records: Mapping[str, AffinityRecord], *, foreign: bool = False) -> SignedBody:
+    """The request as `serving_id` is sent it (DESIGN §23.4, §16.8). For each assistant tool
+    call in the active turn:
+
+    - the client sent a signature: kept, unless `foreign` (a handoff, or a mixed turn served
+      by its latest owner) and `serving_id` didn't make the call (unknown IDs included), which
+      gets the placeholder (§16.8). The client's signature always wins over a stored one.
+    - the client sent none: this model's stored signature if its record has one; unchanged if
+      the record says the response had none (""); else the placeholder (an unknown state, an
+      unknown or missing ID, a failed lookup, or another model's call).
+
+    Earlier turns are sent as received. Changed messages and calls are copied, so the
+    client's request is never changed, and `request` itself is returned when nothing changes."""
     messages = request.get("messages")
     if not isinstance(messages, list):
-        return request
+        return SignedBody(request)
     new = list(messages)
     changed = False
+    restored = placeholder = foreign_n = 0
     for i in range(active_turn_start(messages) + 1, len(messages)):
         m = messages[i]
         if not (isinstance(m, dict) and m.get("role") == "assistant" and isinstance(m.get("tool_calls"), list)):
             continue
         calls = []
+        touched = False
         for tc in m["tool_calls"]:
             if isinstance(tc, dict):
                 tc_id = tc.get("id")
-                owner = owners.get(tc_id) if isinstance(tc_id, str) else None
-                if owner != serving_id:
-                    extra = tc.get("extra_content")
-                    extra = extra if isinstance(extra, dict) else {}
-                    google = extra.get("google")
-                    google = google if isinstance(google, dict) else {}
-                    tc = {**tc, "extra_content": {
-                        **extra, "google": {**google, "thought_signature": PLACEHOLDER_SIGNATURE}}}
+                rec = records.get(tc_id) if isinstance(tc_id, str) and tc_id else None
+                own = rec is not None and rec.model_id == serving_id
+                sent = _client_signature(tc)
+                put: str | None = None
+                if sent is not None:
+                    if foreign and not own:
+                        put = PLACEHOLDER_SIGNATURE
+                        if rec is not None:
+                            foreign_n += 1
+                elif own and rec.signature:
+                    put = rec.signature
+                    restored += 1
+                elif own and rec.signature == "":
+                    pass  # the response had none for this call: sent as received
+                else:
+                    put = PLACEHOLDER_SIGNATURE
+                    if foreign and rec is not None and not own:
+                        foreign_n += 1  # another model's call in a handoff or mixed turn: §16.8's
+                    else:
+                        placeholder += 1  # incl. a call of a model no longer configured
+                if put is not None and put != sent:
+                    tc = _with_signature(tc, put)
+                    touched = True
             calls.append(tc)
-        if calls != m["tool_calls"]:
+        if touched:
             new[i] = {**m, "tool_calls": calls}
             changed = True
-    return {**request, "messages": new} if changed else request
+    return SignedBody({**request, "messages": new} if changed else request,
+                      restored, placeholder, foreign_n)
 
 
 def active_turn_tool_call_ids(messages: Any) -> list[str]:
@@ -335,6 +422,9 @@ class Router:
         self.state_errors = 0
         self.tool_call_ids_reused = 0
         self.on_handoff: HandoffHook | None = None  # set by the HTTP layer for /metrics
+        # Thought-signature counts since start, for /status (DESIGN §23.6); never values.
+        self.signatures: dict[str, int] = dict.fromkeys(SIGNATURE_ACTIONS, 0)
+        self.on_signature: SignatureHook | None = None  # set by the HTTP layer for /metrics
 
     def resolve(self, name: Any) -> list[ModelConfig] | None:
         if not isinstance(name, str):
@@ -345,10 +435,12 @@ class Router:
         return [m] if m else None
 
     def _pin(self, request: Mapping[str, Any], candidates: list[ModelConfig]
-             ) -> tuple[list[ModelConfig], Affinity | None, dict[str, str], str | None]:
-        """Candidates after pinning, the affinity label, the known ID → model map (empty
-        unless the turn is pinned to an owner, which is then `candidates[0]`), and the turn ID
-        of the latest known call that has one (DESIGN §16.8 1d)."""
+             ) -> tuple[list[ModelConfig], Affinity | None, dict[str, AffinityRecord], str | None]:
+        """Candidates after pinning, the affinity label, the active turn's known records (also
+        for an unpinned turn, whose calls of the serving model can still get their signatures
+        back, DESIGN §23.4; empty if the lookup failed), and the turn ID of the latest known call
+        that has one (DESIGN §16.8 1d). A pinned or mixed turn's owner is `candidates[0]`.
+        This is the request's only affinity read."""
         ids = active_turn_tool_call_ids(request.get("messages"))
         if not ids:
             return candidates, None, {}, None
@@ -358,24 +450,23 @@ class Router:
             self.state_errors += 1
             log.exception("affinity lookup failed; routing the tool turn normally")
             return candidates, "unknown", {}, None
-        known = {i: r.model_id for i, r in records.items()}
-        owners = [known[i] for i in ids if i in known]
+        owners = [records[i].model_id for i in ids if i in records]
         if not owners:
             log.warning("tool turn with %d call ID(s), none known; routing normally", len(ids))
-            return candidates, "unknown", {}, None
+            return candidates, "unknown", records, None
         turn_id = next((records[i].turn_id for i in reversed(ids)
                         if i in records and records[i].turn_id), None)
         owner_id = owners[-1]  # the latest known call's model
         model = self._config.model_by_id(owner_id)
         if model is None:
             log.warning("tool turn belongs to %s, which is no longer configured; routing normally", owner_id)
-            return candidates, "unknown", {}, turn_id
+            return candidates, "unknown", records, turn_id
         if len(set(owners)) > 1:
             # Expected after a handoff (DESIGN §16.8); without one it is worth a look.
             log.info("tool turn spans %d models; pinning to the latest call's model %s",
                      len(set(owners)), owner_id)
-            return [model], "mixed", known, turn_id
-        return [model], "pinned", known, turn_id
+            return [model], "mixed", records, turn_id
+        return [model], "pinned", records, turn_id
 
     @staticmethod
     def _turn(request: Mapping[str, Any], affinity: Affinity | None, turn_id: str | None,
@@ -445,9 +536,9 @@ class Router:
         resolved = self.resolve(name)
         if resolved is None:
             return RouteFailed(404, "model_not_found", f"unknown model or route: {name!r}", None)
-        candidates, affinity, known, turn_id = self._pin(request, resolved)
+        candidates, affinity, records, turn_id = self._pin(request, resolved)
         turn = self._turn(request, affinity, turn_id, started)
-        owner = candidates[0] if known else None
+        owner = candidates[0] if affinity in ("pinned", "mixed") else None
         if owner is not None:
             candidates = [owner, *self._handoff_targets(name, resolved, owner)]
         input_tokens = estimate_input_tokens(request)
@@ -460,14 +551,15 @@ class Router:
         hand_off: bool | None = None  # decided once, from the owner's result
         # Skipped only for the soft part of a 5xx cooldown or a recovery attempt in flight:
         # tried after the normal pass if nothing served (DESIGN §22.2).
-        deferred: list[tuple[Candidate, Mapping[str, Any], int]] = []
+        deferred: list[tuple[Candidate, SignedBody, int]] = []
 
-        async def attempt(c: Candidate, body: Mapping[str, Any], tokens: int,
+        async def attempt(c: Candidate, signed: SignedBody, tokens: int,
                           last_resort: bool) -> RouteOutcome | None | object:
             """Try one candidate. Returns an outcome to return, None to go on, or _STOP when
             a last-resort pass has no attempts or time left."""
             nonlocal tried
             model = c.model
+            body = signed.body
             served_affinity = affinity if owner is None or model.id == owner.id else "handoff"
             handoff_from = owner.id if owner is not None and model.id != owner.id else None
             async with self._lock:
@@ -494,7 +586,7 @@ class Router:
                 c.reason, c.ready_at, c.detail = res.reason, res.ready_at, res.detail
                 c.unhealthy = res.cooling_down
                 if res.deferred and not last_resort:
-                    deferred.append((c, body, tokens))
+                    deferred.append((c, signed, tokens))
                 return None
             if res is None:  # eligible, but no attempts or time left
                 c.reason, c.ready_at = "not_tried", self._clock.now()
@@ -519,8 +611,9 @@ class Router:
                 # Only a timeout with the whole usual budget counts towards the streak (§22.1).
                 full_budget = timeout >= full_timeout
                 attempt_started = self._clock.now()
-                entry = Attempt(model.id)
+                entry = Attempt(model.id, signatures=signed.counts())
                 log_.append(entry)
+                self._count_restores(model.id, signed)  # this body is being sent
                 call = upstream(model, timeout) if body is request else upstream(model, timeout, body=body)
                 try:
                     result = await asyncio.wait_for(call, timeout + 1.0)
@@ -546,8 +639,9 @@ class Router:
                     self._store.on_recovered(model, res)
                 self._note_handoff(owner, model, "rejected")
                 return RoutePassthrough(model, result.payload, res, path, served_affinity, handoff_from,
-                                        rewritten=body is not request,
-                                        turn=self._served_turn(turn, resolved, model, handoff_from))
+                                        rewritten=signed.foreign > 0,
+                                        turn=self._served_turn(turn, resolved, model, handoff_from),
+                                        restored=signed.restored, placeholder=signed.placeholder)
             self._note_handoff(owner, model, "failed")
             if isinstance(result, RateLimited):
                 cls = classify_429(result.body, result.headers)
@@ -614,13 +708,17 @@ class Router:
                 if not hand_off:
                     break  # the owner's own result decides (DESIGN §16.8)
             # Calls the serving model didn't make carry the placeholder: after a handoff, or in
-            # a mixed turn served by its latest owner. An owner serving its own turn sends the
-            # body unchanged, unknown IDs included (most likely its own calls).
+            # a mixed turn served by its latest owner (DESIGN §16.8). An owner serving its own
+            # turn keeps the client's signatures, unknown IDs included (most likely its own
+            # calls). Calls the client sent without one get this model's stored signature back,
+            # or the placeholder (DESIGN §23.4).
             foreign = owner is not None and (
-                model.id != owner.id or any(v != model.id for v in known.values()))
-            body = with_placeholder_signatures(request, model.id, known) if foreign else request
+                model.id != owner.id or any(r.model_id != model.id for r in records.values()))
+            # Also with no ID in the turn: an ID-less call still gets the placeholder (§23.4).
+            signed = with_signatures(request, model.id, records, foreign=foreign)
+            body = signed.body
             # Estimated from what this model is sent: placeholders are much shorter than real
-            # signatures, so the client's body would overstate a handoff's size.
+            # signatures and restored ones make it longer, so the client's body would be wrong.
             tokens = input_tokens if body is request else estimate_input_tokens(body)
             c = Candidate(model)
             results.append(c)
@@ -630,18 +728,18 @@ class Router:
             if not fits(model, tokens, output_tokens):
                 c.reason = "too_large"
                 continue
-            out = await attempt(c, body, tokens, last_resort=False)
+            out = await attempt(c, signed, tokens, last_resort=False)
             if out is not None:
                 return out  # type: ignore[return-value]
 
         # Last resort (DESIGN §22.2): the models skipped only for the soft part of a 5xx
         # cooldown or a busy recovery slot, in candidate order, while attempts and time remain.
         # A pinned owner comes first here, after its handoff targets have failed.
-        for c, body, tokens in deferred:
+        for c, signed, tokens in deferred:
             if self._store.is_disabled(c.model):
                 c.reason = "disabled"
                 continue
-            out = await attempt(c, body, tokens, last_resort=True)
+            out = await attempt(c, signed, tokens, last_resort=True)
             if out is _STOP:
                 break
             if out is not None:
@@ -719,23 +817,76 @@ class Router:
             self.state_errors += 1
             log.exception("could not record a finished stream for %s", served.model.id)
 
+    def note_signatures(self, model_id: str, action: str, n: int = 1) -> None:
+        """Count `n` signature events (DESIGN §23.6). Never raises."""
+        if n <= 0 or action not in self.signatures:
+            return
+        self.signatures[action] += n
+        if self.on_signature is not None:
+            try:
+                self.on_signature(model_id, action, n)
+            except Exception:
+                log.exception("signature hook failed")
+
+    def _count_restores(self, model_id: str, signed: SignedBody) -> None:
+        self.note_signatures(model_id, "restored", signed.restored)
+        self.note_signatures(model_id, "placeholder", signed.placeholder)
+
+    def _count_written(self, model_id: str, states: list[str | None]) -> None:
+        self.note_signatures(model_id, "stored", sum(1 for s in states if s))
+        self.note_signatures(model_id, "none", sum(1 for s in states if s == ""))
+
     def complete(self, served: RouteServed, prompt_tokens: int | None,
-                 tool_call_ids: list[str] | None = None) -> None:
+                 tool_call_ids: list[str] | None = None,
+                 signatures: Mapping[str, str | None] | None = None,
+                 count: bool = True) -> Recorded | None:
         """After the response finished: settle usage and record tool-call affinity (with
-        the response's turn, DESIGN §16.8 1d).
+        the response's turn, DESIGN §16.8 1d) and each call's signature state (§23.1: an ID
+        missing from `signatures` is stored as unknown). Returns what was recorded, or None
+        if the record failed, in which case nothing of it was written. `count`: count the
+        written states as `stored`/`none` now (a stream counts them when it settles).
 
         Safe to call more than once for one response: usage settles only the first time,
         so a later call can record tool-call IDs that arrived after the usage chunk."""
         self._store.settle(served.reservation, prompt_tokens)
-        if tool_call_ids:
-            try:
-                reused = self._affinity.record(tool_call_ids, served.model.id,
-                                               served.turn.turn_id if served.turn else None)
-            except Exception:  # losing affinity only means "unknown" on the next request
-                self.state_errors += 1
-                log.exception("could not record tool-call affinity for %s", served.model.id)
-                return
-            if reused:
-                self.tool_call_ids_reused += reused
-                log.warning("%d tool-call ID(s) from %s were already recorded; affinity assumes "
-                            "IDs never repeat (DESIGN §20.6)", reused, served.model.id)
+        if not tool_call_ids:
+            return Recorded(0, 0, None)
+        model_id = served.model.id
+        try:
+            recorded = self._affinity.record(tool_call_ids, model_id,
+                                             served.turn.turn_id if served.turn else None, signatures)
+        except Exception:  # losing affinity only means "unknown" on the next request
+            self.state_errors += 1
+            log.exception("could not record tool-call affinity for %s", model_id)
+            return None
+        if count:
+            sigs = signatures or {}
+            self._count_written(model_id, [sigs.get(i) for i in dict.fromkeys(tool_call_ids)
+                                           if isinstance(i, str) and i])
+        self.note_signatures(model_id, "evicted", recorded.evicted)
+        if recorded.reused:
+            self.tool_call_ids_reused += recorded.reused
+            log.warning("%d tool-call ID(s) from %s were already recorded; affinity assumes "
+                        "IDs never repeat (DESIGN §20.6)", recorded.reused, model_id)
+        return recorded
+
+    def settle_signatures(self, served: RouteServed,
+                          updates: list[tuple[str, str | None, str | None, float]]) -> list[str | None] | None:
+        """A stream's settling write (DESIGN §23.1): (ID, new state, recorded state, recorded
+        created_at) for calls `complete()` recorded. Guarded on the model, turn, created_at and
+        recorded state, so it never changes a record a later response wrote. A failure leaves the calls as recorded
+        (unknown, the safe state); it is logged and counted, and never raises. Returns the
+        states written (counted as `stored`/`none`), or None if the write failed."""
+        if not updates:
+            return []
+        model_id = served.model.id
+        try:
+            written, evicted = self._affinity.settle_signatures(
+                model_id, served.turn.turn_id if served.turn else None, updates)
+        except Exception:
+            self.state_errors += 1
+            log.exception("could not settle the thought signatures of a stream from %s", model_id)
+            return None
+        self._count_written(model_id, written)
+        self.note_signatures(model_id, "evicted", evicted)
+        return written

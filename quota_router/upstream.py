@@ -22,7 +22,8 @@ import httpx
 
 from .classify import classify_429, parse_error_body
 from .config import ModelConfig
-from .router import ModelNotFound, RateLimited, Rejected, Served, Unavailable, UpstreamResult
+from .router import (ModelNotFound, RateLimited, Rejected, Served, Unavailable, UpstreamResult,
+                     restored_signatures)
 from .scrub import Scrubber
 
 log = logging.getLogger("quota_router")
@@ -106,6 +107,9 @@ class Stream:
     events: AsyncIterator[SSEEvent]
     first: SSEEvent
     closed: bool = False
+    # Scrubs what is passed on from this stream (error events, captures): the proxy's secrets
+    # plus the signatures it restored into this call's body (DESIGN §23.8 amendment 2).
+    scrubber: Scrubber | None = None
 
     async def aclose(self) -> None:
         if self.closed:
@@ -149,13 +153,17 @@ class Captures:
             self._count = CAPTURE_MAX_FILES
         self._warned = False
 
-    def save(self, model_id: str, status: int, headers: httpx.Headers | dict, body: bytes) -> None:
+    def save(self, model_id: str, status: int, headers: httpx.Headers | dict, body: bytes,
+             scrubber: Scrubber | None = None) -> None:
+        """`scrubber`, when given, replaces the default for this capture (one that also knows
+        the signatures restored into the call's body)."""
+        scrub = scrubber or self._scrub
         if self._count >= CAPTURE_MAX_FILES:
             if not self._warned:
                 self._warned = True
                 log.warning("429 capture folder is full (%d files); not saving more", CAPTURE_MAX_FILES)
             return
-        clean = self._scrub.capture_body(body)  # redact the whole body first, then truncate
+        clean = scrub.capture_body(body)  # redact the whole body first, then truncate
         truncated = len(clean) > CAPTURE_MAX_BYTES
         clean = clean[:CAPTURE_MAX_BYTES]
         try:
@@ -166,7 +174,7 @@ class Captures:
         record = {
             "at": dt.datetime.fromtimestamp(now, dt.timezone.utc).isoformat(timespec="seconds"),
             "model": model_id, "status": status,
-            "headers": {k: self._scrub.capture(v) for k, v in headers.items() if k.lower() == "retry-after"},
+            "headers": {k: scrub.capture(v) for k, v in headers.items() if k.lower() == "retry-after"},
             "body": parsed, "truncated": truncated,
         }
         stamp = dt.datetime.fromtimestamp(now, dt.timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
@@ -226,8 +234,9 @@ class GeminiUpstream:
         async def call(model: ModelConfig, timeout_s: float, *,
                        body: dict | None = None, _client_body: dict = body) -> UpstreamResult:
             handles.attempted.append(model.id)
-            sent = _client_body if body is None else body  # a handed-off turn (DESIGN §16.8)
-            result = await self._call(sent, stream, handles, model, timeout_s)
+            sent = _client_body if body is None else body  # signatures rewritten (§16.8, §23.4)
+            scrub = self._scrub.with_extra(restored_signatures(_client_body, sent))
+            result = await self._call(sent, stream, handles, model, timeout_s, scrub)
             if self._on_result:
                 try:
                     self._on_result(model, result)
@@ -251,7 +260,8 @@ class GeminiUpstream:
             return json.dumps(payload, ensure_ascii=True).encode("ascii")
 
     async def _call(self, body: dict, stream: bool, handles: HandleSet,
-                    model: ModelConfig, timeout_s: float) -> UpstreamResult:
+                    model: ModelConfig, timeout_s: float, scrub: Scrubber | None = None) -> UpstreamResult:
+        scrub = scrub or self._scrub
         response: httpx.Response | None = None
         handed_over = False
         sending = False  # once True, Google may have received the request
@@ -286,8 +296,8 @@ class GeminiUpstream:
                         return Unavailable("empty stream", counts=True, status=status)
                     err = first.error()
                     if err is not None:  # nothing has reached the client yet (DESIGN §20.4)
-                        return self._first_event_error(model, err, first)
-                    s = Stream(response, events, first)
+                        return self._first_event_error(model, err, first, scrub)
+                    s = Stream(response, events, first, scrubber=scrub)
                     handles.streams.append(s)
                     handed_over = True
                     return Served(s, stream=True, status=status)
@@ -316,26 +326,27 @@ class GeminiUpstream:
             return Served(Body(status, content, ctype), status=status)
         if status == 429:
             if self._captures:
-                self._captures.save(model.id, status, response.headers, content)
+                self._captures.save(model.id, status, response.headers, content, scrub)
             return RateLimited(content, dict(response.headers), status=status)
         if status in _UNAVAILABLE_STATUSES:
             return Unavailable(f"http {status}", counts=True, status=status)
         if status == 404 and _is_model_not_found(content):
             return ModelNotFound(content, status=status)
-        return Rejected(Body(status, self._scrub.bytes(content), ctype), status=status)
+        return Rejected(Body(status, scrub.bytes(content), ctype), status=status)
 
-    def _first_event_error(self, model: ModelConfig, err: dict, event: SSEEvent) -> UpstreamResult:
+    def _first_event_error(self, model: ModelConfig, err: dict, event: SSEEvent,
+                           scrub: Scrubber) -> UpstreamResult:
         kind, code = error_event_kind(err)
         raw = (event.data or "").encode("utf-8")
         if kind == "rate_limited":
             if self._captures:
-                self._captures.save(model.id, 429, {}, raw)
+                self._captures.save(model.id, 429, {}, raw, scrub)
             return RateLimited(raw, None, status=code)
         if kind == "unavailable":
             return Unavailable(f"stream error event {code}", counts=True, status=code)
         if code == 404 and _is_model_not_found(raw):
             return ModelNotFound(raw, status=code)
-        return Rejected(Body(code, self._scrub.bytes(raw), "application/json"), status=code)
+        return Rejected(Body(code, scrub.bytes(raw), "application/json"), status=code)
 
 
 async def _close_quietly(response: httpx.Response) -> None:

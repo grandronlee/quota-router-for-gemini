@@ -145,6 +145,8 @@ Hand-written; `scripts/probe.py` keeps this section when it regenerates the repo
   HTTP 400 ("Function call is missing a thought_signature in functionCall parts"). Since
   Zoo Code's multi-step task got no 400, **Zoo Code 3.98.0 preserves `extra_content`**, and
   the proxy doesn't need to re-attach signatures (DESIGN §5.1 fallback not needed).
+  (Revised 2026-11-22: the §23 live check saw Zoo Code send a call back without its signature;
+  see "Copilot agent mode with restored signatures" below.)
 
 ### Tool-call ID format through the proxy (DESIGN §20.6), 2026-11-20 19:48 PT
 
@@ -228,3 +230,30 @@ Task (read-only): read README.md, list docs/, read DESIGN §16.8, summarise hand
 - The `exhausted` row was removed afterwards, with the proxy stopped.
 - Observed: while Hydrogen and 3.6 Flash return 503, every `gemini-smart` turn start waits for
   both to fail (35–95 s here) before a model that works.
+
+### Copilot agent mode with restored signatures (DESIGN §23.7), 2026-11-22 02:04–02:07 PT
+
+- Setup: VS Code Copilot Chat, custom endpoint (Chat Completions), route `gemini-smart`, agent
+  mode, a new chat. The proxy was rebuilt with DESIGN §23 and its §23.8 amendments; the state
+  file migrated from version 2 to 3 at startup. Before the rebuild the same prompt still got
+  Google's 400 "Function call is missing a thought_signature … position 5" (old build).
+- Prompt: "Read quota_router/quota.py and explain in 5 bullet points what `try_reserve` does.
+  Don't edit any files."
+- Turn start: `gemini-4-hydrogen` timed out at 120 s, then `gemini-3.6-flash` served it (200,
+  stream complete, 145 s in total) with a `read_file` call. Its signature was stored
+  (`/status` `signatures.stored: 1`).
+- Follow-up: `pinned` to `gemini-3.6-flash`, 200, 30 s. Its `attempts` entry shows
+  `signatures: {"restored": 1, "placeholder": 0}`. No 400. `state_errors: 0`.
+- Result: **PASS**. Copilot answered with five correct bullets on `try_reserve`.
+- Zoo Code part, 2026-11-22 02:09 PT: Zoo Code 3.98.0, Code mode, profile on `gemini-fast`, the
+  same prompt. Four requests, all 200 on `gemini-3.5-flash-lite` (2.7 s, 8.0 s non-streamed
+  utility request, 4.7 s, 7.4 s). The pinned follow-up's `attempts` entry shows
+  `signatures: {"restored": 1, "placeholder": 0}`: Zoo Code sent that call back **without** its
+  signature, so the proxy restored it. Expected was no `signatures` field. No 400,
+  `state_errors: 0`; the task finished with a correct answer.
+- Why: Zoo Code's bundled code (3.98.0) stores a response's signature under a provider-named
+  key and reads it back from a `google` key when it sends the call back, so it can be dropped.
+  Not confirmed by inspecting a request (the proxy never logs bodies). This revises the Phase 0
+  conclusion below that Zoo Code preserves `extra_content`.
+- Result: **PASS** for both clients (no 400, signatures restored); §23.7's expectation for Zoo
+  Code was wrong and is corrected in DESIGN §23.8.
