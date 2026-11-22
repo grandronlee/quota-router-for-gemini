@@ -783,6 +783,34 @@ def test_database_file_that_cant_be_made_owner_only_refuses_to_start(tmp_path, m
         connect(path)
 
 
+def test_wal_file_that_cant_be_made_owner_only_closes_the_connection(tmp_path, monkeypatch):
+    # The -wal and -shm files appear only once _open() switches to WAL, so their check runs
+    # after the connection exists; refusing to start there must not leave it open.
+    import sqlite3
+    from quota_router import db as dbmod
+    from quota_router.db import StateDBError
+    path = tmp_path / "q.sqlite3"
+    opened = []
+    real_connect, real_chmod = sqlite3.connect, os.chmod
+
+    def recording_connect(*a, **kw):
+        opened.append(real_connect(*a, **kw))
+        return opened[-1]
+
+    def no_chmod_on_wal_or_shm(p, m, *a, **kw):
+        if str(p).endswith(("-wal", "-shm")):
+            raise PermissionError(1, "Operation not permitted")
+        return real_chmod(p, m, *a, **kw)
+
+    monkeypatch.setattr(dbmod.sqlite3, "connect", recording_connect)
+    monkeypatch.setattr(dbmod.os, "chmod", no_chmod_on_wal_or_shm)
+    with pytest.raises(StateDBError, match=r"-(wal|shm) owner-only"):
+        connect(path)
+    assert len(opened) == 1
+    with pytest.raises(sqlite3.ProgrammingError, match="closed"):
+        opened[0].execute("SELECT 1")
+
+
 # ---- failures never fail the request ----------------------------------------------------------
 
 def test_failed_record_leads_to_unknown_and_the_placeholder():
