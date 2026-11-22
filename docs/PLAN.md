@@ -214,6 +214,26 @@ are implemented too. In order:
    Zoo Code task. Results go into probe-results.md. Done 2026-11-22: both passed with no 400;
    Zoo Code also had a signature restored, so it doesn't always keep them (DESIGN §23.8).
 
+Step 2 (DESIGN §16.9, approved 2026-11-22 with the recommended choices: the smart tier paced
+as one pool, the demand curve read from the decision log, the measured curve after 7 days,
+`reserve: 5`, and a top-level `auto:` block), in order:
+
+1. Config: the `auto:` block and its validation (§16.9.1), and the block commented out in
+   `config.example.yaml` and `scripts/init_config.py`.
+2. Demand curve (§16.9.3): measured from `turns`, then `working_hours`, then flat. It is cached
+   per PT hour, keeps its last value when a query fails, and never goes down on the fall-back day.
+3. Pool pacing and the upgrade test (§16.9.2), with candidate order and handoff targets taken
+   from the owner's tier first (§16.9.4).
+4. Schema migration 3→4 (`turns.tier`) and the new `reason` values `default` and `pace-upgrade`.
+5. Visibility (§16.9.5): `x-route-tier` and `x-route-reason`, the `auto` object in `/status`,
+   `qr_route_decisions_total`, `qr_pace_left` and `qr_pace_upgrade_above`, and a dashboard pace row.
+   README: a Zoo Code profile on `gemini-auto` and a note to set `working_hours`.
+6. Offline tests from DESIGN §16.9.7.
+7. Validation: `.venv/bin/python -m pytest -q`, `docker compose run --build --rm test`, then
+   `code-reviewer` (routing, a migration, and unlocked concurrent reads of quota state).
+8. Live check: one working day of Zoo Code on `gemini-auto`. Check the headers, see `/status`
+   `left` fall with `share`, and see most of the smart pool used by the end of working hours.
+
 Also after v1: alerts (DESIGN §17.2 layer 6), a remote-hosting design (DESIGN §18)
 if the proxy is to run somewhere other than the user's machine.
 

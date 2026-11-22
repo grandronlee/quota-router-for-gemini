@@ -28,8 +28,9 @@ their own status. Code and docs cite sections as "DESIGN §N".
 | 13 | [Alternatives considered](#13-alternatives-considered) | core |
 | 14 | [Failure-mode summary](#14-failure-mode-summary) | core |
 | 15 | [Clients](#15-clients) | core |
-| 16 | [After v1: automatic routing (`gemini-auto`)](#16-after-v1-automatic-routing-gemini-auto--proposed-pending-approval) | proposed; step 1 (§16.8) approved and implemented |
+| 16 | [After v1: automatic routing (`gemini-auto`)](#16-after-v1-automatic-routing-gemini-auto--proposed-pending-approval) | proposed; step 1 (§16.8) approved and implemented; step 2 (§16.9) approved |
 | 16.8 | ↳ [Step 1 in detail: `gemini-smart`, handoffs and the decision log](#168-step-1-in-detail-gemini-smart-handoffs-and-the-decision-log--approved-2026-11-21) |  |
+| 16.9 | ↳ [Step 2 in detail: `gemini-auto` with tiers, spill and pacing](#169-step-2-in-detail-gemini-auto-with-tiers-spill-and-pacing--approved-2026-11-22) | approved 2026-11-22 |
 | 17 | [Observability](#17-observability--layers-15-and-local-collection-approved-2026-11-21-21-alerts-and-remote-rows-proposed) | layers 1–5 approved; alerts and remote rows proposed |
 | 18 | [Hosting](#18-hosting--local-docker-and-tailscale-approved-2026-11-21-21-remote-hosting-proposed) | local Docker and Tailscale approved; remote hosting proposed |
 | 19 | [Other accounts and billing](#19-other-accounts-and-billing--approved-2026-11-21) | approved |
@@ -644,6 +645,10 @@ The existing loop (§5 step 4) walks this list unchanged: skips are free, at mos
 
 ### 16.3 Quota pacing (the pace line)
 
+(Step 2's detail, §16.9, approved 2026-11-22, changes this section in three ways: it paces the
+smart tier as one pool instead of each model, it renames `burst` to `reserve`, and it states
+the upgrade test in terms of quota left. Where the two differ, §16.9 applies.)
+
 The proxy doesn't run all day, and the user's working hours need not line up with the PT
 reset, so pacing follows demand rather than the clock. For each paced model (by default the
 `smart` tier):
@@ -705,7 +710,7 @@ system-prompt text or hashes, or exact timestamps (date and hour are enough).
 
 | Feature | Data kept | Where | Kept for | Used once |
 |---|---|---|---|---|
-| Demand curve | count of turn starts per (PT date, hour) | SQLite, 24 rows a day | 14 days | 7 days have data; days with no turns are left out of the average |
+| Demand curve | count of turn starts per (PT date, hour) | the decision log's `turns` rows (§16.9.3; replaces a separate table of 24 rows a day) | 14 days | 7 days have data; days with no turns are left out of the average |
 | Reliability | per model, time and ok/fail of each attempt | memory only (lost on restart, which is fine) | 15 minutes | at least 4 attempts |
 | Token estimate | per model, the last 50 ratios of reported `prompt_tokens` to the estimate | SQLite, one row per model | rolling | 20 samples; until then the fixed 1.2 |
 | Suggestion report | one row per turn (below) | SQLite decision log | 30 days | a group has enough turns (below) |
@@ -904,6 +909,203 @@ first). `scripts/init_config.py` offers it commented out.
 2. `handoff_after_s: 60`. The alternative is to hand off whenever the owner can't take the
    request now. That is simpler, but it uses smart quota on every RPM wait.
 3. The probe budget in 1a: about 4 requests on each smart model and about 14 on 3.5 Flash Lite.
+
+### 16.9 Step 2 in detail: `gemini-auto` with tiers, spill and pacing — approved 2026-11-22
+
+**What step 2 does.** One new route, `gemini-auto`, makes one choice when a turn starts:
+use the smart tier first, or the fast tier first. Every model of both tiers stays in
+the candidate list, so the turn fails only when every model is out (§16.1). There are no
+rules yet (step 3), so a turn prefers smart only when pacing says the smart tier has spare
+quota. Quota spills both ways:
+
+- **Down** (fast is out): a fast turn's list goes on into the smart models. This is the
+  existing fallback loop, and pacing never blocks it.
+- **Up** (smart is unused): a turn is upgraded to smart while the smart tier has more quota
+  left than the rest of the day's demand is expected to use.
+
+`gemini-fast`, `gemini-smart` and direct model IDs don't change.
+
+**Numbers on this account today.** The configured smart tier is 4 Hydrogen, 3.6 Flash, 3 Flash
+and 2.5 Flash: **80 RPD**, because 3.8 Flash isn't configured yet (§16.8 1c). The fast tier is
+3.5 Flash Lite and 2.5 Flash Lite: **520 RPD**. 3.1 Flash Lite adds 500 once its tool call
+passes. That makes the smart tier about 13% of the total, and about 7% once 3.1 Flash Lite joins.
+The decision log held 11 turns over 3 PT days on 2026-11-22, with 1–9 steps a turn. Step 2
+therefore has to work from a cold start.
+
+#### 16.9.1 Config
+
+```yaml
+auto:
+  name: gemini-auto
+  tiers:                     # best first within each tier
+    smart: [gemini-4-hydrogen, gemini-3.6-flash, gemini-3-flash-preview, gemini-2.5-flash]
+    fast: [gemini-3.5-flash-lite, gemini-2.5-flash-lite]
+  default_tier: fast
+  pacing:
+    tier: smart
+    reserve: 5               # requests kept back, shrinking to 0 as the day's demand ends
+    working_hours: "09:00-18:00"   # optional; used until 7 days of demand are measured
+    timezone: "<IANA zone>"        # required with working_hours
+```
+
+- A new top-level `auto:` block, not an entry under `routes:` as the §16.4 sketch had it.
+  `routes` stays `name → [models]`, so existing configs and their validation don't change.
+- Validation: `name` must not match a route or a model ID. Tier members must be known model
+  keys, and no model may be in two tiers (a model may still be in other routes). There must be
+  at least two tiers. `default_tier` and `pacing.tier` must name tiers and must differ. Every
+  paced model needs a numeric `rpd`, because a model without a limit can't be paced.
+  `working_hours` is `HH:MM-HH:MM` and may wrap past midnight, and `timezone` must load in
+  `zoneinfo`.
+- The route's order, used for `/v1/models` and for handoffs, is the tiers in config order.
+- `scripts/init_config.py` offers the block commented out. `handoff_targets` applies to
+  `gemini-auto` as to any route.
+
+#### 16.9.2 Pacing the smart tier as one pool
+
+§16.3 paced each smart model separately. Step 2 paces the **tier as one pool**, and keeps the
+order inside the tier best first. Separate lines would each need their own margin (five
+models × `burst: 5` is 25 requests, about a third of the pool). They would also spread the
+best model thinly while weaker smart models sat idle. With one pool, an upgraded turn gets the
+best smart model that has room. 4 Hydrogen is used up first, and later turns in the day get the
+weaker smart models. That is the same order `gemini-smart` uses today.
+
+At a turn start at time `t`:
+
+```
+capacity = Σ rpd                  over the paced tier's enabled models
+left     = Σ max(0, rpd − used)   over those that are not exhausted (§5.2)
+share    = demand_share(t)        0 at PT midnight, 1 once the day's expected demand is over
+upgrade  ⇔ left > capacity × (1 − share) + reserve × (1 − share)
+```
+
+- `used` is the model's RPD count today from **every** route. Smart quota used through
+  `gemini-smart` or a direct model ID counts too, so a manual Architect profile and `gemini-auto`
+  share one budget instead of both spending it.
+- An exhausted model (a per-day 429 from Google) adds nothing to `left`, even if the proxy's
+  own count says it has room, because Google's count wins (§7). A cooldown or RPM wait
+  doesn't lower `left`. It is short, and the fallback loop already skips the model.
+- Start of the PT day: `share = 0`, so nothing is upgraded. End of demand: `share = 1`, so every
+  turn is upgraded while any smart quota is left. In between, smart use follows the demand curve.
+  Upgrades follow from quota that is really left, so a model that is out early holds them
+  back by itself.
+- The decision is made once, for the turn as a whole, but a turn can take several requests
+  (up to 9 so far). An upgrade can therefore take the pool past the line. Later turns then
+  stay on fast until demand catches up, so the line corrects itself. Any steps the pool can't
+  cover hand off (§16.8).
+- `reserve` (this is §16.3's `burst`, renamed because step 2 has no rule-matched turns for it
+  to let through) keeps a few requests for explicit `gemini-smart` use and, later, for
+  rule-matched turns. It shrinks to 0 as demand ends, so nothing is held back at the end of
+  the day.
+- Only one tier is paced. The fast tier is the default and has about 6× more quota, so it
+  needs no line.
+
+#### 16.9.3 The demand curve
+
+`demand_share(t)` is the share of a typical PT day's turn starts that come before `t`. It is
+taken from the first of these sources that applies:
+
+1. **Measured**, once 7 PT days in the last 14 (not counting today) have turn starts. Counts
+   come from the decision log (§16.8 1d), so step 2 needs no new table. This replaces
+   §16.5's separate demand table. The rows counted are those with `steps > 0` whose `reason`
+   is a turn start (not `pinned`, `handoff` or `unknown`), on every route. Leaving out
+   `steps = 0` keeps client retries during an outage from inflating an hour. The counts are
+   pooled by PT hour over those days. `share` is the sum of the hours before `t`, plus the
+   current hour's count times the fraction of the hour gone, divided by the total.
+2. **`working_hours`** in `timezone`, as even demand inside those hours mapped onto today's PT
+   hours.
+3. **Flat** over the 24 PT hours. This holds smart quota back for most of the day, so the README
+   recommends setting `working_hours`.
+
+- It is recomputed at most once per PT hour, since the query reads at most 14 days of
+  rows. If the query fails, the last curve is kept (the cold-start source if there is none
+  yet), and the failure is logged and counted in `state_errors`.
+- DST: hours are PT wall-clock hours. On the spring-forward day the curve skips an hour. On the
+  fall-back day `share` is held at its highest value so far, so it never goes back down.
+- The curve uses timing only (date and hour), as the minimum-data rule requires (§16.5).
+
+#### 16.9.4 Candidate order
+
+| Turn | Candidates, in order | `x-route-reason` |
+|---|---|---|
+| start, upgraded | smart tier, then fast tier | `pace-upgrade` |
+| start, not upgraded | fast tier, then smart tier | `default` |
+| either, served outside its preferred tier | (as above) | `spill` |
+| follow-up, pinned | owner, then the `handoff_targets` in the owner's tier, then those in the other tiers | `pinned` / `handoff` |
+| follow-up, no known call (`x-turn-affinity: unknown`) | decided as a turn start | `default` / `pace-upgrade` / `spill` |
+
+- The existing loop (§5 step 4) walks the list unchanged: skips are free, there are at most
+  `max_attempts` calls, and the deadline, §22's last-resort pass and §5's final status rules all
+  stay the same.
+- Handoff targets come from the owner's tier first. The turn's tier was decided once, so a
+  handoff doesn't check the pace again. An upgraded turn whose model runs out stays on smart
+  models while any is a handoff target.
+- A request too large for the fast models (§5 step 3) ends up on smart through the same list.
+- The upgrade check reads quota state from memory and takes no lock. Two turns starting at once
+  can both be upgraded, which overshoots the line by one turn. Pacing is a preference, so this
+  is accepted, and the line corrects it as above.
+
+#### 16.9.5 Visibility
+
+- **Headers** on every `gemini-auto` response, errors included: `x-route-tier` (the turn's
+  preferred tier; for a follow-up, its owner's tier) and `x-route-reason` (table above). The
+  model that served it is still in `x-served-model`. Other routes don't get these headers.
+- **Decision log:** migration 3→4 adds `tier TEXT` to `turns` (the preferred tier; NULL on other
+  routes and on old rows). `reason` gains `default` and `pace-upgrade`, and `spill` keeps its
+  meaning: served outside the preferred tier. Together, `tier` and `reason` tell an upgrade that
+  spilled to fast apart from a fast turn that ran out.
+- **`/status`** gets an `auto` object: `capacity`, `left`, `share`, the share's `source`
+  (`measured`, `working_hours` or `flat`), the `upgrade_above` threshold, and today's turn
+  starts by reason.
+- **Metrics:** `qr_route_decisions_total{reason,tier}`, plus gauges `qr_pace_left` and
+  `qr_pace_upgrade_above`. The dashboard gets a pace row. Labels stay low-cardinality.
+
+#### 16.9.6 Failure paths
+
+- **A state read fails** (the RPD count at a new PT day): the turn isn't upgraded, and spill
+  still works. The failure is logged and counted. Not upgrading is the safe choice, because it
+  keeps smart quota back.
+- **A decision-log write fails:** as today, logged and counted, and the request is never failed
+  (§16.8 1d). The demand curve misses that turn.
+- **Restart:** RPD counts, exhausted state and the decision log are in SQLite, so pacing goes on
+  where it was. Only the cached curve is rebuilt.
+- **Existing config and data:** without an `auto:` block nothing changes. Migration 3→4 adds a
+  nullable column and doesn't change existing rows.
+- **PT midnight:** `used` and `share` both go back to 0. A turn upgraded at 23:59 keeps its owner
+  after midnight (§5.1), and that model's new day pays for its later steps.
+- **Upgraded turns and 5 RPM:** a smart model allows 5 requests a minute, so a fast tool loop on
+  an upgraded turn can get short 429s, as on `gemini-smart` today (§16.8 `handoff_after_s`). This
+  is accepted for step 2. The decision log's `errors` on `pace-upgrade` rows shows whether it
+  matters, and a step 4 change can follow if it does.
+- **No quota is spent** by any of this. Every number comes from requests clients sent.
+
+#### 16.9.7 Not in step 2, cost, tests
+
+- Not in step 2: rules (step 3; their reason is the rule name, and the `paced` reason arrives
+  with them, because only a rule-preferred turn can be ahead of the line), Gemma's `small` tier,
+  the reliability and token-margin adaptations, and the suggestion report (steps 4–5, §16.5).
+- Cost: one dict walk over the paced models at each turn start, and one indexed query per PT
+  hour. It makes no upstream calls.
+- Offline tests:
+  - The upgrade formula at `share` 0, mid-day and 1, with an exhausted or disabled member, and
+    with smart quota used through another route.
+  - Each curve source and when it switches to the next one. The `steps = 0` and follow-up rows
+    are left out. The fall-back day never lowers `share`.
+  - Candidate order for each row of the table above, including handoff targets taken from the
+    owner's tier.
+  - Config validation for each rule in 16.9.1.
+  - Migration 3→4 on a version-3 file that has `turns` rows.
+  - Headers on served, 429 and 503 responses, and none on other routes.
+  - A failed state read gives `default`, and a failed curve query keeps the last curve.
+- Live, by hand: one Zoo Code profile on `gemini-auto` for a normal working day. Check the headers,
+  see `/status` `left` fall roughly with `share`, and see most of the smart pool used by the end of
+  working hours. No probe and no extra requests are needed.
+
+**Approved with these choices (2026-11-22):**
+
+1. The smart tier is paced as one pool, best model first, not each model on its own line.
+2. The demand curve comes from the decision log in step 2, not from a separate table in step 4.
+3. The measured curve is used once 7 PT days in the last 14 have turns (as in §16.5).
+4. `reserve: 5`, and a top-level `auto:` block in place of an entry under `routes:`.
 
 ## 17. Observability — layers 1–5 and local collection approved 2026-11-21 (§21); alerts and remote rows proposed
 
