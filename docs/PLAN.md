@@ -367,6 +367,8 @@ Steps 1–4 done 2026-11-24 (branch `short-wait-holds`, `tests/test_stream_token
 regression test fails on the old code): `.venv/bin/python -m pytest -q` and
 `docker compose run --build --rm test` pass (766); `code-reviewer` found no defect, and its test
 gaps (`read_error`, a shared turn row, the metric on every ending) are closed.
+Step 5 done 2026-11-24 (probe-results "Live check of DESIGN §27"): a 61-chunk answer logged
+1,438 output tokens, and its turn row has the same.
 
 Also after v1: alerts (DESIGN §17.2 layer 6), a remote-hosting design (DESIGN §18)
 if the proxy is to run somewhere other than the user's machine.

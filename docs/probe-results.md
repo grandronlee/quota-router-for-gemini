@@ -464,3 +464,11 @@ dropped by the client 1.8 s in, before any byte). 33 streamed, 2 not (task title
   chunk. **`usage_seen: true` does not mean the stream finished**, so the live run 4 reading
   ("ended after one output token", "a usage chunk arrived, so Google probably finished") does
   not hold: that stream may have stopped mid-answer.
+
+### Live check of DESIGN §27 (PLAN stream token counts step 5), 2026-11-23 23:38 PT
+
+- Setup: proxy on `76da6a3`, rebuilt and recreated 2026-11-24 07:37 UTC (log saved first). One
+  request on `gemini-fast` for an answer of about 800 words.
+- Result: 3.5 Flash-Lite, 61 chunks, `done` / `stop`, prompt 41,774, **output 1,438** in the
+  request log, and the same 1,438 in its turn row. Under the old code the turn row before it
+  (5 steps, written by `60c2755`) has 186 output tokens. **PASS.**
