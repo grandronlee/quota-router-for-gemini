@@ -333,6 +333,20 @@ DESIGN §25.10. Step 6 done 2026-11-24 (probe-results "Live run 4"): 8 holds, al
 to either client; Copilot waited through 52 s first bytes. Its turn ended on an upstream
 mid-stream truncation, not a block, so a fully finished Copilot turn is not yet seen.
 
+Stream-ending detail (DESIGN §26, approved 2026-11-24: `stream_end` on every stream line, no
+metric, Gemini's `finish_reason` values checked live), in order:
+
+1. HTTP layer: `stream_end` (`end`, `error`, `chunks`, `finish_reason`, `usage_seen`, `idle_ms`)
+   tracked in `StreamSession` and written by its finaliser.
+2. Offline tests from DESIGN §26.4.
+3. Validation: `.venv/bin/python -m pytest -q`, `docker compose run --build --rm test`, then
+   `code-reviewer` (stream ingestion).
+4. Live: save the log, recreate, and read `stream_end` over the next live runs (§26.5).
+
+Steps 1–3 done 2026-11-24 (branch `short-wait-holds`, `tests/test_stream_end.py`):
+`.venv/bin/python -m pytest -q` and `docker compose run --build --rm test` pass (754);
+`code-reviewer` found nothing significant, and its two test gaps are closed.
+
 Also after v1: alerts (DESIGN §17.2 layer 6), a remote-hosting design (DESIGN §18)
 if the proxy is to run somewhere other than the user's machine.
 

@@ -2941,3 +2941,90 @@ places (marked **amended**; both approved 2026-11-24):
   (`await routing`, closing handles) loses that request's line and hold count, as non-held
   requests already do. `in_flight` stays right.
 - **Rollback:** as §25.7. No schema change; remove `hold_max_s` before running an older image.
+
+## 26. How a stream ended, in the request log — approved 2026-11-24
+
+### 26.1 What failed
+
+In live run 4 (probe-results), the last step of a Copilot turn on 3.5 Flash-Lite ended in
+`stream_incomplete` (request `b6229912c054488b`, 06:53:34 UTC). It held 537 ms on `tpm`, had its
+first byte at 2.6 s and ended 2.7 s later. It had 68,916 prompt tokens by Google's count and 1
+output token. The proxy sent its error event, and Copilot showed "Response contained no
+choices" (it parsed that event, which has no `choices`). The behaviour followed §8 and §22.1.
+
+The line can't say why the stream stopped. `StreamSession.body()` writes `stream_incomplete` on
+two paths: the upstream body ended without `[DONE]` (a clean end of file), or reading it raised
+an httpx error (for example a dropped connection). Nothing logs which path ran; only non-httpx
+exceptions are logged. The line also doesn't say whether a `finish_reason` arrived before the end,
+or how many chunks came. `prompt_tokens` came from Google, so a `usage` chunk arrived, and
+probe-results says `usage` comes on the last content chunk. That suggests Google finished and
+only `[DONE]` was missing. It's one case, and it isn't confirmed.
+
+The answer decides any later fix. If streams that stop early have already sent a `finish_reason`,
+the proxy could treat the missing `[DONE]` as a clean end. If they stop mid-answer, it can't. This
+section only adds the evidence. It changes no behaviour.
+
+### 26.2 Change: a `stream_end` field
+
+Every line for a streamed request that reached its first byte gets `stream_end`, with metadata
+only (§10, §20.7):
+
+- **`end`**, from a fixed list:
+  - `done`: `[DONE]` arrived.
+  - `error_event`: an upstream error event (§8).
+  - `eof`: the body ended without `[DONE]` or an error event.
+  - `read_error`: reading the body raised.
+  - `client_gone`: the client went away first.
+- **`error`**: on `read_error` only, the exception's class name if it is an httpx exception
+  (`RemoteProtocolError`, `ReadError`, `ReadTimeout` and so on), else `other`. Never the
+  message, which can hold a URL.
+- **`chunks`**: upstream events that had a `data:` line, `[DONE]` not counted.
+- **`finish_reason`**: the last non-null `choices[].finish_reason` seen. Known values (`stop`,
+  `length`, `tool_calls`, `content_filter`) are logged as sent. Any other value is logged as
+  `other`, and null means none came. The values Gemini's OpenAI layer sends are an assumption,
+  to be checked against a live log (§26.5).
+- **`usage_seen`**: whether a chunk had `usage`. Today a null `prompt_tokens` can mean either case.
+- **`idle_ms`**: milliseconds from the last upstream event to the moment the ending was seen.
+  It's measured on the monotonic clock, as `latency_ms` is. It separates a connection that hung
+  and then dropped from one that closed at once.
+
+Example (illustrative values), the 06:53:34 case if Google finished and only `[DONE]` was
+missing: `"stream_end": {"end": "eof", "chunks": 3, "finish_reason": "stop", "usage_seen": true,
+"idle_ms": 12}`.
+
+- **Not changed:** `reason`, `attempts[].outcome`, §22.1's neutral treatment, the error event the
+  client gets, metrics and `/status`. The existing `stream_incomplete` outcome stays. `eof` and
+  `read_error` split it in the new field only.
+- **Not on:** non-streamed lines, and streams that never sent a first byte (they have no session).
+- **No metric.** One case so far, so the log is enough. A
+  `qr_stream_endings_total{model, end}` counter can follow if endings other than `done` recur.
+
+### 26.3 Failure paths
+
+- Counting must never stop a stream. The new fields are plain attribute updates in `_handle`.
+  `finish_reason` is read only from a chunk already parsed as a dict, and is skipped if
+  `choices` isn't a list of dicts.
+- An ending seen more than once (an error, then `finish()`) keeps the first `end`. `client_gone`
+  is set only in `finish()` when no other ending was recorded, as `client_disconnected` is today.
+- Older log files lack the field. `scripts/summarize_log.py` reads with `.get` and ignores it.
+- Size: about 100 bytes on stream lines.
+- Rollback: the field is only written to the log. An older image just doesn't write it.
+
+### 26.4 Tests
+
+- One test per `end` value, with a fake upstream: `[DONE]`, an error event, end of file without
+  `[DONE]`, an httpx `RemoteProtocolError` mid-stream (giving `error: "RemoteProtocolError"`), a
+  non-httpx exception (giving `other`), and a client disconnect.
+- `chunks` counts data events and leaves out comments and `[DONE]`. `finish_reason` keeps the last
+  non-null value. An unknown value gives `other`. `usage_seen` follows the usage chunk.
+- No exception message or chunk content appears in the line.
+- Non-streamed lines have no `stream_end`.
+- The regression case: usage, `finish_reason: "stop"`, then end of file gives `eof`, with the
+  `finish_reason` and `usage_seen: true`, while `reason` stays `stream_error`.
+
+### 26.5 Afterwards
+
+Deploy, then keep reading `stream_end` across live runs. Before §26.1's possible follow-up (a
+missing `[DONE]` after a `finish_reason` counts as a clean end), there must be at least one
+ending other than `done` that shows which case it was. That follow-up would be its own
+approved amendment.
