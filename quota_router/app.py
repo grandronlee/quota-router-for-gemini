@@ -50,6 +50,8 @@ log = logging.getLogger("quota_router")
 request_log = logging.getLogger(REQUEST_LOGGER)
 
 PRUNE_INTERVAL_S = 3600.0
+# finish_reason values logged as sent in `stream_end`; anything else is "other" (DESIGN §26.2).
+FINISH_REASONS = frozenset({"stop", "length", "tool_calls", "content_filter"})
 UNGUARDED_AUTH_PATHS = {"/healthz"}  # still behind the Host/Origin guard
 # /dashboard paths skip the bearer token too: they use a per-tab session header and a stricter
 # origin rule instead (dashboard.py, DESIGN §21.4).
@@ -298,7 +300,8 @@ class Proxy:
                prompt_tokens: int | None = None, output_tokens: int | None = None,
                first_byte_s: float | None = None, http_path: str | None = None,
                handoff_from: str | None = None, attempts: list[Attempt] | None = None,
-               outcome: Any = None, hold: Hold | None = None) -> None:
+               outcome: Any = None, hold: Hold | None = None,
+               stream_end: dict | None = None) -> None:
         """One request's metrics, /status counts and its JSON log line (DESIGN §17.2). With the
         route `outcome`, the line also gets gemini-auto's route fields and, for a 429 or 503 the
         proxy produced, its Retry-After and what blocked each candidate (DESIGN §24.1)."""
@@ -328,6 +331,8 @@ class Proxy:
             fields["handoff_from"] = handoff_from
         if hold is not None and hold.held:  # DESIGN §25.6, whatever the ending
             fields["hold"] = hold.log(now)
+        if stream_end is not None:  # DESIGN §26.2
+            fields["stream_end"] = stream_end
         if outcome is not None:
             fields.update(outcome_log_fields(outcome, now))
         request_log.info("request", extra={"fields": fields})
@@ -484,6 +489,42 @@ class StreamSession:
         # How the served call ended, for its `attempts` entry (DESIGN §22.4); None: still open.
         self.outcome: tuple[str, int | None] | None = None
         self.status = served.attempt.status if served.attempt else None
+        # How the stream ended, for the line's `stream_end` (DESIGN §26.2). The first event was
+        # read just before the session was made, so it counts as arriving now.
+        self.end: str | None = None
+        self.end_error: str | None = None
+        self.idle_ms: int | None = None
+        self.chunks = 0
+        self.finish_reason: str | None = None
+        self.usage_seen = False
+        self.last_event_at = time.monotonic()
+
+    def _end(self, kind: str, error: str | None = None) -> None:
+        """Record the first ending seen (DESIGN §26.3)."""
+        if self.end is None:
+            self.end, self.end_error = kind, error
+            self.idle_ms = round(max(0.0, time.monotonic() - self.last_event_at) * 1000)
+
+    def _see_chunk(self, obj: dict) -> None:
+        """Counts for `stream_end` from one parsed chunk; never raises (DESIGN §26.3)."""
+        if "usage" in obj and isinstance(obj.get("usage"), dict):
+            self.usage_seen = True
+        choices = obj.get("choices")
+        if not isinstance(choices, list):
+            return
+        for choice in choices:
+            if isinstance(choice, dict):
+                fr = choice.get("finish_reason")
+                if fr is not None:
+                    self.finish_reason = fr if isinstance(fr, str) and fr in FINISH_REASONS else "other"
+
+    def stream_end(self) -> dict:
+        out: dict[str, Any] = {"end": self.end}
+        if self.end == "read_error":
+            out["error"] = self.end_error
+        out.update(chunks=self.chunks, finish_reason=self.finish_reason,
+                   usage_seen=self.usage_seen, idle_ms=self.idle_ms)
+        return out
 
     def _complete(self, prompt_tokens: int | None) -> None:
         ids, self.pending_ids = self.pending_ids, []
@@ -586,13 +627,17 @@ class StreamSession:
     def _handle(self, ev: SSEEvent) -> tuple[bytes | None, bool]:
         """Process one upstream event; returns (bytes to send, stop)."""
         if ev.is_done:
+            self._end("done")
             self.done = True  # a clean end: the settling write may store "" (DESIGN §23.8)
             self._complete_if_needed()  # before [DONE] reaches the client (router contract)
             self.outcome = ("stream_complete", self.status)
             self.p.router.stream_done(self.served)  # the model recovered (DESIGN §22.1); never raises
             return ev.raw, True
+        if ev.data is not None:
+            self.chunks += 1
         err = ev.error()
         if err is not None:  # mid-stream upstream error: one error event, no [DONE]
+            self._end("error_event")
             self.reason = "stream_error"
             self._complete_if_needed()
             self._record_stream_error(err, ev)
@@ -600,6 +645,7 @@ class StreamSession:
             return b"data: " + self._scrub.text(json.dumps(payload)).encode("utf-8") + b"\n\n", True
         obj = ev.json()
         if isinstance(obj, dict):
+            self._see_chunk(obj)
             for key, i, raw in tool_call_parts(obj, "delta"):
                 call = self._track(key, i)
                 if raw is not None:
@@ -628,24 +674,29 @@ class StreamSession:
             try:
                 ev = await anext(self.stream.events, None)
             except Exception as e:  # httpx errors and anything unexpected; cancellation propagates
-                if not isinstance(e, (httpx.HTTPError, httpx.StreamError)):
+                known = isinstance(e, (httpx.HTTPError, httpx.StreamError))
+                if not known:
                     log.exception("reading the upstream stream failed")
+                self._end("read_error", type(e).__name__ if known else "other")  # never the message
                 self.reason = "stream_error"
                 self.outcome = ("stream_incomplete", self.status)  # neutral (DESIGN §22.1)
                 self._complete_if_needed()
                 yield self._error_event(f"upstream stream failed: {type(e).__name__}")
                 return
             if ev is None:
+                self._end("eof")
                 self.reason = "stream_error"
                 self.outcome = ("stream_incomplete", self.status)  # neutral (DESIGN §22.1)
                 self._complete_if_needed()
                 yield self._error_event("upstream stream ended before [DONE]")
                 return
+            self.last_event_at = time.monotonic()
 
     async def finish(self) -> None:
         if self.finished:
             return
         self.finished = True
+        self._end("client_gone")  # only if no other ending was seen (DESIGN §26.3)
         if not self.done and self.reason == "served":
             self.reason = "client_disconnected"
         if self.served.attempt is not None:
@@ -665,7 +716,7 @@ class StreamSession:
                       input_estimate=self.input_estimate, prompt_tokens=self.prompt_tokens,
                       output_tokens=self.output_tokens, first_byte_s=self.first_byte_s,
                       handoff_from=self.served.handoff_from, attempts=self.attempts, outcome=self.served,
-                      hold=self.hold)
+                      hold=self.hold, stream_end=self.stream_end())
 
 
 class ManagedStream(StreamingResponse):
