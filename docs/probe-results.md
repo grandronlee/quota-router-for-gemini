@@ -359,3 +359,55 @@ and 3.4 s.
 
 - Result: **PASS** for checks 1, 3, 4 and 5 and for check 2's rule match; check 2's switch to
   `paced` is not verified and needs a session that drains smart to `rule_above`.
+
+### Live run 4: short-wait holds (DESIGN §25, PLAN short-wait holds step 6), 2026-11-23 22:46–22:55 PT
+
+- Setup: proxy on `6c6a5eb`, rebuilt and recreated 2026-11-24 06:44 UTC with `hold_max_s: 60`
+  (`request_deadline_s` 180, `handoff_after_s` 60). One VS Code Copilot Chat agent-mode turn on
+  `gemini-auto` (95 tools; a read-every-file task), then, overlapping its end, one Zoo Code task
+  on `gemini-fast` (3.5 Flash-Lite only). **About 10 minutes of use.**
+- Evidence: request log `data/request-log-2026-11-24T064443Z.jsonl` (36 requests), `/status` at
+  06:55 UTC. Metadata only.
+
+Requests: 36 × 200 (35 `served`, 1 `stream_error`), **no 429 and no 503 to either client**.
+`/status` `holds`: served 8, passthrough 0, refused 0, cancelled 0, error 0, `in_flight` 0.
+
+**Copilot turn** (06:50:27–06:53:34 UTC, 14 steps, 55–83 k estimated input tokens a step):
+
+| UTC | Model | Hold (limits, ms) | First byte |
+|---|---|---|---|
+| 06:50:56 | 2.5 Flash | `rpm`, 19,154 | 20.6 s |
+| 06:51:26 | 2.5 Flash | `rpm` + `tpm`, 27,185 | 29.0 s |
+| 06:51:29 | → 3.5 Flash-Lite (`handoff`; later steps `mixed`) | — | 2.2 s |
+| 06:52:28 | 3.5 Flash-Lite | `tpm`, 50,268 | 52.3 s |
+| 06:52:31 | 3.5 Flash-Lite | `tpm`, 473 | 2.4 s |
+| 06:52:35 | 3.5 Flash-Lite | `tpm`, 1,915 | 3.8 s |
+| 06:53:28 | 3.5 Flash-Lite | `tpm`, 50,258 | 52.4 s |
+| 06:53:34 | 3.5 Flash-Lite | `tpm`, 537 | 2.6 s, then `stream_incomplete` |
+
+- Copilot waited through every hold, including two first bytes of **52 s**, with no retry of
+  its own. This is the turn shape that failed in live run 3 (Flash-Lite `tpm`, 429 at 32 s and
+  52 s).
+- **The turn still ended in an error**, at its last step: Google's stream ended before `[DONE]`
+  after one output token (`stream_incomplete`, 4.8 s), and Copilot showed "Sorry, your request
+  failed … Response contained no choices." The hold was not the cause (it ended at 0.5 s and the
+  first byte arrived). The line has `hold` and was counted once as `served`, the §25.9 "held
+  stream that fails after the first byte" case.
+- Restores on the `mixed` steps after the handoff: e.g. `restored` 8, `placeholder` 0 on the last.
+
+**Zoo Code task** (06:53:30–06:55:01 UTC, 17 requests on 3.5 Flash-Lite, 12–22 k tokens a step):
+one hold, `tpm`, 33,843 ms (first byte 35.2 s), served; no 429 countdown. For its first 4 s it
+shared Flash-Lite's TPM window with the Copilot turn; neither was refused.
+
+**Checks against DESIGN §25.9 (live):**
+
+1. `hold` lines appear, with `limits` `rpm`/`tpm` only: **PASS** (8).
+2. No "request failed" from a 429: **PASS.** The one failure was an upstream stream truncation.
+3. The turn finishing: **not verified.** The Copilot turn reached its final summary step and was
+   cut there by Google's stream, not by a block.
+4. Copilot's first-byte tolerance: **at least 52.4 s** (observed twice, Copilot Chat in VS Code).
+5. Zoo Code unchanged apart from `hold` lines: **PASS** (one hold, no countdown).
+
+- Result: **PASS** for the hold itself (8 held, 8 served, 0 refused). Open: a Copilot turn that
+  finishes end to end; mid-stream truncation on 3.5 Flash-Lite (one case, outcome
+  `stream_incomplete`) is a separate item.

@@ -329,7 +329,9 @@ one routing context and one hold per request; no decision-log column), in order:
 
 Steps 1–5 done 2026-11-24 (branch `short-wait-holds`): `.venv/bin/python -m pytest -q` and
 `docker compose run --build --rm test` pass (742). The readings and two amendments are in
-DESIGN §25.10. Step 6 is open.
+DESIGN §25.10. Step 6 done 2026-11-24 (probe-results "Live run 4"): 8 holds, all served, no 429
+to either client; Copilot waited through 52 s first bytes. Its turn ended on an upstream
+mid-stream truncation, not a block, so a fully finished Copilot turn is not yet seen.
 
 Also after v1: alerts (DESIGN §17.2 layer 6), a remote-hosting design (DESIGN §18)
 if the proxy is to run somewhere other than the user's machine.

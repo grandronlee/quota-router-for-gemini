@@ -41,7 +41,7 @@ their own status. Code and docs cite sections as "DESIGN §N".
 | 23 | [Restoring thought signatures that clients drop](#23-restoring-thought-signatures-that-clients-drop--approved-2026-11-21-implemented-2026-11-21) | approved; implemented (amendments in §23.8) |
 | 23.8 | ↳ [After review](#238-after-review--fixes-settled-2026-11-22-amendments-approved-and-implemented-2026-11-22) |  |
 | 24 | [Request-log detail and a per-model first-byte timeout](#24-request-log-detail-and-a-per-model-first-byte-timeout--approved-2026-11-22) | approved 2026-11-22 |
-| 25 | [Short waits: hold the request instead of answering 429](#25-short-waits-hold-the-request-instead-of-answering-429--approved-2026-11-24) | approved 2026-11-24; implemented 2026-11-24 (§25.10), live check pending |
+| 25 | [Short waits: hold the request instead of answering 429](#25-short-waits-hold-the-request-instead-of-answering-429--approved-2026-11-24) | approved 2026-11-24; implemented 2026-11-24 (§25.10), live check done (probe-results "Live run 4") |
 
 ## 0. v1 scope
 
