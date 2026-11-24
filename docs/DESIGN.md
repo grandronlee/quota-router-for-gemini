@@ -28,9 +28,10 @@ their own status. Code and docs cite sections as "DESIGN §N".
 | 13 | [Alternatives considered](#13-alternatives-considered) | core |
 | 14 | [Failure-mode summary](#14-failure-mode-summary) | core |
 | 15 | [Clients](#15-clients) | core |
-| 16 | [After v1: automatic routing (`gemini-auto`)](#16-after-v1-automatic-routing-gemini-auto--proposed-pending-approval) | proposed; step 1 (§16.8) approved and implemented; step 2 (§16.9) approved |
+| 16 | [After v1: automatic routing (`gemini-auto`)](#16-after-v1-automatic-routing-gemini-auto--proposed-pending-approval) | proposed; step 1 (§16.8) approved and implemented; step 2 (§16.9) approved; step 3 (§16.10) approved |
 | 16.8 | ↳ [Step 1 in detail: `gemini-smart`, handoffs and the decision log](#168-step-1-in-detail-gemini-smart-handoffs-and-the-decision-log--approved-2026-11-21) |  |
 | 16.9 | ↳ [Step 2 in detail: `gemini-auto` with tiers, spill and pacing](#169-step-2-in-detail-gemini-auto-with-tiers-spill-and-pacing--approved-2026-11-22) | approved 2026-11-22; amendment §16.9.8 deferred |
+| 16.10 | ↳ [Step 3 in detail: a client probe, then rules for `gemini-auto`](#1610-step-3-in-detail-a-client-probe-then-rules-for-gemini-auto--approved-2026-11-23) | approved 2026-11-23 |
 | 17 | [Observability](#17-observability--layers-15-and-local-collection-approved-2026-11-21-21-alerts-and-remote-rows-proposed) | layers 1–5 approved; alerts and remote rows proposed |
 | 18 | [Hosting](#18-hosting--local-docker-and-tailscale-approved-2026-11-21-21-remote-hosting-proposed) | local Docker and Tailscale approved; remote hosting proposed |
 | 19 | [Other accounts and billing](#19-other-accounts-and-billing--approved-2026-11-21) | approved |
@@ -1128,6 +1129,12 @@ taken from the first of these sources that applies:
 hint. Moving turns more readily would trade some waiting for more model switches inside a tool
 turn. The proposal is kept below for when that check is done.
 
+**Check done (2026-11-23):** Zoo Code honors `Retry-After` exactly: in live run 2, its next
+request came 10–29 ms after each of 19 hints (PLAN, "Live run 2"). A 429 inside a turn therefore
+costs the hinted wait and nothing more. The amendment stays deferred. It is about quota balance
+(a fast turn spending the smart pool), not about 429s, and run 2 had no fast turn handed to smart.
+Reconsider it if that happens again.
+
 **What the first live run showed (2026-11-22).** A Zoo Code Code-mode task on `gemini-auto` was
 decided `default` and started on 3.5 Flash Lite. At its fourth step, 3.5 Flash Lite and
 2.5 Flash Lite both answered 503 at once, so the turn was handed off to 3 Flash (§16.8). A
@@ -1199,6 +1206,287 @@ decided for that tier, instead of the other tier's.
 
 **Not in this amendment:** Zoo Code's task-title requests taking upgrades (a step 3 rule), and
 4 Hydrogen's timeouts (the §22 cooldown already handles them; watch it for a day).
+
+### 16.10 Step 3 in detail: a client probe, then rules for `gemini-auto` — approved 2026-11-23
+
+**What step 3 does.** Step 2 decides a turn's tier only from pacing. Step 3 adds ordered rules
+(§16.4) that look at a turn start's request and choose its tier first. Rules decide *which* turns
+get smart first; the pace line still decides *how many* (§16.3). Two needs come from live run 1
+and the logs since:
+
+- **Keep tiny requests on fast.** Zoo Code sends a task-title request (60–90 prompt tokens, no
+  tools) as its own turn. Under step 2 it can take a smart upgrade like any other turn start. On
+  2026-11-22 one such request (89 prompt tokens) was decided as its own turn start. It stayed on
+  fast only because the pool was ahead of the line at the time.
+- **Send planning turns to smart first.** Architect- and Orchestrator-style turns gain most from
+  the smart tier. Step 2 can only upgrade them when the pool happens to be behind the line.
+
+A rule may depend only on what the client really sends, and §16.4 requires a probe before any
+rule relies on mode text. So step 3 comes in two parts: **3a**, a probe that captures Zoo Code's
+requests without spending quota; then **3b**, the rule engine, with the patterns taken from 3a.
+
+#### 16.10.1 Part 3a: capturing what the client sends
+
+The request log is metadata only (§10, §20.7) and doesn't hold system prompts or tool lists, and
+Zoo Code's task history (`globalStorage/.../tasks/*/history_item.json`) records the mode and
+profile but not the request. The probe is therefore a separate stand-in server, run by hand like
+`scripts/probe.py`. The proxy doesn't change.
+
+`scripts/capture_client.py`:
+
+- Standard library only, so it runs with `python -I`. It binds a loopback address only:
+  `127.0.0.1` by default, or `::1` or `localhost` with `--host` (default port 4010, `--port`). Any
+  other address is refused. It never opens a connection of its own, so it spends **no quota**.
+  A body over 64 MB gets a 413, and a connection that stalls for 30 s is dropped.
+- `GET /v1/models` (and `/models`) lists `gemini-auto` (`--models` to change it), so a client
+  profile can pick a model. `POST /v1/chat/completions` (and `/chat/completions`) captures the
+  request and answers it.
+- **The answer ends the task at once.** If the request offers a tool named `attempt_completion`,
+  the answer is one call to it, with each required string parameter set to `capture ok`.
+  Otherwise it is the text `capture ok`. Streamed (SSE chunks, then `data: [DONE]`) or not, as the
+  request asks. A finished task lets Zoo Code send its title request, which is captured too.
+- **Each capture** is written to `data/capture/<seq>-<UTC time>.json` (folder `0700`, file
+  `0600`, `data/` is git-ignored). An existing folder that isn't private, or a symlink, is refused
+  rather than changed (found in review, 2026-11-23: `--out ~` would have made the home folder
+  `0700`). Each capture holds:
+  - `received_at`, the `User-Agent` value (client prompts change between versions, §16.4), and
+    no other header. The `Authorization` value is never stored.
+  - `shape`: `model`, `stream`, the top-level keys, `reasoning_effort`, `max_tokens`,
+    `max_completion_tokens`, `temperature`, `tool_choice`, the number and names of `tools`, the
+    message roles in order, the characters per role, the characters of the system text and of
+    the last user message, and whether any message carries an image or a tool result.
+  - `markers`: the first three lines of the system text that start with `You are`, and the lines
+    that name a mode (the word `mode` in any case, or a `<slug>…</slug>` tag), kept separately for
+    the system text and the last user message, at most 20 each. (Found in review, 2026-11-23: one
+    shared list let a long system prompt, full of "model" and "modes", crowd out the user
+    message's lines, which may be where the mode is.)
+  - `body`: the full request, after a scrub of anything shaped like a Google key (`AIza…`) and the
+    `GEMINI_API_KEY` and `PROXY_TOKEN` values if they are set in its environment. A rule pattern
+    has to be written from the real text, so the body is kept, but only on this machine.
+- `--summary` prints one tab-separated row per capture from the `shape` and `markers` fields,
+  including the marker lines themselves, so patterns can be written without opening the files, for
+  `docs/probe-results.md`. The results file gets only these fields and the chosen patterns, never
+  prompt text beyond the marker lines. After that, `--clean` deletes the captures; the script
+  prints this command when it exits.
+- **It only touches files it wrote.** A file counts as a capture only if all of these hold:
+  - its name is in the exact form the script writes (`<4+ digits>-<YYYYMMDDTHHMMSSffffffZ>.json`);
+  - it is a regular file, not a symlink, and is opened without following one;
+  - it carries the script's `"written_by": "scripts/capture_client.py"` marker.
+
+  `--summary` reads only captures and `--clean` deletes only captures. Only the default
+  `data/capture/`, which the script owns, is then removed, and only if empty; a folder given with
+  `--out` is never removed. The exit reminder prints the exact `--clean` command, with an absolute,
+  shell-quoted `--out`, so it can be pasted from any directory. Not defended: another process
+  swapping or re-linking the folder, or a folder above it, while `--clean` runs. This is a
+  by-hand tool on the owner's machine. (Found in review, 2026-11-24, in two rounds, the second by
+  Codex: the reminder said "Delete <folder>", the name alone decided, `--summary` followed a
+  symlink, an empty folder another tool made was removed, and a path with spaces or a relative
+  path broke the pasted command.)
+
+**Procedure (by hand, about 15 minutes):**
+
+1. Run `python -I scripts/capture_client.py`. Add a temporary Zoo Code profile `capture`
+   (OpenAI Compatible, base URL `http://127.0.0.1:4010/v1`, any key, model `gemini-auto`).
+2. In each mode (Code, Ask, Architect, Debug, Orchestrator and the custom `code-reviewer`), start
+   a new task with a one-line prompt. Each ends at once with `capture ok`.
+3. If the profile offers a reasoning-effort setting, repeat one mode with it set to high.
+4. Optional: one Copilot Chat ask and one agent request against the same port, to check that no
+   rule would misfire on Copilot.
+5. Record the `--summary` rows in `docs/probe-results.md`, then run `--clean` and remove the
+   profile.
+
+**What 3a must answer** (each is an assumption until then):
+
+- Where the mode shows: the system prompt's role line, a mode line in the last user message
+  (Roo-family clients add an environment block there), or both.
+- Whether the title request is recognisable from metadata alone (no tools and a small estimate)
+  or needs a pattern.
+- Whether Zoo Code sends `reasoning_effort`, and with which values.
+- Whether any of this differs between modes in a way that metadata already shows, for example
+  the number of tools.
+
+#### 16.10.2 Part 3b: rules
+
+**Config.** A `rules` list in the `auto:` block (§16.9.1); first match wins:
+
+```yaml
+auto:
+  # ... tiers, default_tier, pacing as in §16.9.1
+  rules:
+    - name: task-title
+      when: { max_tools: 0, max_input_tokens: 500 }
+      tier: fast
+    - name: planning-mode
+      when:
+        system_line_prefix:
+          - "You are Zoo, an experienced technical leader"
+          - "You are Zoo, a strategic workflow orchestrator"
+      tier: smart
+```
+
+Conditions in `when`; all of a rule's conditions must hold, and a rule needs at least one:
+
+| Condition | Matches when |
+|---|---|
+| `system_line_prefix` | a line of the system text begins with one of the listed strings (the text's start, or right after a newline). The system text is the `system` and `developer` messages' text, joined by newlines, first 32,768 characters |
+| `min_tools`, `max_tools` | the number of `tools` is within the bounds |
+| `min_input_tokens`, `max_input_tokens` | the request's input estimate (§5 step 3, before any model's margin) is within the bounds |
+| `reasoning_effort` | the request's `reasoning_effort` is one of the listed strings (kept only if 3a shows a client sends it) |
+
+- A content part that isn't text, or a message whose content isn't a string or a list of parts,
+  adds nothing. A malformed request matches no text condition and is never failed by a rule.
+- The search is cut to 32,768 characters, and prefixes are matched literally, so one turn start's
+  cost is linear in that text (amendment below). Zoo Code's system prompts run to 12–15K
+  characters, and the role line that names a mode is their first line (3a).
+- **(decide, after 3a)** If 3a shows that the mode appears only in the last user message, add
+  `user_matches`, searched in the last user message's text in the same way. This reads more of
+  the request than §16.4 planned. Like `system_line_prefix`, the text is only matched, never stored
+  or logged.
+
+**Validation.** `rules` is optional. Each rule's `name` is unique, uses the tier-name characters
+(§16.9.1, because it is sent in a header), and isn't one of the reserved reasons: `default`,
+`pace-upgrade`, `spill`, `paced`, `pinned`, `handoff`, `handback`, `unknown`, `first`, `mixed`.
+`tier` names a configured tier. `when` has only the keys above. Each prefix is a non-empty string
+with no newline, in a non-empty list. Bounds are
+integers ≥ 0 with min ≤ max. `reasoning_effort` is a non-empty list of strings.
+
+**Decision at a turn start.** Rules are evaluated only where step 2 decides (§16.9.4): a turn start,
+or a follow-up with no known call. A pinned follow-up keeps its owner as today, so one decision
+still covers the turn (§16.1).
+
+| Case | Turn starts on | `x-route-reason` |
+|---|---|---|
+| a rule names the paced tier, and `left > max(0, capacity × (1 − share) − reserve)` | paced tier, then the others | the rule's name |
+| a rule names the paced tier, and the pool is past that line | default tier, then the others | `paced` |
+| a rule names any other tier | that tier, then the others; **never upgraded** | the rule's name |
+| no rule matches | as in step 2 | `default` / `pace-upgrade` |
+| any of these, served outside the tier it starts on | (as above) | `spill` |
+
+- **The rule line is a turn-start threshold.** A paced-tier rule's turn *starts* on smart while
+  the pool is no more than `reserve` requests past the line. This is §16.3's "`pace(t) + burst`",
+  restated for the one pool: `used < pace(t) + reserve` is
+  `left > capacity × (1 − share) − reserve`. A turn without a rule is upgraded only while the pool
+  is *behind* the line by the reserve (§16.9.2). So rule-matched turns get smart quota first, and
+  upgrades get what they leave.
+- **Smart use can still pass the rule line** (found in review, 2026-11-24), as with step 2's line
+  (§16.9.2), because the test covers only where a turn starts:
+  - the later steps of a turn that started on smart stay with their owner (§5.1), however many
+    there are;
+  - a turn that starts on fast, `paced` or not, spills into smart when every fast model is out
+    (§16.9.4), and its pinned steps then stay there;
+  - concurrent turn starts (§16.10.4).
+  Each turn start after that sees less `left`, so later turns start on fast until demand catches
+  up. The line bounds where turns start, not the requests they make.
+- **A rule that names a non-paced tier means "keep this turn there".** Without that, a `fast` rule
+  would do nothing, because the default tier is already fast. This is what keeps the title request
+  off the smart pool.
+- `x-route-tier` is the tier the turn **starts on**, so a `paced` turn shows the default tier, and
+  is a `spill` only if it is then served outside it.
+- If the pace can't be read, a paced-tier rule's turn starts on the default tier as `paced`, and
+  the failure is logged and counted. This is the same safe choice as §16.9.6.
+
+#### 16.10.3 Visibility and the decision log
+
+- **Decision log:** migration 4→5 adds `rule TEXT` to `turns`, the matched rule's name, NULL when
+  no rule matched and on old rows. `reason` keeps its meaning (the rule's name, `paced`, `spill`
+  and so on), so a rule-matched turn that spilled or was paced still names its rule. The suggestion
+  report (step 5) groups by `rule`.
+- **Request log:** `route_rule` alongside `route_tier` and `route_reason` (§24.1), on `gemini-auto`
+  turn starts that matched a rule.
+- **`/status`:** `auto.pace` gains `rule_above`, the `left` a paced-tier rule needs.
+  `turn_starts_today_by_reason` gains the rule names and `paced`.
+- **Metrics:** `qr_route_decisions_total{reason,tier}` takes rule names as `reason`. They come from
+  config, so the labels stay bounded (§17.1). A new gauge, `qr_pace_rule_above`.
+- **Demand curve:** rule-matched turn starts count like any other (§16.9.3). A title request
+  therefore counts as its own turn start. It comes with every new task, so it scales the curve
+  rather than changing its shape, and that is accepted.
+
+#### 16.10.4 Failure paths
+
+- **Existing config and data:** without `rules`, nothing changes. Migration 4→5 adds a nullable
+  column and doesn't change existing rows. A config that was valid stays valid.
+- **A bad prefix list** is a config error at startup, never at request time. No prefix can make
+  matching slow, because the match is literal.
+- **A prefix that matches too much:** matching turns start on smart until the pool is `reserve`
+  past the line, then they become `paced`. Their steps already under way can take it further,
+  as above. Over-matching costs routing quality, never refusals (§16.1).
+  `turn_starts_today_by_reason` shows it.
+- **Client prompts change between versions.** A prefix that stops matching makes those turns
+  `default` again, which is step 2's behaviour. The probe can be re-run, and the probe results
+  record the client's `User-Agent`.
+- **Concurrent turn starts** read the pace without a lock, as in §16.9.4, and can overshoot the
+  rule line by one turn. Accepted for the same reason.
+- **PT midnight, restart:** as §16.9.6. Rules hold no state.
+- **No quota is spent** by 3a or 3b.
+
+#### 16.10.5 Not in step 3, cost, tests
+
+- Not in step 3: the deferred hand-back (§16.9.8), Gemma's `small` tier, and the adaptations and
+  report of steps 4–5.
+- Cost: at most one literal search per prefix over 32,768 characters per turn start.
+  Follow-ups don't evaluate rules.
+- Offline tests:
+  - Each condition, alone and combined, including bounds at their edges, text in list content
+    parts, `developer` messages, and text past 32,768 characters not being searched. A prefix
+    matches at the text's start and after a newline, not mid-line.
+  - First match wins, and no match gives step 2's decision.
+  - The paced-tier rule's line at `share` 0, mid-day and 1, and `paced` past it. A non-paced rule
+    is never upgraded, even when step 2 would upgrade.
+  - `spill` on a rule turn served outside its tier, with `rule` still recorded.
+  - A failed pace read on a rule turn gives `paced` and counts a state error.
+  - Pinned follow-ups ignore rules. An `unknown` follow-up evaluates them.
+  - Each validation rule, including reserved names, an empty prefix and one with a newline.
+  - Migration 4→5 on a version-4 file that has `turns` rows.
+  - `route_rule`, `rule_above`, the gauge, and no rule fields on other routes.
+  - The capture script, offline: a request in and its answer out, streamed and not, for the
+    `attempt_completion` and plain-text cases; file modes `0600` and `0700`; the scrub; a refused
+    non-loopback address.
+- Live, by hand: after 3a's prefixes are set, one working day on `gemini-auto`. Title requests
+  show `task-title` on fast; planning-mode turns show their rule on smart until `paced`.
+
+**Approved with the recommended choices (2026-11-23):**
+
+1. A paced-tier rule's turn starts on smart until the pool is `reserve` past the line, then it
+   becomes `paced` (a turn-start threshold; its steps can go further, §16.10.2). The
+   alternative: smart while any smart quota is left, which lets a day of Architect work empty the
+   pool by mid-morning.
+2. A rule naming a non-paced tier blocks the upgrade. The alternative is a separate `upgrade: false`
+   flag; with no other use for a fast rule, the flag adds nothing.
+3. A `rule` column (migration 4→5) instead of keeping the rule only in `reason`, which loses it on
+   `paced` and `spill` turns.
+4. Title requests count in the demand curve.
+5. `user_matches` is decided after 3a, only if the mode isn't in the system prompt.
+
+**3a done (2026-11-23):** the probe (probe-results.md, "Zoo Code request shapes per mode") found
+the mode in the system prompt's first line, so `user_matches` is not added. Patterns for 3b:
+`task-title` is `{ max_tools: 0, max_input_tokens: 500 }` on fast; `planning-mode` is
+`(?m)^You are Zoo, (?:an experienced technical leader|a strategic workflow orchestrator)\b` on
+smart. (Since the amendment below: the two literal prefixes in the config example above.) A bare mode name doesn't work, because every prompt lists all modes. Zoo Code sends
+`reasoning_effort: "low"` on every request, so a `reasoning_effort` rule would match everything;
+the condition stays in the engine for clients that vary it.
+
+**Amendment: literal line prefixes instead of a regular expression — approved 2026-11-24**
+(already applied to the text above). Found in review (2026-11-24): cutting the text to 32,768 characters bounds
+its length, not the matching time. A valid Python pattern with nested quantifiers can backtrack
+for minutes on a prompt well within that limit, and `re` has no timeout, so one config line
+could stall every `gemini-auto` turn start.
+
+- Replace `system_matches` with **`system_line_prefix`**: a non-empty list of literal strings. It
+  matches when any line of the system text begins with one of them (the text's start, or right
+  after a newline). The check is `text.startswith(p) or "\n" + p in text` for each prefix,
+  which runs in time linear in the text, with no backtracking. The 32,768-character cut stays.
+- The probe's pattern becomes
+  `system_line_prefix: ["You are Zoo, an experienced technical leader", "You are Zoo, a strategic workflow orchestrator"]`.
+  It matches the same 2 of the 10 captures (architect and orchestrator).
+- Validation: each prefix is a non-empty string with no newline. Case matters, as in the client's
+  text.
+- Alternatives:
+  - Keep `re` and run the search with a time limit in a worker thread. A stuck thread can't be
+    stopped in CPython, so a bad pattern would still use a core until the process restarts.
+  - Use the third-party `regex` package, which has a `timeout`. It adds a dependency to the
+    hash-locked requirements (§21.3) for a feature the probe didn't need.
+- Tests change accordingly: prefixes at the text's start and after a newline match; mid-line text
+  doesn't; text past 32,768 characters isn't searched.
 
 ## 17. Observability — layers 1–5 and local collection approved 2026-11-21 (§21); alerts and remote rows proposed
 
@@ -1753,7 +2041,6 @@ prevent that. The session now lives in the page, scoped to its exact origin.
   `GRAFANA_ADMIN_PASSWORD` in `.env` (compose refuses to start the profile without it). A
   provisioned data source and one dashboard (requests by status and reason, attempts by
   outcome, RPD used against limit, model state, first-byte latency).
-
 ### 21.7 `scripts/init_config.py`
 
 - Reads `GEMINI_API_KEY` from the environment or `.env`; calls `models.list` (the same call

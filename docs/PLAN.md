@@ -246,7 +246,9 @@ regression test that fails on the old code:
   no longer lowers it. This replaces the in-memory high-water mark.
 - `/status` leaves follow-up rows out of today's turn starts.
 
-The dashboard line has not been checked visually. Step 8 is pending.
+The dashboard's pace line was checked visually on 2026-11-24: it read "80 of 80 left · upgrades
+while above 15.9 · 81% of the day's demand gone (flat) · upgrading now", which matches the
+formula. Step 8 (a day of pacing) is pending.
 
 Live run 1 (2026-11-22), and what followed from it:
 - **The run:** 4 Hydrogen timed out at 120 s twice. A fast turn was handed off to 3 Flash after
@@ -266,7 +268,36 @@ Done 2026-11-22: DESIGN §24 (approved 2026-11-22):
   - A budget of 5 s or less cut short by the deadline is no longer cooled down.
   - The "ran out" tolerance scales with the budget.
   - Stale `limits` are cleared after a last-resort call or a 404.
-- **Still to do:** compare `retry_after_s` with Zoo Code's actual retry timing.
+- **Retry timing, checked 2026-11-23 (live run 2):** Zoo Code honors `Retry-After` exactly. A
+  10-minute Code task on `gemini-auto` got 19 of the proxy's 429s (14 RPM on 3.6 Flash and
+  2.5 Flash, 5 TPM on 3.5 Flash Lite at 40K-token prompts), with hints of 2–40 s. Each time, its
+  next request came 10–29 ms after the hint ran out. The waits added up to 223 s.
+- **Live run 2, other findings:** the upgraded turn moved 3.6 Flash → 2.5 Flash (an upstream
+  429) → 3.5 Flash Lite (a later handoff), so 4 Hydrogen, outside `handoff_targets` and second
+  in the tier, got no requests and its `first_byte_ms` is still unknown. Two task-title requests
+  (54 and 88 prompt tokens) were upgraded to 3.6 Flash, waited 19 s and 31 s for a first byte,
+  and took 2 of its 5 RPM while the task's own turn needed them. That is the case the
+  `task-title` rule (§16.10) is for.
+
+Step 3 (DESIGN §16.10, approved 2026-11-23 with the recommended choices: a paced-tier rule may
+run `reserve` ahead of the line, a non-paced rule blocks upgrades, a `turns.rule` column, title
+requests count in the demand curve, `user_matches` decided after the probe), in order:
+
+1. `scripts/capture_client.py` (§16.10.1) with its offline tests.
+2. Client probe by hand: one task per Zoo Code mode, optionally Copilot. Results (shape and
+   marker rows only) go into probe-results.md; then run `capture_client.py --clean`. Set the prefixes,
+   and decide `user_matches` (§16.10.2) from what the probe shows.
+   Done 2026-11-23: mode found in the system prompt's role line; no `user_matches`.
+   Amendment approved 2026-11-24: `system_line_prefix` (literal) replaces `system_matches`.
+3. Config: `auto.rules` and its validation, commented examples in `config.example.yaml` and
+   `scripts/init_config.py`.
+4. Router: rules at a turn start, the paced-tier rule line, `paced`, and spill for rule turns.
+5. Schema migration 4→5 (`turns.rule`); `route_rule` in the request log; `rule_above` in
+   `/status`; `qr_pace_rule_above`.
+6. Offline tests from DESIGN §16.10.5.
+7. Validation: `.venv/bin/python -m pytest -q`, `docker compose run --build --rm test`, then
+   `code-reviewer` (routing, a migration).
+8. Live check: one working day on `gemini-auto` with the rules set.
 
 Also after v1: alerts (DESIGN §17.2 layer 6), a remote-hosting design (DESIGN §18)
 if the proxy is to run somewhere other than the user's machine.

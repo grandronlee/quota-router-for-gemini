@@ -262,3 +262,34 @@ Task (read-only): read README.md, list docs/, read DESIGN §16.8, summarise hand
   request's `attempts` showed `restored: 1`, status 200.
 - Result: **PASS** for both clients (no 400, signatures restored); §23.7's expectation for Zoo
   Code was wrong and is corrected in DESIGN §23.8.
+
+### Zoo Code request shapes per mode (DESIGN §16.10.1), 2026-11-23 19:43–19:45 PT
+
+- Setup: `scripts/capture_client.py` on `127.0.0.1:4010`, Zoo Code 3.98.2 (`ZooCode/3.98.2`)
+  profile `quota-router-auto` pointed at it, one task continued through six modes with "Say hello."
+  10 captures; no quota spent. Raw captures deleted afterwards.
+
+| Mode | Tools | System chars | `reasoning_effort` | First system line (role) | Last user message |
+|---|---|---|---|---|---|
+| code | 13 | 14,638 | `low` | `You are Zoo, a highly skilled software engineer …` | `# Current Mode` / `<slug>code</slug>` |
+| architect | 11 | 14,459 | `low` | `You are Zoo, an experienced technical leader …` | `<slug>architect</slug>` |
+| ask | 9 | 12,247 | `low` | `You are Zoo, a knowledgeable technical assistant …` | `<slug>ask</slug>` |
+| debug | 13 | 14,845 | `low` | `You are Zoo, an expert software debugger …` | `<slug>debug</slug>` |
+| orchestrator | 6 | 13,278 | `low` | `You are Zoo, a strategic workflow orchestrator …` | `<slug>orchestrator</slug>` |
+| code-reviewer (custom) | 11 | 14,665 | `low` | `You are Zoo Code, a read-only reviewer. …` | `<slug>code-reviewer</slug>` |
+
+- Every request: `stream: true`, `reasoning_effort: "low"`, no image.
+- **The mode is in both places.** The system prompt's first line names the role, and the last user
+  message's environment block has `# Current Mode` and a `<slug>`. So `system_matches` is enough,
+  and `user_matches` is not added (DESIGN §16.10.2 choice 5).
+- **Anchor on the role line.** Every system prompt also lists all modes by name ("🏗️ Architect" mode
+  (architect) …), so a bare `architect` matched all 10 captures. The pattern
+  `(?m)^You are Zoo, (?:an experienced technical leader|a strategic workflow orchestrator)\b`
+  matched exactly the architect and orchestrator captures and none of the others.
+- **Title requests.** None were captured (the task was continued, not started afresh). The decision
+  log has them: all 10 turns with no tools were one request of 54–89 input tokens; every Zoo Code
+  turn with tools offered 6 or more. On `gemini-auto`, 4 of them took a `pace-upgrade`. So
+  `max_tools: 0, max_input_tokens: 500` identifies them from metadata alone.
+- **Tool counts alone don't identify a mode:** code and debug both offer 13, architect and
+  code-reviewer both 11.
+- Result: patterns settled for DESIGN §16.10 step 3b. Re-run this probe after a Zoo Code upgrade.
