@@ -41,6 +41,7 @@ their own status. Code and docs cite sections as "DESIGN §N".
 | 23 | [Restoring thought signatures that clients drop](#23-restoring-thought-signatures-that-clients-drop--approved-2026-11-21-implemented-2026-11-21) | approved; implemented (amendments in §23.8) |
 | 23.8 | ↳ [After review](#238-after-review--fixes-settled-2026-11-22-amendments-approved-and-implemented-2026-11-22) |  |
 | 24 | [Request-log detail and a per-model first-byte timeout](#24-request-log-detail-and-a-per-model-first-byte-timeout--approved-2026-11-22) | approved 2026-11-22 |
+| 25 | [Short waits: hold the request instead of answering 429](#25-short-waits-hold-the-request-instead-of-answering-429--approved-2026-11-24) | approved 2026-11-24 |
 
 ## 0. v1 scope
 
@@ -810,6 +811,7 @@ are not offered.
   with 5xx or timed out on this request. If it is only out of RPM room for under 60 s, the
   proxy returns 429 with that short `Retry-After`, as it does today. Handing off would spend
   a scarce request elsewhere and lower the quality of the turn just to save a few seconds.
+  (§25, approved 2026-11-24: hold such short waits inside the proxy for clients that don't wait.)
 - When B serves a handed-off turn, every tool call in the active turn that B didn't make
   (from the affinity record) has its signature replaced with the placeholder in the body sent
   upstream. B's own calls keep their real signatures. Unknown IDs also get the placeholder.
@@ -2600,3 +2602,302 @@ every model. A model that hangs costs the whole 120 s before the fallback can st
   - A timeout that used the model's own full budget grows the streak. One cut short by the
     deadline doesn't.
   - Values outside 1–120 are rejected. Models without the setting keep 120 s.
+
+## 25. Short waits: hold the request instead of answering 429 — approved 2026-11-24
+
+### 25.1 What failed
+
+Live run 3 (probe-results, "Live run 3", 2026-11-23) had one VS Code Copilot Chat agent turn on
+`gemini-auto` that never finished. Request log `data/request-log-2026-11-24T044339Z.jsonl`,
+metadata only:
+
+- **Turn start, 05:04:05 UTC.** 4 Hydrogen 503 (3.4 s), 2.5 Flash 503 (7.8 s), 3.6 Flash and
+  3 Flash Preview `rpm`-blocked by Zoo Code turns, so the turn spilled to 3.5 Flash-Lite and was
+  pinned there (§5.1). It offered 95 tools. Reported `prompt_tokens` grew from 43,700 to 52,518 over
+  the turn's 9 served steps, most about 2 s apart; the proxy's estimates, with the 1.2 margin,
+  were 54–64k.
+- **05:04:31.** The next step found 3.5 Flash-Lite's input-TPM window holding 228.5k of 250k
+  (five steps since 05:04:05), so the proxy answered 429 with `Retry-After: 32` without calling
+  upstream (`attempts: []`, `limits: ["tpm"]`). The client's next request came 90 s later, when the user
+  asked it to try again.
+- **05:06:01–05:06:07.** Four more steps (203.7k in the window), then `tpm` again: 429 with
+  `Retry-After: 52`. Copilot sent the same request three more times within 6 s (hints 49, 48, 47)
+  and showed "request failed".
+- **2.5 Flash-Lite**, a `handoff_targets` model in the same tier, was never tried. Each wait was
+  under `handoff_after_s: 60`, so the gate (§16.8, `router._may_hand_off`) returned the owner's
+  429. That is the approved behaviour.
+
+Two facts set the shape of the fix:
+
+1. **The block recurs every minute.** At about 50k input tokens a step, 250k TPM fits 4–5 steps a
+   minute on any one model. The client asks for a step every 2 s, about 30 a minute. No free-tier
+   model on this account can keep up with this turn. The only choice is whether the client sees the
+   wait as a **429** or as **latency**.
+2. **The client doesn't wait.** Zoo Code honours `Retry-After` exactly (§16.9.8, live run 2).
+   Copilot didn't, the only time it was seen (once, 2026-11-23). On the first 429 it made no
+   retry of its own. On the second it retried three times in 6 s and gave up. **Observed once, not
+   documented.** It may depend on the hint's size or Copilot's version.
+
+### 25.2 Limits checked
+
+Google's rate-limits page (https://aistudio.google.com/docs/rate-limits, read 2026-11-24; the old
+`ai.google.dev/gemini-api/docs/rate-limits` redirects there) no longer lists free-tier limits for
+each model. It says limits are "applied per project, not per API key" and "can be viewed in Google
+AI Studio". It defines TPM as "Tokens per minute (input)". The per-project table
+(`aistudio.google.com/rate-limit`) needs a sign-in, so it wasn't read for this proposal. The numbers
+below are this project's AI Studio snapshot (§2, 2026-11-20), as copied into `config.yaml`.
+**Assumption to verify:** that they still hold today.
+
+| Model | RPM | TPM (input) | RPD |
+|---|---|---|---|
+| 3.5 Flash-Lite (`gemini-3.5-flash-lite`) | 15 | 250K | 500 |
+| 2.5 Flash-Lite (`gemini-2.5-flash-lite`) | 10 | 250K | **20** |
+
+### 25.3 Why a same-tier handoff doesn't fix this
+
+The first idea was to apply `handoff_after_s` only when the target is in a scarcer tier than the
+owner, and to hand off at once within a tier or from smart down to fast. Against the numbers above:
+
+- **It buys a few steps, not a cure.** 2.5 Flash-Lite has the same 250K TPM, so it can take about
+  4–5 more of this turn's steps before it is blocked too. The turn would then alternate between the
+  two Lite models (each handoff makes the target the owner through the `mixed` rule, §5.1, and an
+  immediate same-tier handoff sends it back). That gives about 8–10 steps a minute against a burst
+  rate near 30. A short remainder might finish, but a sustained burst still runs into both limits,
+  and Copilot gets the same 429 a little later. The run doesn't show how many steps the turn had left.
+- **The cheap target isn't cheap.** The fast tier's 520 RPD is 500 + **20**. 2.5 Flash-Lite has a
+  smart model's daily quota. At 4–5 calls per saturated minute, it lasts about 4–5 such minutes a
+  day. A tier name says nothing about this; only `rpd` does.
+- `gemini-smart` and `gemini-fast` have no tiers, so the rule would need a second notion of
+  scarcity there (for example, comparing `rpd`) anyway.
+
+It stays as alternative (a) in §25.8. It is worth reconsidering when 3.1 Flash-Lite (500 RPD) passes
+its tool call and joins `handoff_targets` (§0, §16.8 1c), defined by the target's `rpd` rather than
+its tier. Even then, three Lite models give about 750K TPM, still short of this turn's demand, so it
+would add to the fix below, not replace it.
+
+### 25.4 Change: hold a short wait inside the proxy
+
+Sometimes a request would get **429** only because the proxy's own count says a model's minute
+window is full. If that window frees within a short wait, the proxy waits for it and then walks the
+same candidates once more, instead of answering. The client sees a slower response, not a 429.
+(Narrowed after a Codex plan critique, 2026-11-24. The first draft also held after upstream 429s
+and re-ran routing from the start.)
+
+- **Config:** `hold_max_s`, top level, optional, **default 0 (off)**. With 0, behaviour is exactly
+  today's. Validation: 0 is accepted for every valid `request_deadline_s`, so a config with a short
+  deadline still starts. A positive value needs `hold_max_s + 5 ≤ request_deadline_s` (the
+  `MIN_ATTEMPT_S` margin). The example config shows `hold_max_s: 60` commented out, as an opt-in,
+  because it lengthens first-byte times for every client of the proxy. This project's `config.yaml`
+  turns it on for the live check. 60 is the length of a per-minute window.
+- **When it holds.** All of these must hold after the normal pass and §22's last-resort pass:
+  1. The outcome is §5 step 5 rule 2: **429**, every remaining candidate is `quota`. A 503 is
+     never held.
+  2. **No upstream call was made on this request.** A request that got an upstream 429, a 5xx or a
+     timeout is answered as today. After a call, a candidate's `ready_at` comes from a fresh state
+     check and isn't a clean wait. It can be "now", a 30 s state-error guess, or a 5xx turned into
+     `quota` (§16.8). Sending again would also break §9's one attempt per candidate.
+  3. At least one candidate the gate admits (the owner, or a target once the gate allows a handoff)
+     has a finite `ready_at` in the future that comes **only from local `rpm` or `tpm` limits**
+     (§24.1's fixed names). The wait runs to the earliest of these. `rpd`, `exhausted`,
+     `cooldown_429`, `cooldown_5xx`, `recovering` and `other` never start a hold. RPD therefore
+     can't, even seconds before PT midnight.
+  4. The wait is at most `hold_max_s`, and the request deadline (§9, from arrival) leaves at least
+     `MIN_ATTEMPT_S` after it.
+  5. **One hold per request.**
+- **The wait** is a sleep until that time. Nothing is reserved and no lock is held while waiting.
+  The wake time is a **hint, not an entitlement**: other requests can take the room first, and a
+  settled reservation (§7, `settle`) can change the window in either direction. Held bodies keep
+  their share of `max_inflight_parsed_bytes` (§20.3), so many held requests can make new ones get
+  503 `server_busy`.
+- **After the wait: the same routing context.** The request keeps one context for its whole life:
+  arrival time and deadline, affinity and owner, turn reference, the gemini-auto tier decision and
+  rule, the attempt budget, and the ordered path. The candidates are walked again in the same order,
+  with the same handoff gate (re-evaluated from fresh state) and last-resort rules. Every limit is
+  checked again under the lock when reserving. The five-second minimum is checked again after waking
+  and after reserving, and an unsent reservation is released if the margin has gone. Nothing is
+  looked up or decided a second time, so the owner, turn ID and tier can't change mid-request.
+- **One terminal outcome.** Bookkeeping (affinity, turn row, request log, metrics) happens once,
+  through the existing path, for the final outcome. The first pass made no upstream call, so it has
+  no quota updates, attempt metrics or restore counts to undo. `x-fallback-path` remains the list of
+  real calls. If time runs out during or after the hold, the answer is 503, as for any deadline
+  (§9). If quota still blocks the request while time remains, it gets a fresh 429 with the current
+  `Retry-After`.
+- **No bytes are sent while holding**, streamed or not. Sending SSE keep-alive comments would fix
+  the status at 200 before the outcome is known (alternative (d)).
+- **Where it applies:** every route and direct model IDs, turn starts and pinned follow-ups alike.
+  The pinned case is the one that matters, because a turn start falls back across models before it
+  can reach rule 2.
+- **The handoff gate doesn't change.** An owner blocked for at least `handoff_after_s` still hands
+  off first (§16.8). The proxy holds only when the gate keeps the turn on a briefly blocked owner, or
+  when the targets it allows are briefly blocked too.
+
+**Compliance.** The hold covers only the proxy's own count of a window that hasn't reached Google.
+Google hasn't refused anything, so the proxy is waiting to stay *under* a limit, as its quota store
+already does (COMPLIANCE §1). It then sends the one request the client asked for. A request that
+Google answered with 429 is never held or re-sent by the proxy.
+
+**What the run might have looked like.** All five of the run's Copilot 429s were local `tpm` blocks
+with no upstream call, which is the case the hold covers. The 05:04:31 step would have been held for
+about 32 s and then sent. The turn could then have gone on at the 4–5 steps a minute that one Lite
+model's TPM allows, pausing 30–50 s each minute. Whether it finishes depends on Copilot waiting that
+long for a first byte, which is what the live check measures.
+
+**Assumptions to verify in the live check:**
+
+- Copilot's first-byte timeout. It accepted 13.2 s at this turn's start (two 503s, then
+  Flash-Lite), observed once. A hold adds up to `hold_max_s` on top of the model's own first-byte
+  time.
+- Zoo Code accepts the delay. It sat through 120 s first-byte stalls in live run 1 (§24), so this
+  is likely. For Zoo Code a hold is the same wait it already makes after a 429, without the
+  countdown in its UI.
+
+### 25.5 Covered cases
+
+- **Tiers.** None. The hold depends on §5 step 5's outcome and on local limits, not on tiers, so
+  `gemini-smart`, `gemini-fast`, direct model IDs and `gemini-auto` behave alike. §16.9.6's
+  accepted short 429s on upgraded turns (smart models at 5 RPM) are held too when they are local
+  `rpm` blocks with no upstream call. That helps clients that don't wait, at no extra quota.
+- **`mixed` turns and placeholders.** No new rewrite path. The walk after the hold builds each body
+  as the first walk did (§16.8 1b, §23.4), for the same owner. Restores are counted per upstream
+  attempt (`_count_restores`), and the first walk made none, so nothing is counted twice.
+- **2.5 Flash-Lite's own TPM.** No effect: the hold doesn't hand the turn anywhere new. If the gate
+  allows a target and it is free, the existing loop already uses it.
+- **Pace and the demand curve.** A held turn start keeps the decision made on arrival. It creates
+  one turn row, as today.
+
+### 25.6 Visibility
+
+- **Request log:** a held request's line gets `hold: {"model", "limits", "ms"}`. These are the
+  candidate whose `ready_at` set the wait, its limits at that moment (`rpm` or `tpm`), and the
+  milliseconds actually waited, whatever the request's ending (served, refused, 499, stream
+  failure). The line's status, `blocked` and `retry_after_s` come from the final outcome as today.
+  A request that is held and then served has `status: 200`, `hold`, and no `blocked`. The hold
+  details are kept in request scope, so the disconnect branch (§25.7) and the stream finaliser,
+  which writes a stream's line when it settles, can log them.
+- **Metrics:** `qr_holds_total{result}`, counted once per held request at the point where its
+  response is decided (before any stream starts). `result` is `served`, `passthrough` (a 4xx
+  returned unchanged), `refused` (429 or 503 again), `cancelled` (the client left or the handler
+  was cancelled) or `error` (an internal error). The labels are a fixed list (§17.1). A stream that
+  later breaks is counted by the existing stream metrics, not here.
+- **`/status`:** `holds: {"max_s", "in_flight", "served", "passthrough", "refused", "cancelled",
+  "error"}`. `in_flight` goes down in a `finally` on every exit. The counts are since the start, in
+  memory, like the other `/status` counts (§20.8).
+- **Decision log:** unchanged, with no migration. A held step that is served counts as one step and
+  not as an error. The request log is where holds show up.
+- **Response headers:** unchanged. `x-fallback-path` lists the real upstream calls.
+
+### 25.7 Failure paths
+
+- **Concurrent requests on the same model.** A held request reserves nothing, but waking gives it no
+  priority. Two requests waiting for the same window wake together, and the lock lets the first to
+  reserve go first. The other gets a 429 with a fresh `Retry-After` (one hold only). A Zoo Code turn
+  and a Copilot turn sharing 3.5 Flash-Lite's 250K therefore still compete, and the Copilot turn can
+  still fail when Zoo Code takes the room. That case is accepted, and the `refused` count shows how
+  often it happens.
+- **The target is blocked too.** The wake time is the earliest local `rpm` or `tpm` readiness among
+  the candidates the gate admits. On waking, the candidates are walked again in normal order, with
+  the gate and the last-resort rules, so the model that set the timer isn't necessarily the one
+  tried. A 5xx cooldown or recovery slot on another candidate is handled as today.
+- **A candidate fails after the hold** (5xx, timeout, upstream 429). It is handled as usual. The loop
+  falls back while attempts and the deadline allow, then answers 503 or 429. There is no second hold.
+- **The client disconnects.** The existing watcher cancels routing (`app.py`, §8). There are three
+  cases, each with its own test:
+  - during the sleep: nothing is reserved, so nothing is spent;
+  - at the moment of waking: routing stops before any send;
+  - the handler itself is cancelled.
+  The 499 line carries `hold` with the time waited, and `cancelled` is counted. If routing and the
+  watcher finish together, today's order applies (routing's outcome wins).
+- **The deadline and the clock.** The router's clock is wall time (`time.time()`, `clock.py`), as
+  are `ready_at` and the request deadline. The sleep is computed from that clock, and its overshoot,
+  the lock and SQLite all eat into the margin. So the five-second minimum is checked again after
+  waking and after reserving (§25.4). A wall-clock step during a hold can only make it end early or
+  late within `hold_max_s` and the deadline. It never sends a request that the quota store refuses,
+  because reserving checks again.
+- **A stream after a hold.** Once the first byte is sent, the stream is handled as today (§8). A
+  stream that fails after a 200 is logged by the stream finaliser, with `hold`.
+- **Restart while held.** The connection drops, as it would for any request in flight. Nothing was
+  reserved.
+- **Body memory.** Held requests keep their bytes. At the 128 MB default and about 250 KB for a
+  95-tool Copilot body, memory runs out long after the per-minute limits do. If it does run out, new
+  requests get 503 `server_busy` (§20.3).
+- **Older configs and deployments.** `hold_max_s` is optional and defaults to 0. A config that was
+  valid still starts and behaves as before, including one with a `request_deadline_s` under 5 s.
+  There is no schema change. Rollback: an older image refuses a config with `hold_max_s`
+  (`extra="forbid"`), so remove the key first. The database needs nothing.
+- **PT midnight.** `rpd` and `exhausted` never start a hold (§25.4 condition 3), so a reset a few
+  seconds away doesn't matter.
+
+### 25.8 Alternatives
+
+- **(a) Tier-aware handoff gate** (§25.3). Apply `handoff_after_s` only towards a scarcer tier, and
+  hand off at once otherwise. Not recommended now. In this run it buys a few steps against a
+  sustained burst, and it spends a 20-RPD model. It also needs a notion of scarcity on routes
+  without tiers. Reconsider it, keyed on `rpd`, when a second 500-RPD Lite model is a handoff
+  target, and after the live check shows whether Copilot waits through a hold.
+- **(b) Lower `handoff_after_s` everywhere.** Rejected in §16.8 choice 2: it spends smart quota on
+  every RPM wait. It shares (a)'s problem, because each target's TPM fills in turn.
+- **(c) Hold and (a) together.** Faster turns, at the cost of the 20-RPD model. It can be added
+  later without changing the hold.
+- **(d) Hold with SSE keep-alive comments** for streamed requests. This keeps clients with an idle
+  timeout connected, but fixes the status at 200 before the outcome is known. A refused walk would
+  then have to be an error inside the stream, which clients handle in different ways. Only worth it
+  if the live check shows Copilot timing out on a held request.
+- **(e) Also hold after an upstream 429** (the first draft). This would cover Google's own rate
+  limits as well, but it sends a second attempt to a model on the same request (§9) and depends on
+  `ready_at` values from a fresh state check that aren't clean waits (§25.4 condition 2). Live run 3
+  had none of these.
+- **(f) Do nothing and document** that Copilot's agent mode needs a turn small enough for one
+  Lite model's TPM. Copilot's `maxInputTokens` (§15) bounds one request, not a minute's worth of
+  steps, so this doesn't help users.
+
+### 25.9 Cost and tests
+
+- **Cost:** no upstream requests and no quota. On held requests only, one more walk over the
+  candidates: a dict walk under the lock.
+- **Offline tests** (fake clock, mocked upstream):
+  - A pinned owner `tpm`-blocked for 32 s, with `hold_max_s: 60`: no 429, one upstream call at
+    t+32 s, the log has `hold` with `limits: ["tpm"]` and `ms` ≈ 32,000, and `served` is counted.
+  - The same with an `rpm` block.
+  - A wait over `hold_max_s` gives today's 429. With `hold_max_s: 0`, every existing router test
+    passes unchanged.
+  - No hold:
+    - after any upstream call on the request (a 429, a 5xx, a timeout);
+    - for blocks from `rpd`, `exhausted`, `cooldown_429`, `cooldown_5xx`, `recovering` or `other`;
+    - for any 503 outcome;
+    - when the deadline would leave under 5 s.
+  - After waking, the five-second margin is checked again: a reservation made with too little left
+    is released and the answer is 503.
+  - The owner blocked for 60 s or more still hands off first. A hold happens when the gate keeps a
+    briefly blocked owner, or when the admitted targets are blocked briefly too, and it waits for
+    the earliest of them.
+  - The routing context is kept: the owner, turn ID, tier and rule are the same after the hold,
+    even if affinity or the pace changed meanwhile.
+  - Two held requests for one window: one served, the other a 429 with a fresh `Retry-After` and
+    `refused` counted.
+  - A disconnect during the sleep, at waking, and a cancelled handler: no upstream call, nothing
+    reserved, a 499 with `hold`, `cancelled` counted, and `in_flight` back to 0.
+  - A held turn start: one turn row, `steps: 1`, `errors: 0`.
+  - A held pinned follow-up in a `mixed` turn: the body sent equals what the first walk would
+    have sent (placeholders and restores), and restores are counted once.
+  - A held stream that fails after the first byte: its line has `hold`, and the hold is counted
+    once as `served`.
+  - Config: a negative value, and a positive value with `hold_max_s + 5 > request_deadline_s`,
+    are rejected. 0 is accepted with any valid deadline, including one under 5 s. A missing key is 0.
+  - `/status` `holds` and the metric labels.
+- **Live, by hand:** set `hold_max_s: 60` in this project's `config.yaml`. Then run a Copilot
+  agent-mode turn with many tools on `gemini-auto` that reaches a Lite model. Check for `hold`
+  lines, no "request failed", and the turn finishing, which also measures Copilot's first-byte
+  tolerance. Then check that Zoo Code shows no change apart from `hold` lines in place of 429
+  countdowns. Setting the key needs a container recreate, which clears the request log, so save the
+  log first.
+
+**Approved with these choices (2026-11-24):**
+
+1. Hold short waits in the proxy (§25.4), not a tier-aware handoff gate (§25.3, alternative (a)).
+2. Hold only for local `rpm` or `tpm` blocks on a request that made no upstream call. An upstream
+   429 is answered as today (alternative (e)).
+3. `hold_max_s` defaults to 0 (off) in code, is commented out in the example config, and is set to
+   60 in this project's config for the live check. The alternative is to default to 60, which
+   changes behaviour for existing deployments without asking.
+4. One routing context per request, one hold per request, and no keep-alive bytes while holding.
+5. No decision-log column. Holds are visible in the request log, `/status` and `qr_holds_total`.

@@ -301,12 +301,31 @@ requests count in the demand curve, `user_matches` decided after the probe), in 
    Done 2026-11-23 20:49–21:06 PT (probe-results.md, "Live run 3"), a short session rather than a
    day: checks 1, 3, 4 and 5 pass and both planning-mode turns matched. The switch to `paced` was
    not reached (`left` 25 against `rule_above` 4.6), so it stays to be seen on a heavier day. One
-   Copilot turn failed on a `tpm` block shorter than `handoff_after_s`; a DESIGN proposal, not yet
-   written.
+   Copilot turn failed on a `tpm` block shorter than `handoff_after_s`. Proposal written 2026-11-24:
+   DESIGN §25 (hold short waits in the proxy), approved 2026-11-24.
 
 Steps 3–7 done 2026-11-24 (branch `step3b-rules`): `.venv/bin/python -m pytest -q` and
 `docker compose run --build --rm test` pass. The readings settled while implementing are in
 DESIGN §16.10.5, "3b implemented".
+
+Short-wait holds (DESIGN §25, approved 2026-11-24 with the listed choices: hold instead of a
+tier-aware handoff; local `rpm`/`tpm` blocks before any upstream call only; `hold_max_s` default 0;
+one routing context and one hold per request; no decision-log column), in order:
+
+1. Config: `hold_max_s` and its validation (0 always valid; a positive value needs
+   `hold_max_s + 5 ≤ request_deadline_s`); commented example in `config.example.yaml` and
+   `scripts/init_config.py`.
+2. Router: the hold after the normal and last-resort passes, under §25.4's conditions; one
+   routing context per request; the five-second margin checked again after waking and after
+   reserving.
+3. HTTP layer: `hold` in request scope for the request log, the 499 branch and the stream
+   finaliser; `qr_holds_total{result}`; `/status` `holds`.
+4. Offline tests from DESIGN §25.9.
+5. Validation: `.venv/bin/python -m pytest -q`, `docker compose run --build --rm test`, then
+   `code-reviewer-deep` (concurrency, a retry-like second walk, cancellation) with a Codex
+   adversarial review alongside.
+6. Live check: save the log, set `hold_max_s: 60` in `config.yaml`, recreate, then one Copilot
+   agent-mode turn that reaches a Lite model, and a Zoo Code task.
 
 Also after v1: alerts (DESIGN §17.2 layer 6), a remote-hosting design (DESIGN §18)
 if the proxy is to run somewhere other than the user's machine.
