@@ -327,6 +327,10 @@ one routing context and one hold per request; no decision-log column), in order:
 6. Live check: save the log, set `hold_max_s: 60` in `config.yaml`, recreate, then one Copilot
    agent-mode turn that reaches a Lite model, and a Zoo Code task.
 
+Steps 1–5 done 2026-11-24 (branch `short-wait-holds`): `.venv/bin/python -m pytest -q` and
+`docker compose run --build --rm test` pass (742). The readings and two amendments are in
+DESIGN §25.10. Step 6 is open.
+
 Also after v1: alerts (DESIGN §17.2 layer 6), a remote-hosting design (DESIGN §18)
 if the proxy is to run somewhere other than the user's machine.
 

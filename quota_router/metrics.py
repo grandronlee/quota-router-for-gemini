@@ -19,6 +19,7 @@ REASONS = ("served", "passthrough", "quota", "unavailable", "context_length_exce
            "stream_error", "client_disconnected", "internal_error", "login_throttled", "busy")
 OUTCOMES = ("ok", "429_rpm", "429_tpm", "429_rpd", "429_unknown", "5xx", "timeout", "404", "4xx", "error")
 STATES = ("available", "cooldown", "exhausted", "disabled")
+HOLD_RESULTS = ("served", "passthrough", "refused", "cancelled", "error")  # DESIGN §25.6
 FIRST_BYTE_BUCKETS = (0.5, 1, 2, 5, 10, 20, 30, 60, 120, 180)
 RECENT_ERRORS = 20
 
@@ -34,6 +35,9 @@ HELP = {
                                                "DESIGN §23.6."),
     "qr_route_decisions_total": ("counter", "Routed gemini-auto requests by x-route-reason and "
                                             "x-route-tier; DESIGN §16.9.5."),
+    "qr_holds_total": ("counter", "Requests held for the proxy's own RPM or TPM window, by how "
+                                  "their response was decided (served, passthrough, refused, "
+                                  "cancelled, error); DESIGN §25.6."),
     "qr_pace_left": ("gauge", "Requests the paced tier has left today (exhausted models count 0)."),
     "qr_pace_upgrade_above": ("gauge", "A gemini-auto turn is upgraded to the paced tier while "
                                        "qr_pace_left is above this."),
@@ -100,7 +104,8 @@ class Metrics:
             lines.append(f"# TYPE {name} {kind}")
 
         for name in ("qr_requests_total", "qr_upstream_attempts_total", "qr_tokens_total",
-                     "qr_handoff_total", "qr_thought_signatures_total", "qr_route_decisions_total"):
+                     "qr_handoff_total", "qr_thought_signatures_total", "qr_route_decisions_total",
+                     "qr_holds_total"):
             head(name)
             for labels, v in sorted(self._counters.get(name, {}).items()):
                 lines.append(f"{name}{_labels(labels)} {_num(v)}")

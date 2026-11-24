@@ -87,6 +87,10 @@ class Blocked:
     # What blocks it, from a fixed list, for the request log (DESIGN §24.1): rpm, tpm, rpd,
     # exhausted, cooldown_429, cooldown_5xx, recovering.
     limits: tuple[str, ...] = ()
+    # Only the proxy's own RPM or input-TPM count blocks it, so `ready_at` is a clean wait a
+    # request may be held for (DESIGN §25.4 condition 3). Never after Google's TPM 429 (its
+    # `tpm_full_until`), a cooldown of any kind, RPD or exhausted.
+    holdable: bool = False
 
 
 # Blocked.detail parts → the request log's fixed limit names (DESIGN §24.1).
@@ -196,9 +200,11 @@ class QuotaStore:
         elif recovering:
             limits.append("recovering")
         if quota:
+            holdable = (set(quota) <= {"rpm", "tpm"} and not (hard or soft or recovering)
+                        and st.tpm_full_until <= now)
             # Kept with a quota reason too, so a failing owner still hands off (§16.8, §22.2).
             return Blocked("quota", ready, ", ".join(quota), cooling_down=hard or soft or recovering,
-                           limits=tuple(limits))
+                           limits=tuple(limits), holdable=holdable)
         if hard:
             return Blocked("unavailable", ready, "5xx cooldown", cooling_down=True, limits=tuple(limits))
         # Deferred models are ready now as a last resort, so they don't stretch Retry-After.

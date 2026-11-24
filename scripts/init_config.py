@@ -164,7 +164,11 @@ def render(models: list[dict], chosen: list[str]) -> str:
             if handoff
             else "           # models whose handoff probe passed (DESIGN §16.8)")
     lines += ["", f"handoff_targets: []{hint}",
-              "handoff_after_s: 60           # hand a tool turn off only if its model is blocked longer"]
+              "handoff_after_s: 60           # hand a tool turn off only if its model is blocked longer",
+              "# Hold a request for up to this many seconds when only the proxy's own per-minute count",
+              "# (RPM or TPM) blocks it, instead of answering 429 (DESIGN §25). Off by default: it makes",
+              "# first bytes slower for every client of the proxy. Needs hold_max_s + 5 <= request_deadline_s.",
+              "# hold_max_s: 60"]
     tiers = {t: [mid for mid in ms if mid in by_id] for t, ms in AUTO_TIERS.items()}
     if all(tiers.values()):
         lines += ["",

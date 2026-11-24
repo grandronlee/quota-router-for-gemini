@@ -35,11 +35,11 @@ from .config import PARSED_BASE_FACTOR, PARSED_OVERHEAD, PARSED_WIDTH_FACTOR, Co
 from .dashboard import SECURITY_HEADERS, add_dashboard, dashboard_request_ok, is_dashboard_path
 from .db import connect
 from .logs import REQUEST_LOGGER
-from .metrics import OUTCOMES, STATUSES, Metrics, RequestStats, bounded
+from .metrics import HOLD_RESULTS, OUTCOMES, STATUSES, Metrics, RequestStats, bounded
 from .quota import QuotaStore
-from .router import (ROUTE_REASONS, Attempt, ModelNotFound, RateLimited, Rejected, RouteFailed,
-                     RoutePassthrough, RouteServed, Router, Served, Unavailable, UpstreamResult,
-                     estimate_input_tokens)
+from .router import (ROUTE_REASONS, Attempt, Hold, ModelNotFound, RateLimited, Rejected,
+                     RouteFailed, RoutePassthrough, RouteServed, Router, Served, Unavailable,
+                     UpstreamResult, estimate_input_tokens)
 from .scrub import Scrubber
 from .settings import Settings, normalize_host
 from .turns import TurnLog, TurnRef
@@ -214,6 +214,8 @@ class Proxy:
             r.name for r in (config.auto.rules if config.auto else ())}
         self.stats = RequestStats(self.clock.now())
         self.auth_failures = 0
+        # Held requests by how their response was decided, since start (DESIGN §25.6).
+        self.holds: dict[str, int] = dict.fromkeys(HOLD_RESULTS, 0)
         self.body_budget = BodyBudget(config.max_inflight_parsed_bytes)
         capture_dir = Path(config.db_path).parent / "429" if config.db_path != ":memory:" else None
         self.captures = Captures(capture_dir, self.scrubber, self.clock.now) if capture_dir else None
@@ -244,6 +246,8 @@ class Proxy:
             "state_errors": self.router.state_errors,
             # Capture and restore counts since start (DESIGN §23.6); never values.
             "signatures": dict(self.router.signatures),
+            "holds": {"max_s": self.config.hold_max_s, "in_flight": self.router.holds_in_flight,
+                      **self.holds},
         }
 
     def _auto_view(self) -> dict | None:
@@ -276,6 +280,14 @@ class Proxy:
             return name
         return "unknown"
 
+    def note_hold(self, hold: Hold | None, result: str) -> None:
+        """Count a held request once, where its response is decided (DESIGN §25.6)."""
+        if hold is None or not hold.held:
+            return
+        result = bounded(result, HOLD_RESULTS, "error")
+        self.holds[result] += 1
+        self.metrics.inc("qr_holds_total", result=result)
+
     def on_attempt(self, model: ModelConfig, result: UpstreamResult) -> None:
         self.metrics.inc("qr_upstream_attempts_total", model=model.id,
                          outcome=bounded(attempt_outcome(result), OUTCOMES, "error"))
@@ -286,7 +298,7 @@ class Proxy:
                prompt_tokens: int | None = None, output_tokens: int | None = None,
                first_byte_s: float | None = None, http_path: str | None = None,
                handoff_from: str | None = None, attempts: list[Attempt] | None = None,
-               outcome: Any = None) -> None:
+               outcome: Any = None, hold: Hold | None = None) -> None:
         """One request's metrics, /status counts and its JSON log line (DESIGN §17.2). With the
         route `outcome`, the line also gets gemini-auto's route fields and, for a 429 or 503 the
         proxy produced, its Retry-After and what blocked each candidate (DESIGN §24.1)."""
@@ -314,6 +326,8 @@ class Proxy:
             fields["path"] = http_path[:200]
         if handoff_from is not None:
             fields["handoff_from"] = handoff_from
+        if hold is not None and hold.held:  # DESIGN §25.6, whatever the ending
+            fields["hold"] = hold.log(now)
         if outcome is not None:
             fields.update(outcome_log_fields(outcome, now))
         request_log.info("request", extra={"fields": fields})
@@ -446,9 +460,10 @@ class StreamSession:
 
     def __init__(self, proxy: Proxy, served: RouteServed, stream: Stream, *, request_id: str,
                  route: str, started: float, input_estimate: int,
-                 attempts: list[Attempt] | None = None) -> None:
+                 attempts: list[Attempt] | None = None, hold: Hold | None = None) -> None:
         self.p = proxy
         self.attempts = attempts
+        self.hold = hold  # logged on the line the stream writes when it settles (DESIGN §25.6)
         self.served = served
         self.stream = stream
         self.request_id = request_id
@@ -649,7 +664,8 @@ class StreamSession:
                       path=self.served.path, affinity=self.served.affinity,
                       input_estimate=self.input_estimate, prompt_tokens=self.prompt_tokens,
                       output_tokens=self.output_tokens, first_byte_s=self.first_byte_s,
-                      handoff_from=self.served.handoff_from, attempts=self.attempts, outcome=self.served)
+                      handoff_from=self.served.handoff_from, attempts=self.attempts, outcome=self.served,
+                      hold=self.hold)
 
 
 class ManagedStream(StreamingResponse):
@@ -1058,13 +1074,14 @@ def create_app(proxy: Proxy) -> FastAPI:
         estimate = estimate_input_tokens(body)
         handles = HandleSet()
         attempts: list[Attempt] = []  # filled as calls start, so a cancelled request logs them too
+        hold = Hold()  # filled if the request is held (DESIGN §25.6), for every ending's log line
         assert p.upstream is not None
-        routing = asyncio.ensure_future(
-            p.router.route(body, p.upstream.bind(body, stream, handles), started_at=arrived,
-                           attempts=attempts))
         # DESIGN §8: if the client goes away before the response starts, stop routing (no
         # more attempts or fallbacks for nobody). uvicorn doesn't cancel the handler itself.
         watcher = asyncio.ensure_future(_wait_for_disconnect(request))
+        routing = asyncio.ensure_future(
+            p.router.route(body, p.upstream.bind(body, stream, handles), started_at=arrived,
+                           attempts=attempts, hold=hold, gone=watcher.done))
         try:
             await asyncio.wait({routing, watcher}, return_when=asyncio.FIRST_COMPLETED)
         except BaseException:  # the handler itself was cancelled
@@ -1072,27 +1089,36 @@ def create_app(proxy: Proxy) -> FastAPI:
                 t.cancel()
             with anyio.CancelScope(shield=True):
                 await handles.close_except(None)
+            if hold.held:  # its line and count (DESIGN §25.7); routing is cancelled above
+                p.note_hold(hold, "cancelled")
+                p.record(request_id=request_id, route=route, status=499, reason="client_disconnected",
+                         stream=stream, started=started, path=handles.attempted,
+                         input_estimate=estimate, attempts=attempts, hold=hold)
             raise
         watcher.cancel()
-        if not routing.done():
+        # Routing cancels itself when a held request wakes to find the client gone (§25.7).
+        if not routing.done() or routing.cancelled():
             routing.cancel()
             try:
                 await routing
             except (asyncio.CancelledError, Exception):
                 pass
             await handles.close_except(None)
+            p.note_hold(hold, "cancelled")
             # The model being called keeps its reservation; name it, since rpd_used went up.
             p.record(request_id=request_id, route=route, status=499, reason="client_disconnected",
                      stream=stream, started=started, path=handles.attempted, input_estimate=estimate,
-                     attempts=attempts)
+                     attempts=attempts, hold=hold)
             return Response(status_code=499)
         try:
             outcome = routing.result()
         except Exception:
             await handles.close_except(None)
             log.exception("routing failed")
+            p.note_hold(hold, "error")
             p.record(request_id=request_id, route=route, status=500, reason="internal_error",
-                     stream=stream, started=started, input_estimate=estimate, attempts=attempts)
+                     stream=stream, started=started, input_estimate=estimate, attempts=attempts,
+                     hold=hold)
             return openai_error(500, "internal_error", "internal proxy error", "server_error",
                                 {"x-request-id": request_id})
         served_payload = outcome.payload if isinstance(outcome, RouteServed) else None
@@ -1111,9 +1137,10 @@ def create_app(proxy: Proxy) -> FastAPI:
             if outcome.code == "no_enabled_model":
                 reason = "no_enabled_model"
             reason = reason or "unavailable"
+            p.note_hold(hold, "refused")
             p.record(request_id=request_id, route=route, status=outcome.status, reason=reason, stream=stream,
                      started=started, path=outcome.path, affinity=outcome.affinity, input_estimate=estimate,
-                     handoff_from=outcome.handoff_from, attempts=attempts, outcome=outcome)
+                     handoff_from=outcome.handoff_from, attempts=attempts, outcome=outcome, hold=hold)
             p.note_turn(outcome.turn, route=route, status=outcome.status, handoff_from=outcome.handoff_from)
             return JSONResponse(p.scrubber.obj(outcome.error_body()),
                                 status_code=outcome.status, headers=headers)
@@ -1136,21 +1163,24 @@ def create_app(proxy: Proxy) -> FastAPI:
                 log.error("HTTP 400 from %s on a tool turn sent with restored or placeholder "
                           "signatures (restored %d, placeholder %d)", outcome.model.id,
                           outcome.restored, outcome.placeholder)
+            p.note_hold(hold, "passthrough")
             p.record(request_id=request_id, route=route, status=b.status, reason="passthrough", stream=stream,
                      started=started, served_model=outcome.model.id, path=outcome.path,
                      affinity=outcome.affinity, input_estimate=estimate, handoff_from=outcome.handoff_from,
-                     attempts=attempts, outcome=outcome)
+                     attempts=attempts, outcome=outcome, hold=hold)
             p.note_turn(outcome.turn, route=route, status=b.status, handoff_from=outcome.handoff_from)
             headers["content-type"] = b.content_type
             return Response(b.content, status_code=b.status, headers=headers)
 
         assert isinstance(outcome, RouteServed)
+        p.note_hold(hold, "served")  # before any stream starts; a later break isn't a hold result
         headers = _response_headers(request_id, outcome.path, outcome.affinity, outcome.model.id,
                                     outcome.handoff_from, outcome=outcome)
         payload = outcome.payload
         if isinstance(payload, Stream):
             session = StreamSession(p, outcome, payload, request_id=request_id, route=route,
-                                    started=started, input_estimate=estimate, attempts=attempts)
+                                    started=started, input_estimate=estimate, attempts=attempts,
+                                    hold=hold)
             headers.update({"cache-control": "no-cache", "x-accel-buffering": "no"})
             return ManagedStream(session, headers)
 
@@ -1177,7 +1207,7 @@ def create_app(proxy: Proxy) -> FastAPI:
                  started=started, served_model=outcome.model.id, path=outcome.path,
                  affinity=outcome.affinity, input_estimate=estimate, prompt_tokens=prompt_tokens,
                  output_tokens=output_tokens, first_byte_s=first_byte, handoff_from=outcome.handoff_from,
-                 attempts=attempts, outcome=outcome)
+                 attempts=attempts, outcome=outcome, hold=hold)
         headers["content-type"] = b.content_type
         return Response(b.content, status_code=b.status, headers=headers)
 

@@ -15,12 +15,12 @@ import math
 import sqlite3
 import time
 from dataclasses import dataclass, field, replace
-from typing import Any, Callable, Literal, Mapping, Protocol
+from typing import Any, Awaitable, Callable, Literal, Mapping, Protocol
 
 from .affinity import AffinityRecord, AffinityStore, Recorded
 from .classify import classify_429
 from .clock import Clock
-from .config import AutoRule, Config, ModelConfig
+from .config import MIN_ATTEMPT_S, AutoRule, Config, ModelConfig
 from .pacing import DemandCurve, Pacer, PaceView
 from .quota import Blocked, QuotaStore, Reservation
 from .turns import TurnReason, TurnRef, new_turn_id
@@ -32,7 +32,12 @@ CHARS_PER_TOKEN = 4.0
 ESTIMATE_SAFETY = 1.2
 NON_TEXT_PART_TOKENS = 1500  # images and other non-text parts; their bytes say little about tokens
 STATE_ERROR_RETRY_S = 30.0  # Retry-After hint when the quota state can't be read or written
-MIN_ATTEMPT_S = 5.0  # a later attempt with less time left than this isn't started (DESIGN §5.2)
+# A hold sleeps this much past the wake time, so a timer that fires early or a float at the
+# window's edge never wakes it to a window that is still full (DESIGN §25.7, found in review).
+HOLD_PAD_S = 0.05
+# Time a hold leaves beyond MIN_ATTEMPT_S for the pad, the sleep's overshoot and the
+# reservation's SQLite write, so a held request isn't then refused for its margin (review).
+HOLD_SLACK_S = 1.0
 
 _FAILED = object()  # sentinel: a state read failed
 _STOP = object()  # sentinel: the last-resort pass has no attempts or time left
@@ -134,6 +139,28 @@ class Attempt:
         return out
 
 
+@dataclass
+class Hold:
+    """A request's short-wait hold (DESIGN §25), filled in by the router as it happens so the
+    caller can log it whatever the request's ending (§25.6). Router-clock times."""
+    model: str | None = None  # the candidate whose ready_at set the wait; None: not held
+    limits: list[str] = field(default_factory=list)  # its limits then: rpm and/or tpm
+    started: float | None = None
+    ms: int | None = None  # set when the sleep ends, also when it is cancelled
+
+    @property
+    def held(self) -> bool:
+        return self.model is not None
+
+    def log(self, now: float) -> dict:
+        """The request log's `hold` field. Before the sleep's end is recorded (a handler
+        cancelled while its routing task hasn't run again yet), the time waited so far."""
+        ms = self.ms
+        if ms is None:
+            ms = 0 if self.started is None else round(max(0.0, now - self.started) * 1000)
+        return {"model": self.model, "limits": list(self.limits), "ms": ms}
+
+
 def log_outcome(result: UpstreamResult) -> str:
     """The log outcome of a call's result (DESIGN §22.4); a stream is finished later."""
     if isinstance(result, Served):
@@ -174,6 +201,8 @@ class Candidate:
     checked_at: float | None = None
     # What blocked it, from a fixed list, for the request log (DESIGN §24.1); never free text.
     limits: list[str] = field(default_factory=list)
+    # Its `ready_at` comes only from the proxy's own RPM or TPM count (DESIGN §25.4).
+    holdable: bool = False
 
 
 @dataclass
@@ -492,7 +521,8 @@ def fits(model: ModelConfig, input_tokens: int, output_tokens: int | None) -> bo
 # ---- the router ----------------------------------------------------------
 
 class Router:
-    def __init__(self, config: Config, store: QuotaStore, affinity: AffinityStore, clock: Clock) -> None:
+    def __init__(self, config: Config, store: QuotaStore, affinity: AffinityStore, clock: Clock,
+                 sleep: Callable[[float], Awaitable[None]] | None = None) -> None:
         self._config = config
         self._store = store
         self._affinity = affinity
@@ -508,6 +538,9 @@ class Router:
         # Thought-signature counts since start, for /status (DESIGN §23.6); never values.
         self.signatures: dict[str, int] = dict.fromkeys(SIGNATURE_ACTIONS, 0)
         self.on_signature: SignatureHook | None = None  # set by the HTTP layer for /metrics
+        # A hold's sleep (DESIGN §25.4); tests replace it with one that moves a fake clock.
+        self.sleep: Callable[[float], Awaitable[None]] = sleep or asyncio.sleep
+        self.holds_in_flight = 0  # requests sleeping in a hold now, for /status (§25.6)
         # gemini-auto's upgrade test (DESIGN §16.9.2); its demand curve reads the decision log.
         self._pacer: Pacer | None = None
         if config.auto is not None:
@@ -684,9 +717,13 @@ class Router:
 
     async def route(self, request: Mapping[str, Any], upstream: Upstream,
                     *, started_at: float | None = None,
-                    attempts: list[Attempt] | None = None) -> RouteOutcome:
+                    attempts: list[Attempt] | None = None, hold: Hold | None = None,
+                    gone: Callable[[], bool] | None = None) -> RouteOutcome:
         """Route one request. `attempts`, when given, receives one entry per upstream call as
-        it starts, so the caller can still log them if routing is cancelled (DESIGN §22.4)."""
+        it starts, so the caller can still log them if routing is cancelled (DESIGN §22.4).
+        `hold`, when given, is filled in if the request is held (DESIGN §25). `gone` says
+        whether the client has left: checked after a hold, so a held request that wakes to a
+        disconnect is never sent (it raises CancelledError instead, §25.7)."""
         started = self._clock.now() if started_at is None else started_at
         deadline = started + self._config.request_deadline_s
         name = request.get("model")
@@ -727,14 +764,22 @@ class Router:
                     out.route_reason = decision
             return out
 
-        results: list[Candidate] = []
         path: list[str] = []
         log_ = attempts if attempts is not None else []
+        hold_ = hold if hold is not None else Hold()
         tried = 0  # upstream calls made
-        hand_off: bool | None = None  # decided once, from the owner's result
+        held = False  # one hold per request (DESIGN §25.4)
+        hand_off: bool | None = None  # decided once per walk, from the owner's result
+        admitted = False  # the first walk's gate let targets in (DESIGN §25.7)
         # Skipped only for the soft part of a 5xx cooldown or a recovery attempt in flight:
         # tried after the normal pass if nothing served (DESIGN §22.2).
         deferred: list[tuple[Candidate, SignedBody, int]] = []
+
+        def may_start(left: float) -> bool:
+            """The first attempt runs while any time is left; a later one, or any attempt after
+            a hold, needs MIN_ATTEMPT_S, since a call that is sure to time out would only cost
+            quota and a cooldown (DESIGN §5.2, §25.4)."""
+            return left > 0 if tried == 0 and not held else left >= MIN_ATTEMPT_S
 
         async def attempt(c: Candidate, signed: SignedBody, tokens: int,
                           last_resort: bool) -> RouteOutcome | None | object:
@@ -748,12 +793,14 @@ class Router:
             async with self._lock:
                 c.checked_at = self._clock.now()
                 left = deadline - c.checked_at
-                # The first attempt runs while any time is left; a later one needs MIN_ATTEMPT_S,
-                # since a call that is sure to time out would only cost quota and a cooldown.
-                limits_left = tried < self._config.max_attempts and \
-                    (left > 0 if tried == 0 else left >= MIN_ATTEMPT_S)
+                time_left = may_start(left)
+                limits_left = tried < self._config.max_attempts and time_left
                 if last_resort and not limits_left:
                     return _STOP  # keeps the reason it was deferred for
+                if held and not time_left:
+                    # Time ran out after a hold: a 503, as for any deadline, not a quota 429 (§25.4).
+                    c.reason, c.ready_at, c.limits = "not_tried", c.checked_at, []
+                    return None
                 try:
                     res = self._store.try_reserve(model, tokens, last_resort=last_resort) if limits_left \
                         else self._store.check(model, tokens)
@@ -770,6 +817,7 @@ class Router:
                 c.reason, c.ready_at, c.detail = res.reason, res.ready_at, res.detail
                 c.unhealthy = res.cooling_down
                 c.limits = list(res.limits)
+                c.holdable = res.holdable
                 if res.deferred and not last_resort:
                     deferred.append((c, signed, tokens))
                 return None
@@ -780,10 +828,21 @@ class Router:
                 # The reservation's SQLite write can wait (up to 1 s): measure again, and give the
                 # whole reservation back if the attempt may no longer start (DESIGN §5 notes).
                 left = deadline - self._clock.now()
-                if not (left > 0 if tried == 0 else left >= MIN_ATTEMPT_S):
+                if not may_start(left):
                     self._safely(self._store.release, res)
                     c.reason, c.ready_at, c.limits = "not_tried", self._clock.now(), []
                     return _STOP if last_resort else None
+                if held and gone is not None:
+                    # A held request yields once more before sending, with its reservation still
+                    # refundable, so a disconnect that is ready reaches the watcher first (§25.7).
+                    try:
+                        await asyncio.sleep(0)
+                    except asyncio.CancelledError:
+                        self._safely(self._store.release, res)
+                        raise
+                    if gone():
+                        self._safely(self._store.release, res)
+                        raise asyncio.CancelledError
 
                 tried += 1
                 path.append(model.id)
@@ -903,55 +962,128 @@ class Router:
                 c.reason, c.detail = "quota", f"{c.detail}; {blocked.detail}"
             return None
 
-        for model in candidates:
-            if owner is not None and model is not owner:
-                if hand_off is None:
-                    hand_off = self._may_hand_off(results[0])
-                if not hand_off:
-                    break  # the owner's own result decides (DESIGN §16.8)
-            # Calls the serving model didn't make carry the placeholder: after a handoff, or in
-            # a mixed turn served by its latest owner (DESIGN §16.8). An owner serving its own
-            # turn keeps the client's signatures, unknown IDs included (most likely its own
-            # calls). Calls the client sent without one get this model's stored signature back,
-            # or the placeholder (DESIGN §23.4).
-            foreign = owner is not None and (
-                model.id != owner.id or any(r.model_id != model.id for r in records.values()))
-            # Also with no ID in the turn: an ID-less call still gets the placeholder (§23.4).
-            signed = with_signatures(request, model.id, records, foreign=foreign)
-            body = signed.body
-            # Estimated from what this model is sent: placeholders are much shorter than real
-            # signatures and restored ones make it longer, so the client's body would be wrong.
-            tokens = input_tokens if body is request else estimate_input_tokens(body)
-            c = Candidate(model)
-            results.append(c)
-            if self._store.is_disabled(model):
-                c.reason, c.limits = "disabled", []
-                continue
-            if not fits(model, tokens, output_tokens):
-                c.reason = "too_large"
-                continue
-            out = await attempt(c, signed, tokens, last_resort=False)
-            if out is not None:
-                return out  # type: ignore[return-value]
+        async def walk() -> tuple[RouteOutcome | None, list[Candidate]]:
+            """One walk over the candidates: the normal pass, then the last-resort pass. Returns
+            an outcome to return, or None with the candidates' states for DESIGN §5 step 5."""
+            nonlocal hand_off, deferred, admitted
+            admitted = bool(hand_off)  # from the walk before; False for the first
+            hand_off, deferred = None, []
+            results: list[Candidate] = []
+            for model in candidates:
+                if owner is not None and model is not owner:
+                    if hand_off is None:
+                        # After a hold, targets the first walk admitted stay admitted: the owner's
+                        # remaining wait is shorter only because the request waited (§25.7). A
+                        # first walk that kept the owner gets the fresh gate, never a looser one.
+                        hand_off = admitted or self._may_hand_off(results[0])
+                    if not hand_off:
+                        break  # the owner's own result decides (DESIGN §16.8)
+                # Calls the serving model didn't make carry the placeholder: after a handoff, or in
+                # a mixed turn served by its latest owner (DESIGN §16.8). An owner serving its own
+                # turn keeps the client's signatures, unknown IDs included (most likely its own
+                # calls). Calls the client sent without one get this model's stored signature back,
+                # or the placeholder (DESIGN §23.4).
+                foreign = owner is not None and (
+                    model.id != owner.id or any(r.model_id != model.id for r in records.values()))
+                # Also with no ID in the turn: an ID-less call still gets the placeholder (§23.4).
+                signed = with_signatures(request, model.id, records, foreign=foreign)
+                body = signed.body
+                # Estimated from what this model is sent: placeholders are much shorter than real
+                # signatures and restored ones make it longer, so the client's body would be wrong.
+                tokens = input_tokens if body is request else estimate_input_tokens(body)
+                c = Candidate(model)
+                results.append(c)
+                if self._store.is_disabled(model):
+                    c.reason, c.limits = "disabled", []
+                    continue
+                if not fits(model, tokens, output_tokens):
+                    c.reason = "too_large"
+                    continue
+                out = await attempt(c, signed, tokens, last_resort=False)
+                if out is not None:
+                    return out, results  # type: ignore[return-value]
 
-        # Last resort (DESIGN §22.2): the models skipped only for the soft part of a 5xx
-        # cooldown or a busy recovery slot, in candidate order, while attempts and time remain.
-        # A pinned owner comes first here, after its handoff targets have failed.
-        for c, signed, tokens in deferred:
-            if self._store.is_disabled(c.model):
-                c.reason, c.limits = "disabled", []
-                continue
-            out = await attempt(c, signed, tokens, last_resort=True)
-            if out is _STOP:
-                break
-            if out is not None:
-                return out  # type: ignore[return-value]
+            # Last resort (DESIGN §22.2): the models skipped only for the soft part of a 5xx
+            # cooldown or a busy recovery slot, in candidate order, while attempts and time remain.
+            # A pinned owner comes first here, after its handoff targets have failed.
+            for c, signed, tokens in deferred:
+                if self._store.is_disabled(c.model):
+                    c.reason, c.limits = "disabled", []
+                    continue
+                out = await attempt(c, signed, tokens, last_resort=True)
+                if out is _STOP:
+                    break
+                if out is not None:
+                    return out, results  # type: ignore[return-value]
+
+            return None, results
+
+        out_, results = await walk()
+        if out_ is not None:
+            return out_
+        found = self._hold_for(results, deadline) if tried == 0 else None
+        if found is not None:
+            wake, wait_s = found
+            # DESIGN §25.4: only the proxy's own minute window blocks the request and it frees
+            # soon. Sleep, reserving nothing, then walk the same candidates once more with the
+            # same context (owner, turn, tier, rule, attempts, path): nothing is decided again.
+            held = True
+            hold_.model, hold_.limits = wake.model.id, list(wake.limits)
+            hold_.started = self._clock.now()
+            self.holds_in_flight += 1
+            try:
+                # The wait _hold_for checked against hold_max_s, not one read from the clock
+                # again, so a wall-clock step can't stretch it (§25.7).
+                await self.sleep(wait_s + HOLD_PAD_S)
+                if gone is not None:
+                    await asyncio.sleep(0)  # a disconnect that is ready reaches the watcher first
+            finally:
+                self.holds_in_flight -= 1
+                hold_.ms = round(max(0.0, self._clock.now() - hold_.started) * 1000)
+            if gone is not None and gone():
+                raise asyncio.CancelledError  # the client left: never sent (§25.7)
+            if deadline - self._clock.now() < MIN_ATTEMPT_S:
+                # The sleep overran the margin: answered as any deadline (§9), with a 503.
+                now = self._clock.now()
+                for c in results:
+                    if c.reason not in ("disabled", "too_large"):
+                        c.reason, c.ready_at, c.limits, c.detail = "not_tried", now, [], ""
+            else:
+                out_, results = await walk()
+                if out_ is not None:
+                    return out_
 
         out = self._final(name, results, path, affinity)
         out.turn = turn
         if owner is not None and any(m != owner.id for m in path):
             out.handoff_from = owner.id  # a target was called and failed too
         return labelled(out, None, out.handoff_from)
+
+    def _hold_for(self, results: list[Candidate], deadline: float) -> tuple[Candidate, float] | None:
+        """The candidate whose readiness a request is held for and the wait, or None (DESIGN
+        §25.4). The
+        caller checks that no upstream call was made and that this is the first hold. Held only
+        if the outcome would be a 429 (every live candidate `quota`) and a candidate the gate
+        admitted (one that was walked) is blocked only by the proxy's own RPM or TPM count for
+        at most hold_max_s, leaving MIN_ATTEMPT_S + HOLD_SLACK_S of the deadline after it."""
+        max_s = self._config.hold_max_s
+        if max_s <= 0:
+            return None
+        now = self._clock.now()
+        live = [c for c in results if c.reason not in ("disabled", "too_large")]
+        if not live or any(c.reason != "quota" for c in live):
+            return None  # not a 429: a 503 is never held
+        # A window that freed since its check is a wait of 0: walked again at once (review).
+        ready = [c for c in live if c.holdable and c.ready_at is not None
+                 and math.isfinite(c.ready_at)]
+        if not ready:
+            return None
+        first = min(ready, key=lambda c: c.ready_at)  # type: ignore[arg-type, return-value]
+        assert first.ready_at is not None
+        wait = max(0.0, first.ready_at - now)
+        if wait > max_s or deadline - (now + wait) < MIN_ATTEMPT_S + HOLD_SLACK_S:
+            return None
+        return first, wait
 
     def _safely(self, fn, *args, failed: Any = None, **kwargs):
         """Run a state update after an upstream call; a SQLite error is logged, not raised,

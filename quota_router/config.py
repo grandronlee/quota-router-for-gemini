@@ -34,6 +34,9 @@ PARSED_BASE_FACTOR = 3 + PARSED_WIDTH_FACTOR  # the ASCII and Latin-1 case
 PARSED_OVERHEAD = 1024
 DEFAULT_PARSED_BUDGET = 128 * 1024 * 1024
 MIN_CHAT_STRUCTURE = 4096  # keys of a plain chat body (system + user, stream options: ~2.2 KB as estimated)
+# A later attempt with less time left than this isn't started (DESIGN §5.2); a hold must leave
+# at least this much of the request deadline after it (§25.4). Used by the router too.
+MIN_ATTEMPT_S = 5.0
 
 
 log = logging.getLogger("quota_router")
@@ -152,6 +155,9 @@ class Config(_Strict):
     # List only models whose multi-step handoff probe passed (DESIGN §16.8 1a).
     handoff_targets: list[str] = Field(default_factory=list)
     handoff_after_s: float = Field(default=60, ge=0)
+    # Longest wait the proxy holds a request for when only its own RPM or TPM count blocks it,
+    # instead of answering 429 (DESIGN §25). 0: off, today's behaviour.
+    hold_max_s: float = Field(default=0, ge=0, allow_inf_nan=False)
     # The automatic route (DESIGN §16.9). After validation it is also in `routes`, its tiers
     # in config order, so /v1/models, handoffs, /status and the dashboard see it as a route.
     auto: AutoConfig | None = None
@@ -187,6 +193,12 @@ class Config(_Strict):
             raise ValueError(f"handoff_targets uses unknown model(s): {', '.join(unknown)}")
         if len(set(self.handoff_targets)) != len(self.handoff_targets):
             raise ValueError("handoff_targets lists a model twice")
+        # 0 is valid with any deadline, so a config with a short request_deadline_s still starts.
+        if self.hold_max_s > 0 and self.hold_max_s + MIN_ATTEMPT_S > self.request_deadline_s:
+            raise ValueError(f"hold_max_s ({self.hold_max_s:g}) plus {MIN_ATTEMPT_S:g} s must not "
+                             f"exceed request_deadline_s ({self.request_deadline_s:g}): a held "
+                             "request needs time left to be sent (DESIGN §25.4). Lower hold_max_s, "
+                             "or set it to 0 to turn holds off")
         minimum = min_parsed_estimate(self.max_body_bytes)
         if self.max_inflight_body_bytes is not None:
             if "max_inflight_parsed_bytes" not in self.model_fields_set:

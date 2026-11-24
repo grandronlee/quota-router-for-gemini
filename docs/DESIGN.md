@@ -41,7 +41,7 @@ their own status. Code and docs cite sections as "DESIGN §N".
 | 23 | [Restoring thought signatures that clients drop](#23-restoring-thought-signatures-that-clients-drop--approved-2026-11-21-implemented-2026-11-21) | approved; implemented (amendments in §23.8) |
 | 23.8 | ↳ [After review](#238-after-review--fixes-settled-2026-11-22-amendments-approved-and-implemented-2026-11-22) |  |
 | 24 | [Request-log detail and a per-model first-byte timeout](#24-request-log-detail-and-a-per-model-first-byte-timeout--approved-2026-11-22) | approved 2026-11-22 |
-| 25 | [Short waits: hold the request instead of answering 429](#25-short-waits-hold-the-request-instead-of-answering-429--approved-2026-11-24) | approved 2026-11-24 |
+| 25 | [Short waits: hold the request instead of answering 429](#25-short-waits-hold-the-request-instead-of-answering-429--approved-2026-11-24) | approved 2026-11-24; implemented 2026-11-24 (§25.10), live check pending |
 
 ## 0. v1 scope
 
@@ -2901,3 +2901,43 @@ long for a first byte, which is what the live check measures.
    changes behaviour for existing deployments without asking.
 4. One routing context per request, one hold per request, and no keep-alive bytes while holding.
 5. No decision-log column. Holds are visible in the request log, `/status` and `qr_holds_total`.
+
+### 25.10 Implemented (2026-11-24)
+
+Steps 1–5 of the PLAN are done (branch `short-wait-holds`). A Codex adversarial review and
+`code-reviewer-deep` ran on the change; their findings are fixed, each with a regression test in
+`tests/test_holds.py`. The text above is read as follows where it left room, and amended in two
+places (marked **amended**; both approved 2026-11-24):
+
+- **Condition 3, Google's TPM window.** A `tpm` block that comes from an earlier upstream TPM 429
+  (the 60 s `tpm_full_until`, §6) is not held, though its log label is the plain `tpm`. It isn't
+  the proxy's own count (Compliance paragraph). `Blocked.holdable` carries this.
+- **The gate after a hold (amended).** "The same handoff gate (re-evaluated from fresh state)" is
+  narrowed: if the first walk's gate admitted the handoff targets, they stay admitted on the walk
+  after the hold. Otherwise an owner in a 60 s cooldown that handed off would, after a 10 s hold
+  for a target, be kept at 50 s, and the held request refused (§25.7's "the target is blocked
+  too"). If the first walk kept the owner, the second walk uses the gate unchanged, from fresh
+  state; time spent holding is never added to the owner's wait (Codex: that could open the gate
+  for a fresh short block and spend a 20-RPD model). Cost: an owner that recovers to a short RPM
+  block during the hold still loses the step to a target.
+- **The deadline after a hold.** A candidate that is reached after the hold with less than
+  `MIN_ATTEMPT_S` left is `not_tried` (a 503), not checked for quota, also after a real call in the
+  second walk. A 429 after a hold comes only from quota checked while the margin remained.
+- **Margins (amended).** A hold must leave `MIN_ATTEMPT_S` + 1 s of the deadline after the wake
+  time (not just 5 s), for the sleep's overshoot and the reservation's SQLite write. The sleep is
+  the wait that was checked against `hold_max_s`, plus 50 ms past the window's edge, so an early
+  timer or a float at the edge never wakes it to a full window. A window that freed between its
+  check and the hold decision is a wait of 0: walked again at once. The config check stays
+  `hold_max_s + 5 ≤ request_deadline_s`, so the longest hold such a config allows is 1 s shorter.
+- **Disconnects.** Routing is given `gone` (the watcher's `done`). After waking, and again after
+  reserving, a held request yields once so a disconnect that is ready reaches the watcher, then
+  stops (raising `CancelledError`, which the handler answers as a 499) with its reservation given
+  back. If the handler itself is cancelled, a 499 line is written for a held request only;
+  non-held requests still write none there, as before.
+- **`/status` `holds.in_flight`** counts requests sleeping in a hold now.
+- **First-byte figures.** `first_byte_ms` and `qr_first_byte_seconds` are measured from arrival,
+  so they include hold time once holds are on.
+- **Known gap (pre-existing pattern):** a handler cancelled during the response's own awaits
+  (`await routing`, closing handles) loses that request's line and hold count, as non-held
+  requests already do. `in_flight` stays right.
+- **Rollback:** as §25.7. No schema change; remove `hold_max_s` before running an older image.
