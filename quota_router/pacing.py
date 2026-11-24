@@ -5,6 +5,10 @@ the PT day's demand is expected to use:
 
     upgrade ⇔ left > (capacity + reserve) × (1 − demand_share(t))
 
+A turn start whose rule names the paced tier (DESIGN §16.10.2) has a lower line instead:
+
+    rule start ⇔ left > max(0, capacity × (1 − demand_share(t)) − reserve)
+
 `demand_share(t)` is the share of a typical PT day's turn starts that come before `t`. It is
 measured from the decision log once 7 PT days in the last 14 (not counting today) have turn
 starts, and otherwise comes from `working_hours`, or a flat day. Only dates, hours and counts
@@ -42,15 +46,22 @@ class PaceView:
     share: float
     source: Source
     upgrade_above: float  # an upgrade needs `left` above this
+    # A turn whose rule names the paced tier starts there while `left` is above this (§16.10.2).
+    rule_above: float = 0.0
 
     @property
     def upgrade(self) -> bool:
         return self.left > self.upgrade_above
 
+    @property
+    def rule_allowed(self) -> bool:
+        return self.left > self.rule_above
+
     def status(self) -> dict:
         return {"tier": self.tier, "capacity": self.capacity, "left": self.left,
                 "share": round(self.share, 4), "source": self.source,
-                "upgrade_above": round(self.upgrade_above, 2), "upgrade_now": self.upgrade}
+                "upgrade_above": round(self.upgrade_above, 2), "upgrade_now": self.upgrade,
+                "rule_above": round(self.rule_above, 2)}
 
 
 class DemandCurve:
@@ -183,5 +194,8 @@ class Pacer:
         # Rounded so float noise can't move the line: (80 + 5) × (1 − 0.8) is 16.999999999999996,
         # which upgraded a turn with exactly 17 left. `left` is a whole number, so 9 places lose
         # nothing real.
-        above = round((capacity + self._auto.pacing.reserve) * (1.0 - share), 9)
-        return PaceView(self._auto.pacing.tier, capacity, left, share, source, above)
+        reserve = self._auto.pacing.reserve
+        above = round((capacity + reserve) * (1.0 - share), 9)
+        # The rule line (DESIGN §16.10.2): `used < pace(t) + reserve`, restated for the pool.
+        rule_above = max(0.0, round(capacity * (1.0 - share) - reserve, 9))
+        return PaceView(self._auto.pacing.tier, capacity, left, share, source, above, rule_above)

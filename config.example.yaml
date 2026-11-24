@@ -59,3 +59,18 @@ handoff_after_s: 60           # hand a tool turn off only if its model is blocke
 #     reserve: 5               # requests kept back, shrinking to 0 as the day's demand ends
 #     working_hours: "09:00-18:00"   # used until 7 days of demand are measured
 #     timezone: "America/New_York"   # your IANA time zone
+#   # Optional rules (DESIGN §16.10.2), first match wins. A rule naming the paced tier starts
+#   # its turns there until the pool is `reserve` requests past the pace line, then on the
+#   # default tier (`paced`); a rule naming another tier keeps its turns there. Prefixes are
+#   # literal and case-sensitive, matched at the start of any line of the system prompt.
+#   # These match Zoo Code 3.98.2 (docs/probe-results.md); other clients need their own.
+#   # rules:
+#   #   - name: task-title     # Zoo Code's small, tool-less title request
+#   #     when: { max_tools: 0, max_input_tokens: 500 }
+#   #     tier: fast
+#   #   - name: planning-mode  # Architect and Orchestrator
+#   #     when:
+#   #       system_line_prefix:
+#   #         - "You are Zoo, an experienced technical leader"
+#   #         - "You are Zoo, a strategic workflow orchestrator"
+#   #     tier: smart

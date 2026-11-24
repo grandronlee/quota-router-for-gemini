@@ -438,9 +438,9 @@ def test_migration_from_version_3_keeps_turns_and_adds_the_tier(tmp_path):
     c.commit()
     c.close()
     conn = connect(path)
-    assert SCHEMA_VERSION == 4 and conn.execute("PRAGMA user_version").fetchone()[0] == 4
-    assert conn.execute("SELECT turn_id, reason, steps, tier FROM turns").fetchall() == [
-        ("t1", "first", 1, None)]
+    assert SCHEMA_VERSION == 5 and conn.execute("PRAGMA user_version").fetchone()[0] == 5
+    assert conn.execute("SELECT turn_id, reason, steps, tier, rule FROM turns").fetchall() == [
+        ("t1", "first", 1, None, None)]
 
 
 # ---- HTTP layer (DESIGN §16.9.5) -------------------------------------------
@@ -471,11 +471,13 @@ def test_headers_turn_row_status_and_metrics_on_a_served_turn():
     assert status["auto"]["route"] == "gemini-auto"
     assert orphan.headers["x-turn-affinity"] == "unknown"
     assert status["auto"]["pace"] == {"tier": "smart", "capacity": 40, "left": 38, "share": 0.5,
-                                      "source": "flat", "upgrade_above": 22.5, "upgrade_now": True}
+                                      "source": "flat", "upgrade_above": 22.5, "upgrade_now": True,
+                                      "rule_above": 15.0}  # max(0, 40 × 0.5 − 5), §16.10.2
     assert status["auto"]["turn_starts_today_by_reason"] == {"pace-upgrade": 1}
     assert 'qr_route_decisions_total{reason="pace-upgrade",tier="smart"} 2' in metrics
     assert 'qr_pace_left{tier="smart"} 38' in metrics
     assert 'qr_pace_upgrade_above{tier="smart"} 22.5' in metrics
+    assert 'qr_pace_rule_above{tier="smart"} 15' in metrics
 
 
 def test_headers_on_429_and_503():

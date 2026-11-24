@@ -17,15 +17,14 @@ import datetime as dt
 import secrets
 import sqlite3
 from dataclasses import dataclass
-from typing import Literal
-
 from .clock import PT, Clock
 
 TURN_RETENTION_DAYS = 30
 
-# `default` and `pace-upgrade` are gemini-auto turn starts (DESIGN §16.9.5); `spill` is a turn
-# start served outside its preferred tier, or after the route's first model on other routes.
-TurnReason = Literal["first", "spill", "pinned", "handoff", "unknown", "default", "pace-upgrade"]
+# `default` and `pace-upgrade` are gemini-auto turn starts (DESIGN §16.9.5), and so are `paced`
+# and a rule's name (§16.10.3); `spill` is a turn start served outside its preferred tier, or
+# after the route's first model on other routes. Rule names come from config, hence `str`.
+TurnReason = str
 # Rows that a follow-up created, not a turn start (the demand curve leaves them out, §16.9.3).
 FOLLOW_UP_REASONS = ("pinned", "handoff", "unknown")
 
@@ -44,6 +43,7 @@ class TurnRef:
     tools: int
     started_at: float
     tier: str | None = None  # gemini-auto's preferred tier (the owner's, for a follow-up)
+    rule: str | None = None  # the gemini-auto rule that decided it (DESIGN §16.10.3)
 
 
 def _pt(t: float) -> dt.datetime:
@@ -73,8 +73,8 @@ class TurnLog:
         step = served_model is not None
         self._conn.execute(
             "INSERT INTO turns (turn_id, day, hour, route, first_model, last_model, reason, tools, "
-            "input_tokens, output_tokens, steps, errors, handoffs, last_status, tier) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+            "input_tokens, output_tokens, steps, errors, handoffs, last_status, tier, rule) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
             "ON CONFLICT (turn_id) DO UPDATE SET "
             "first_model = COALESCE(turns.first_model, excluded.first_model), "
             "last_model = COALESCE(excluded.last_model, turns.last_model), "
@@ -86,7 +86,7 @@ class TurnLog:
             "last_status = excluded.last_status",
             (turn.turn_id, start.date().isoformat(), start.hour, route, served_model, served_model,
              turn.reason, turn.tools, prompt_tokens or 0, output_tokens or 0,
-             int(step), int(not step), int(handoff), status, turn.tier))
+             int(step), int(not step), int(handoff), status, turn.tier, turn.rule))
 
     def starts_today_by_reason(self, route: str) -> dict[str, int]:
         """Turn starts today (PT) on `route`, by reason, for /status (DESIGN §16.9.5). Rows a

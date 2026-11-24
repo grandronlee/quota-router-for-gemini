@@ -165,6 +165,8 @@ def outcome_log_fields(outcome: Any, now: float) -> dict:
     if getattr(outcome, "route_reason", None):
         out["route_tier"] = outcome.route_tier
         out["route_reason"] = outcome.route_reason
+        if getattr(outcome, "route_rule", None):  # a gemini-auto rule decided it (§16.10.3)
+            out["route_rule"] = outcome.route_rule
     if isinstance(outcome, RouteFailed) and outcome.status in (429, 503):
         out["retry_after_s"] = outcome.retry_after_s
         out["blocked"] = [{
@@ -207,6 +209,9 @@ class Proxy:
             "qr_thought_signatures_total", n, model=model, action=action)
         self.scrubber = Scrubber([settings.gemini_api_key, settings.proxy_token])
         self.metrics = Metrics()
+        # qr_route_decisions_total's reason labels: the fixed ones and the configured rule names.
+        self.route_reasons = frozenset(ROUTE_REASONS) | {
+            r.name for r in (config.auto.rules if config.auto else ())}
         self.stats = RequestStats(self.clock.now())
         self.auth_failures = 0
         self.body_budget = BodyBudget(config.max_inflight_parsed_bytes)
@@ -1011,6 +1016,7 @@ def create_app(proxy: Proxy) -> FastAPI:
         if pace is not None:
             gauges["qr_pace_left"] = [({"tier": pace.tier}, pace.left)]
             gauges["qr_pace_upgrade_above"] = [({"tier": pace.tier}, round(pace.upgrade_above, 2))]
+            gauges["qr_pace_rule_above"] = [({"tier": pace.tier}, round(pace.rule_above, 2))]
         text = p.metrics.render(gauges, {
             "qr_auth_failures_total": p.auth_failures,
             "qr_state_errors_total": p.router.state_errors,
@@ -1092,7 +1098,8 @@ def create_app(proxy: Proxy) -> FastAPI:
         served_payload = outcome.payload if isinstance(outcome, RouteServed) else None
         await handles.close_except(served_payload)
         if outcome.route_reason is not None:  # gemini-auto (DESIGN §16.9.5)
-            p.metrics.inc("qr_route_decisions_total", reason=bounded(outcome.route_reason, ROUTE_REASONS),
+            # Rule names come from config, so the label set stays bounded (DESIGN §16.10.3).
+            p.metrics.inc("qr_route_decisions_total", reason=bounded(outcome.route_reason, p.route_reasons),
                           tier=outcome.route_tier or "none")
 
         if isinstance(outcome, RouteFailed):

@@ -20,7 +20,7 @@ from typing import Any, Callable, Literal, Mapping, Protocol
 from .affinity import AffinityRecord, AffinityStore, Recorded
 from .classify import classify_429
 from .clock import Clock
-from .config import Config, ModelConfig
+from .config import AutoRule, Config, ModelConfig
 from .pacing import DemandCurve, Pacer, PaceView
 from .quota import Blocked, QuotaStore, Reservation
 from .turns import TurnReason, TurnRef, new_turn_id
@@ -39,9 +39,11 @@ _STOP = object()  # sentinel: the last-resort pass has no attempts or time left
 
 Reason = Literal["disabled", "too_large", "quota", "unavailable", "not_tried"]
 Affinity = Literal["pinned", "unknown", "mixed", "handoff"]
-# gemini-auto's x-route-reason values (DESIGN §16.9.4).
-RouteReason = Literal["default", "pace-upgrade", "spill", "pinned", "handoff"]
-ROUTE_REASONS = ("default", "pace-upgrade", "spill", "pinned", "handoff")
+# gemini-auto's x-route-reason values (DESIGN §16.9.4, §16.10.2): these, or a configured rule's
+# name, which config validation keeps distinct from them.
+RouteReason = str
+ROUTE_REASONS = ("default", "pace-upgrade", "spill", "pinned", "handoff", "paced")
+SYSTEM_TEXT_LIMIT = 32_768  # characters of system text a rule searches (DESIGN §16.10.2)
 
 # Google's documented signature for history "transferred from a different model" (DESIGN §16.8).
 PLACEHOLDER_SIGNATURE = "skip_thought_signature_validator"
@@ -186,6 +188,7 @@ class RouteServed:
     attempt: Attempt | None = None  # this call's log entry, finished when a stream ends
     route_tier: str | None = None  # gemini-auto only: x-route-tier and x-route-reason (§16.9.5)
     route_reason: RouteReason | None = None
+    route_rule: str | None = None  # gemini-auto only: the rule that decided it (§16.10.3)
 
 
 @dataclass
@@ -203,6 +206,7 @@ class RoutePassthrough:
     placeholder: int = 0  # placeholders for calls sent without a signature and no usable record
     route_tier: str | None = None
     route_reason: RouteReason | None = None
+    route_rule: str | None = None
 
 
 @dataclass
@@ -218,6 +222,7 @@ class RouteFailed:
     turn: TurnRef | None = None  # None only for an unknown model or route
     route_tier: str | None = None
     route_reason: RouteReason | None = None
+    route_rule: str | None = None
 
     def error_body(self) -> dict:
         etype = {400: "invalid_request_error", 404: "invalid_request_error",
@@ -411,6 +416,72 @@ def active_turn_tool_call_ids(messages: Any) -> list[str]:
     return ids
 
 
+def system_text(request: Mapping[str, Any], limit: int = SYSTEM_TEXT_LIMIT) -> str:
+    """The `system` and `developer` messages' text, joined by newlines, first `limit` characters
+    (DESIGN §16.10.2). A message's text parts are joined as they are, so a prefix split across
+    parts still matches. Anything that isn't text adds nothing, and nothing here raises. The
+    text is collected only up to `limit`, so a huge prompt is never copied in full."""
+    messages = request.get("messages")
+    if not isinstance(messages, list):
+        return ""
+    pieces: list[str] = []
+    size = 0
+    first = True
+    for m in messages:
+        if size >= limit:
+            break
+        if not (isinstance(m, dict) and m.get("role") in ("system", "developer")):
+            continue
+        content = m.get("content")
+        if isinstance(content, str):
+            texts = [content]
+        elif isinstance(content, list):
+            texts = [p["text"] for p in content
+                     if isinstance(p, dict) and p.get("type") == "text" and isinstance(p.get("text"), str)]
+        else:
+            continue
+        if not first:
+            pieces.append("\n")
+            size += 1
+        first = False
+        for t in texts:
+            if size >= limit:
+                break
+            t = t[:limit - size]
+            pieces.append(t)
+            size += len(t)
+    return "".join(pieces)[:limit]
+
+
+def _within(n: int, lo: int | None, hi: int | None) -> bool:
+    return (lo is None or n >= lo) and (hi is None or n <= hi)
+
+
+def rule_matches(rule: AutoRule, request: Mapping[str, Any], input_tokens: int,
+                 text: Callable[[], str]) -> bool:
+    """Whether all of the rule's conditions hold (DESIGN §16.10.2). `text` gives the system text,
+    read once per request and only if a rule needs it. A malformed field fails its condition."""
+    w = rule.when
+    if w.min_tools is not None or w.max_tools is not None:
+        tools = request.get("tools", [])
+        if tools is None:
+            tools = []
+        if not isinstance(tools, list) or not _within(len(tools), w.min_tools, w.max_tools):
+            return False
+    if not _within(input_tokens, w.min_input_tokens, w.max_input_tokens):
+        return False
+    if w.reasoning_effort is not None:
+        effort = request.get("reasoning_effort")
+        if not (isinstance(effort, str) and effort in w.reasoning_effort):
+            return False
+    if w.system_line_prefix is not None:
+        t = text()
+        # Literal, so linear in the text: no pattern can backtrack (the 2026-11-24 amendment).
+        if not any(t.startswith(p) or ("\n" + p) in t for p in w.system_line_prefix):
+            return False
+    return True
+
+
 def fits(model: ModelConfig, input_tokens: int, output_tokens: int | None) -> bool:
     limit = model.input_limit if model.tpm_input is None else min(model.input_limit, model.tpm_input)
     if input_tokens > limit:
@@ -461,18 +532,47 @@ class Router:
             log.exception("could not read the pace")
             return None
 
-    def _decide(self) -> tuple[str, RouteReason]:
-        """A gemini-auto turn start's preferred tier and reason (DESIGN §16.9.2). A failed state
-        read gives the default tier: it keeps smart quota back, and spill still works (§16.9.6)."""
+    def _match_rule(self, request: Mapping[str, Any], input_tokens: int) -> AutoRule | None:
+        """The first matching gemini-auto rule (DESIGN §16.10.2), or None."""
+        auto = self._config.auto
+        assert auto is not None
+        cached: list[str] = []
+
+        def text() -> str:
+            if not cached:
+                cached.append(system_text(request))
+            return cached[0]
+        for rule in auto.rules:
+            if rule_matches(rule, request, input_tokens, text):
+                return rule
+        return None
+
+    def _decide(self, request: Mapping[str, Any], input_tokens: int
+                ) -> tuple[str, RouteReason, str | None]:
+        """A gemini-auto turn start's preferred tier, reason and rule (DESIGN §16.9.2, §16.10.2).
+        A failed state read gives the default tier: it keeps smart quota back, and spill still
+        works (§16.9.6); a paced-tier rule's turn is then `paced`."""
         auto = self._config.auto
         assert auto is not None and self._pacer is not None
+        rule = self._match_rule(request, input_tokens)
+        if rule is not None:
+            if rule.tier != auto.pacing.tier:
+                return rule.tier, rule.name, rule.name  # kept there, never upgraded
+            try:
+                if self._pacer.view(self._clock.now()).rule_allowed:
+                    return rule.tier, rule.name, rule.name
+            except sqlite3.Error:
+                self.state_errors += 1
+                log.exception("could not read the pace; rule %s's turn starts on %s",
+                              rule.name, auto.default_tier)
+            return auto.default_tier, "paced", rule.name
         try:
             if self._pacer.view(self._clock.now()).upgrade:
-                return auto.pacing.tier, "pace-upgrade"
+                return auto.pacing.tier, "pace-upgrade", None
         except sqlite3.Error:
             self.state_errors += 1
             log.exception("could not read the pace; not upgrading this turn")
-        return auto.default_tier, "default"
+        return auto.default_tier, "default", None
 
     def resolve(self, name: Any) -> list[ModelConfig] | None:
         if not isinstance(name, str):
@@ -519,7 +619,7 @@ class Router:
     @staticmethod
     def _turn(request: Mapping[str, Any], affinity: Affinity | None, turn_id: str | None,
               started: float, decision: RouteReason | None = None,
-              tier: str | None = None) -> TurnRef:
+              tier: str | None = None, rule: str | None = None) -> TurnRef:
         """The request's decision-log turn. A request with no tool calls in its active turn
         starts one; a follow-up continues the turn its calls name, or starts a row (`unknown`
         when none of its calls is known). A known call whose model is no longer configured is
@@ -533,7 +633,7 @@ class Router:
             reason = "unknown"
         else:
             reason = "pinned"
-        return TurnRef(turn_id or new_turn_id(), reason, n_tools, started, tier)
+        return TurnRef(turn_id or new_turn_id(), reason, n_tools, started, tier, rule)
 
     def _served_turn(self, turn: TurnRef, resolved: list[ModelConfig], model: ModelConfig,
                      handoff_from: str | None) -> TurnRef:
@@ -542,7 +642,10 @@ class Router:
         gemini-auto turn start served outside its preferred tier."""
         if turn.reason == "first" and model.id != resolved[0].id:
             return replace(turn, reason="spill")
-        if turn.reason in ("default", "pace-upgrade") and self._config.tier_of(model.id) != turn.tier:
+        # A gemini-auto turn start: `default`, `pace-upgrade`, `paced` or a rule's name.
+        auto_start = turn.tier is not None and turn.reason not in ("first", "spill", "pinned",
+                                                                    "handoff", "unknown")
+        if auto_start and self._config.tier_of(model.id) != turn.tier:
             return replace(turn, reason="spill")
         if turn.reason == "pinned" and handoff_from is not None:
             return replace(turn, reason="handoff")
@@ -596,13 +699,17 @@ class Router:
         auto = self.is_auto(name)
         tier: str | None = None
         decision: RouteReason | None = None
+        rule: str | None = None
+        input_tokens = estimate_input_tokens(request)
+        output_tokens = requested_output_tokens(request)
         if auto:
             if affinity in ("pinned", "mixed"):
                 tier = self._config.tier_of(candidates[0].id)
             else:
-                tier, decision = self._decide()
+                # Rules are evaluated only here (DESIGN §16.10.2): a pinned turn keeps its owner.
+                tier, decision, rule = self._decide(request, input_tokens)
                 candidates = self._config.tier_models(tier)
-        turn = self._turn(request, affinity, turn_id, started, decision, tier)
+        turn = self._turn(request, affinity, turn_id, started, decision, tier, rule)
         owner = candidates[0] if affinity in ("pinned", "mixed") else None
         if owner is not None:
             candidates = [owner, *self._handoff_targets(name, resolved, owner, tier)]
@@ -611,6 +718,7 @@ class Router:
             """The outcome with gemini-auto's x-route-tier and x-route-reason (§16.9.5)."""
             if auto:
                 out.route_tier = tier
+                out.route_rule = rule
                 if owner is not None:
                     out.route_reason = "handoff" if handoff_from is not None else "pinned"
                 elif model is not None and self._config.tier_of(model.id) != tier:
@@ -618,8 +726,6 @@ class Router:
                 else:
                     out.route_reason = decision
             return out
-        input_tokens = estimate_input_tokens(request)
-        output_tokens = requested_output_tokens(request)
 
         results: list[Candidate] = []
         path: list[str] = []

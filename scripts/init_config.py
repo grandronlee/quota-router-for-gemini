@@ -179,7 +179,19 @@ def render(models: list[dict], chosen: list[str]) -> str:
                   "#     tier: smart",
                   "#     reserve: 5               # requests kept back, shrinking to 0 as the day's demand ends",
                   '#     working_hours: "09:00-18:00"   # used until 7 days of demand are measured',
-                  f'#     timezone: "{FILL_ME}"           # your IANA time zone, e.g. "Europe/Paris"']
+                  f'#     timezone: "{FILL_ME}"           # your IANA time zone, e.g. "Europe/Paris"',
+                  "#   # Optional rules, first match wins (DESIGN §16.10.2). These match Zoo Code",
+                  "#   # 3.98.2; remove the inner '# ' to use them.",
+                  "#   # rules:",
+                  "#   #   - name: task-title",
+                  "#   #     when: { max_tools: 0, max_input_tokens: 500 }",
+                  "#   #     tier: fast",
+                  "#   #   - name: planning-mode",
+                  "#   #     when:",
+                  "#   #       system_line_prefix:",
+                  '#   #         - "You are Zoo, an experienced technical leader"',
+                  '#   #         - "You are Zoo, a strategic workflow orchestrator"',
+                  "#   #     tier: smart"]
     lines.append("")
     return "\n".join(lines)
 

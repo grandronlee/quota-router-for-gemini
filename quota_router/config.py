@@ -8,12 +8,13 @@ from __future__ import annotations
 import logging
 import re
 from pathlib import Path
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, PositiveInt, ValidationError, model_validator
+from pydantic import (BaseModel, ConfigDict, Field, PositiveInt, StrictInt, StrictStr,
+                      ValidationError, model_validator)
 
 GOOGLE_UPSTREAM_HOST = "generativelanguage.googleapis.com"
 _LOOPBACK = {"localhost", "127.0.0.1", "::1"}
@@ -93,12 +94,37 @@ class PacingConfig(_Strict):
     timezone: str | None = None
 
 
+# gemini-auto's own x-route-reason values (DESIGN §16.9.4, §16.10.2), and reasons the decision
+# log uses; a rule may not take one of these names, since its name is sent as a reason too.
+RESERVED_RULE_NAMES = frozenset({"default", "pace-upgrade", "spill", "paced", "pinned", "handoff",
+                                 "handback", "unknown", "first", "mixed"})
+_Count = Annotated[StrictInt, Field(ge=0)]
+
+
+class RuleWhen(_Strict):
+    """A rule's conditions (DESIGN §16.10.2); all that are set must hold."""
+    system_line_prefix: list[str] | None = None
+    min_tools: _Count | None = None
+    max_tools: _Count | None = None
+    min_input_tokens: _Count | None = None
+    max_input_tokens: _Count | None = None
+    reasoning_effort: list[StrictStr] | None = None
+
+
+class AutoRule(_Strict):
+    name: str
+    when: RuleWhen
+    tier: str
+
+
 class AutoConfig(_Strict):
     """The automatic route (DESIGN §16.9.1). `tiers` is best first within each tier."""
     name: str = Field(min_length=1)
     tiers: dict[str, list[str]]
     default_tier: str
     pacing: PacingConfig
+    # Ordered; the first match decides a turn start's tier (DESIGN §16.10.2).
+    rules: list[AutoRule] = Field(default_factory=list)
 
 
 class Config(_Strict):
@@ -252,6 +278,43 @@ class Config(_Strict):
             except (ZoneInfoNotFoundError, ValueError):
                 raise ValueError(f"auto pacing timezone {pacing.timezone!r} is not a known "
                                  "IANA time zone") from None
+        self._check_rules(auto)
+
+    @staticmethod
+    def _check_rules(auto: AutoConfig) -> None:
+        """DESIGN §16.10.2: every problem is a startup error, never a request-time one."""
+        names: set[str] = set()
+        for i, rule in enumerate(auto.rules):
+            where = f"auto rule {rule.name!r}" if rule.name else f"auto rule #{i + 1}"
+            # Sent in the x-route-reason header, like a tier name.
+            if not _TIER_NAME.match(rule.name):
+                raise ValueError(f"{where}: name must be letters, digits, '.', '_' or '-' (ASCII, "
+                                 "starting with a letter or digit): it is sent in the "
+                                 "x-route-reason header")
+            if rule.name in RESERVED_RULE_NAMES:
+                raise ValueError(f"{where}: {rule.name!r} is a reserved route reason; reserved: "
+                                 f"{', '.join(sorted(RESERVED_RULE_NAMES))}")
+            if rule.name in names:
+                raise ValueError(f"{where}: two rules have this name")
+            names.add(rule.name)
+            if rule.tier not in auto.tiers:
+                raise ValueError(f"{where}: tier {rule.tier!r} is not a tier")
+            w = rule.when
+            if not w.model_fields_set or all(getattr(w, k) is None for k in RuleWhen.model_fields):
+                raise ValueError(f"{where}: 'when' needs at least one condition")
+            if w.system_line_prefix is not None:
+                if not w.system_line_prefix:
+                    raise ValueError(f"{where}: system_line_prefix must list at least one prefix")
+                for p in w.system_line_prefix:
+                    if not p or "\n" in p:
+                        raise ValueError(f"{where}: each system_line_prefix must be a non-empty "
+                                         "string without a newline")
+            for lo, hi in (("min_tools", "max_tools"), ("min_input_tokens", "max_input_tokens")):
+                a, b = getattr(w, lo), getattr(w, hi)
+                if a is not None and b is not None and a > b:
+                    raise ValueError(f"{where}: {lo} ({a}) is above {hi} ({b})")
+            if w.reasoning_effort is not None and not w.reasoning_effort:
+                raise ValueError(f"{where}: reasoning_effort must list at least one value")
 
     def tier_of(self, model_id: str) -> str | None:
         """The auto tier of a model (by its real ID), or None."""

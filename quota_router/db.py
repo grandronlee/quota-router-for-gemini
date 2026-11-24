@@ -16,7 +16,7 @@ from pathlib import Path
 
 log = logging.getLogger("quota_router")
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS rpd (
@@ -72,6 +72,11 @@ MIGRATIONS: dict[int, list[str]] = {
     # and on rows from version 3.
     3: [
         "ALTER TABLE turns ADD COLUMN tier TEXT",
+    ],
+    # 4 -> 5: the gemini-auto rule that decided a turn (DESIGN §16.10.3). NULL when no rule
+    # matched, on other routes and on rows from version 4.
+    4: [
+        "ALTER TABLE turns ADD COLUMN rule TEXT",
     ],
 }
 

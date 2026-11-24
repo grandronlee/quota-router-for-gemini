@@ -127,7 +127,7 @@ def test_scrubber():
 
 def test_new_and_phase1_databases_get_the_current_schema_version(tmp_path):
     fresh = connect(tmp_path / "new.sqlite3")
-    assert fresh.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION == 4
+    assert fresh.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION == 5
     fresh.close()
     old = sqlite3.connect(tmp_path / "old.sqlite3")
     old.executescript(SCHEMA)
@@ -183,7 +183,7 @@ def test_prune_removes_expired_rows_and_survives_errors():
     # T0 is 2026-11-20 PT: rows from 30 days back (2026-10-21) are kept, older ones go.
     for turn_id, day in (("t-old", "2026-10-20"), ("t-edge", "2026-10-21"), ("t-new", "2026-11-20")):
         conn.execute("INSERT INTO turns VALUES (?, ?, 9, 'fast', 'model-a', 'model-a', 'first', 0, "
-                     "0, 0, 1, 0, 0, 200, NULL)", (turn_id, day))
+                     "0, 0, 1, 0, 0, 200, NULL, NULL)", (turn_id, day))
     p.prune_once()
     assert [r[0] for r in conn.execute("SELECT day FROM rpd")] == ["2026-11-19"]
     assert conn.execute("SELECT COUNT(*) FROM exhausted").fetchone()[0] == 0

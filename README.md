@@ -131,6 +131,14 @@ any. Until then it uses `working_hours` and `timezone`, so set those to your own
 it assumes even use over the Pacific day, and much of the smart quota can go unused
 ([DESIGN §16.9](docs/DESIGN.md)).
 
+Optional `rules` in the `auto:` block choose a turn's tier first, from what the request
+shows: the number of tools, the input size, `reasoning_effort`, or a literal prefix of a
+system-prompt line. The commented example starts Zoo Code's title requests on fast, with no
+upgrade to smart (they can still spill into smart if no fast model can serve them), and starts
+Architect and Orchestrator turns on smart. A rule turn on smart has the rule's name as
+`x-route-reason`, until the smart pool falls `reserve` requests behind the pace; after that
+those turns start on fast as `paced` ([DESIGN §16.10](docs/DESIGN.md)).
+
 ### Cline / Kilo Code
 
 Provider **OpenAI Compatible**, same base URL and key. Plan mode `gemini-smart` (or

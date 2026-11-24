@@ -69,6 +69,9 @@ function renderModels() {
   document.getElementById("pace").textContent = pace
     ? `Pace (${data.auto.route}, ${pace.tier}): ${num(pace.left)} of ${num(pace.capacity)} left · ` +
       `upgrades while above ${num(Math.round(pace.upgrade_above * 10) / 10)} · ` +
+      // A paced-tier rule's line (DESIGN §16.10.2); absent from an older proxy's /status.
+      (typeof pace.rule_above === "number"
+        ? `rule turns while above ${num(Math.round(pace.rule_above * 10) / 10)} · ` : "") +
       `${Math.round(pace.share * 100)}% of the day's demand gone (${pace.source})` +
       (pace.upgrade_now ? " · upgrading now" : "")
     : "";

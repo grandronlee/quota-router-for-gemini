@@ -37,6 +37,8 @@ HELP = {
     "qr_pace_left": ("gauge", "Requests the paced tier has left today (exhausted models count 0)."),
     "qr_pace_upgrade_above": ("gauge", "A gemini-auto turn is upgraded to the paced tier while "
                                        "qr_pace_left is above this."),
+    "qr_pace_rule_above": ("gauge", "A gemini-auto turn whose rule names the paced tier starts "
+                                    "there while qr_pace_left is above this; DESIGN §16.10.2."),
     "qr_auth_failures_total": ("counter", "Requests rejected for a missing or wrong token."),
     "qr_state_errors_total": ("counter", "SQLite errors while reading or writing quota state."),
     "qr_tool_call_id_reused_total": ("counter", "Tool-call IDs recorded twice (DESIGN §20.6)."),

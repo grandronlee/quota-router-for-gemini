@@ -299,6 +299,10 @@ requests count in the demand curve, `user_matches` decided after the probe), in 
    `code-reviewer` (routing, a migration).
 8. Live check: one working day on `gemini-auto` with the rules set.
 
+Steps 3–7 done 2026-11-24 (branch `step3b-rules`): `.venv/bin/python -m pytest -q` and
+`docker compose run --build --rm test` pass. The readings settled while implementing are in
+DESIGN §16.10.5, "3b implemented".
+
 Also after v1: alerts (DESIGN §17.2 layer 6), a remote-hosting design (DESIGN §18)
 if the proxy is to run somewhere other than the user's machine.
 

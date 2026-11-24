@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import io
 import json
+import re
 import sys
 import urllib.error
 from pathlib import Path
@@ -157,6 +158,10 @@ def test_offered_auto_route_loads_once_uncommented(tmp_path):
     path.write_text(fill_limits(uncomment_auto(text)))
     cfg = load_config(path)
     assert cfg.routes["gemini-auto"] == list(ic.AUTO_TIERS["smart"] + ic.AUTO_TIERS["fast"])
+    assert cfg.auto.rules == []  # the example rules stay commented (DESIGN §16.10.2)
+    # ...and load once their inner '# ' is removed too.
+    path.write_text(fill_limits(re.sub(r"(?m)^  # (?=rules:|  )", "  ", uncomment_auto(text))))
+    assert [r.name for r in load_config(path).auto.rules] == ["task-title", "planning-mode"]
 
 
 def test_auto_route_is_offered_only_with_both_tiers():

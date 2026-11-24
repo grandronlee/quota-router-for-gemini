@@ -31,7 +31,7 @@ their own status. Code and docs cite sections as "DESIGN §N".
 | 16 | [After v1: automatic routing (`gemini-auto`)](#16-after-v1-automatic-routing-gemini-auto--proposed-pending-approval) | proposed; step 1 (§16.8) approved and implemented; step 2 (§16.9) approved; step 3 (§16.10) approved |
 | 16.8 | ↳ [Step 1 in detail: `gemini-smart`, handoffs and the decision log](#168-step-1-in-detail-gemini-smart-handoffs-and-the-decision-log--approved-2026-11-21) |  |
 | 16.9 | ↳ [Step 2 in detail: `gemini-auto` with tiers, spill and pacing](#169-step-2-in-detail-gemini-auto-with-tiers-spill-and-pacing--approved-2026-11-22) | approved 2026-11-22; amendment §16.9.8 deferred |
-| 16.10 | ↳ [Step 3 in detail: a client probe, then rules for `gemini-auto`](#1610-step-3-in-detail-a-client-probe-then-rules-for-gemini-auto--approved-2026-11-23) | approved 2026-11-23 |
+| 16.10 | ↳ [Step 3 in detail: a client probe, then rules for `gemini-auto`](#1610-step-3-in-detail-a-client-probe-then-rules-for-gemini-auto--approved-2026-11-23) | approved 2026-11-23; 3a done; 3b implemented 2026-11-24, live check pending |
 | 17 | [Observability](#17-observability--layers-15-and-local-collection-approved-2026-11-21-21-alerts-and-remote-rows-proposed) | layers 1–5 approved; alerts and remote rows proposed |
 | 18 | [Hosting](#18-hosting--local-docker-and-tailscale-approved-2026-11-21-21-remote-hosting-proposed) | local Docker and Tailscale approved; remote hosting proposed |
 | 19 | [Other accounts and billing](#19-other-accounts-and-billing--approved-2026-11-21) | approved |
@@ -1377,9 +1377,11 @@ still covers the turn (§16.1).
   - concurrent turn starts (§16.10.4).
   Each turn start after that sees less `left`, so later turns start on fast until demand catches
   up. The line bounds where turns start, not the requests they make.
-- **A rule that names a non-paced tier means "keep this turn there".** Without that, a `fast` rule
-  would do nothing, because the default tier is already fast. This is what keeps the title request
-  off the smart pool.
+- **A rule that names a non-paced tier means "start this turn there, never upgraded".** Without
+  that, a `fast` rule would do nothing, because the default tier is already fast. This is what
+  stops the title request taking a smart upgrade. It can still spill into smart when no fast model
+  can serve it (§16.9.4), as any turn can; the rule doesn't block spill. (Wording corrected
+  2026-11-24: it said "keeps the title request off the smart pool", which spill contradicts.)
 - `x-route-tier` is the tier the turn **starts on**, so a `paced` turn shows the default tier, and
   is a `spill` only if it is then served outside it.
 - If the pace can't be read, a paced-tier rule's turn starts on the default tier as `paced`, and
@@ -1487,6 +1489,24 @@ could stall every `gemini-auto` turn start.
     hash-locked requirements (§21.3) for a feature the probe didn't need.
 - Tests change accordingly: prefixes at the text's start and after a newline match; mid-line text
   doesn't; text past 32,768 characters isn't searched.
+
+**3b implemented (2026-11-24)**, with these readings of the text above (from a Codex plan
+critique before coding):
+
+- A message's text parts are joined as they are, and messages with a newline. A prefix split
+  across parts still matches, as in the probe's captures. The text is collected only up to the
+  32,768-character cut, so a huge prompt isn't copied first.
+- A `tools` value that isn't a list fails `min_tools` and `max_tools`, rather than counting as
+  0, so a malformed request can't match `task-title`. A missing or null `tools` counts as 0.
+- An `unknown` follow-up evaluates the rules (as above). Its turn row keeps reason `unknown`,
+  stays out of the demand curve, and records `rule`. Its request-log line has `route_rule`,
+  like a turn start.
+- `qr_pace_rule_above` and `rule_above` are reported whenever the pace can be read, also when
+  no rule names the paced tier.
+- **Rollback:** after migration 4→5, an older image refuses the database ("newer than this
+  proxy understands", §20.10), and it refuses a config with `rules`. To roll back, remove
+  `rules` from the config and either delete the state database (§20.10 says what is lost) or
+  restore a copy taken before the upgrade.
 
 ## 17. Observability — layers 1–5 and local collection approved 2026-11-21 (§21); alerts and remote rows proposed
 
