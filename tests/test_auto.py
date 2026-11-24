@@ -145,6 +145,21 @@ def test_upgrade_follows_quota_left_against_the_share(at, used, upgraded):
         assert (up.called, out.route_tier, out.route_reason) == (["fast-1"], "fast", "default")
 
 
+@pytest.mark.parametrize("left, upgraded", [(17, False), (18, True)])
+def test_upgrade_cutoff_is_exact_despite_float_error(left, upgraded):
+    # Found in review, 2026-11-23: (80 + 5) × (1 − 0.8) is 16.999999999999996 in floating point,
+    # so 17 left was upgraded although the line is exactly 17.
+    from types import SimpleNamespace
+    from quota_router.pacing import Pacer
+    config = SimpleNamespace(models={}, auto=SimpleNamespace(
+        tiers={"smart": []}, pacing=SimpleNamespace(tier="smart", reserve=5)))
+    store = SimpleNamespace(pool=lambda models: (80, left))
+    curve = SimpleNamespace(share=lambda now: (0.8, "flat"))
+    view = Pacer(config, store, curve).view(0.0)
+    assert view.upgrade_above == 17
+    assert view.upgrade is upgraded
+
+
 def test_exhausted_model_counts_nothing_even_with_room_by_the_proxys_count():
     e = auto_env()
     e.store.on_rate_limited(e.model("s2"), Classification("rpd", None))  # Google says it's out

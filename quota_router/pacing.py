@@ -180,5 +180,8 @@ class Pacer:
         """The pace now. Raises sqlite3.Error if today's counts can't be read."""
         capacity, left = self._store.pool(self._models)
         share, source = self._curve.share(now)
-        above = (capacity + self._auto.pacing.reserve) * (1.0 - share)
+        # Rounded so float noise can't move the line: (80 + 5) × (1 − 0.8) is 16.999999999999996,
+        # which upgraded a turn with exactly 17 left. `left` is a whole number, so 9 places lose
+        # nothing real.
+        above = round((capacity + self._auto.pacing.reserve) * (1.0 - share), 9)
         return PaceView(self._auto.pacing.tier, capacity, left, share, source, above)
