@@ -293,3 +293,69 @@ Task (read-only): read README.md, list docs/, read DESIGN §16.8, summarise hand
 - **Tool counts alone don't identify a mode:** code and debug both offer 13, architect and
   code-reviewer both 11.
 - Result: patterns settled for DESIGN §16.10 step 3b. Re-run this probe after a Zoo Code upgrade.
+
+### Live run 3: `gemini-auto` with rules (DESIGN §16.10.5, PLAN Step 3 step 8), 2026-11-23 20:49–21:06 PT
+
+- Setup: proxy on `593ceca`, recreated 2026-11-24 04:43 UTC (20:43 PT) with `task-title` and
+  `planning-mode` in `auto.rules`; schema version 5. Zoo Code 3.98.2, profile
+  `quota-router-auto` on `gemini-auto`, one task per mode (Orchestrator, which delegated to
+  Architect and Code; then Debug, Ask, `code-reviewer`), then one VS Code Copilot Chat agent turn.
+  The task built `scripts/summarize_log.py` on a branch. **About 17 minutes of use, not a full
+  day.**
+- Evidence: request log `data/request-log-2026-11-24T044339Z.jsonl` (81 `gemini-auto` requests),
+  turn rows 26–36 (rows 24–25 are from before the recreate), `/status` and `/metrics` at 21:06 PT.
+  Metadata only.
+
+| Reason | Tier | Turns | Requests | Notes |
+|---|---|---|---|---|
+| `task-title` | fast | 4 | 4 | one per top-level Zoo Code task; subtasks send none; 81–176 input tokens, 0.8–1.0 s, no spill |
+| `planning-mode` | smart | 2 | 2 | Orchestrator (row 26) and its Architect subtask (row 28) |
+| `pace-upgrade` | smart | 2 | 2 | Code subtask (row 29, 16 steps), Debug (row 30, 15 steps) |
+| `spill` | smart → fast | 3 | 3 | Ask (row 32), `code-reviewer` (row 34), Copilot (row 36) |
+| `pinned` / `handoff` | — | — | 66 / 4 | later steps of the turns above |
+
+Requests: 65 × 200, 16 × 429, no 503 to the client. Upstream attempts: 3.6 Flash 13 × 200;
+3 Flash Preview 20 × 200; 2.5 Flash 8 × 200, 3 × 503; 4 Hydrogen 1 × 200, 3 × 503; 3.5 Flash-Lite
+23 × 200. Blocks behind the 429s: 3 Flash Preview `rpm` 7, 3.6 Flash `rpm` 3, 2.5 Flash `rpm` 1,
+3.5 Flash-Lite `tpm` 5. `retry_after_s` 1–52 s.
+
+**Spills, each with its cause** (none caused by a rule):
+
+- Ask, 05:00:12 UTC: 4 Hydrogen 503 (3.3 s), 2.5 Flash 503; 3.6 Flash and 3 Flash Preview were
+  `rpm`-blocked from the Code and Debug turns → 3.5 Flash-Lite.
+- `code-reviewer`, 05:01:09 UTC: 2.5 Flash 503, the same two `rpm` blocks → 3.5 Flash-Lite. Its
+  review was therefore written by the fast model.
+- Copilot, 05:04:05 UTC: 4 Hydrogen 503, 2.5 Flash 503 → 3.5 Flash-Lite. The turn offered 95 tools
+  and sent 54–64 k estimated input tokens per step.
+
+**No `paced` turn.** `left` on smart went from 73 (04:47 UTC) to 25 (05:06 UTC) against a
+`rule_above` of 5.69 → 4.63 (capacity 80, share 0.866 → 0.880, source `flat`). Both
+`planning-mode` turns started with `left` near 70, far above the line. The switch point was **not
+reached, so check 2's switch was not verified.**
+
+**Checks against DESIGN §16.10.5:**
+
+1. Titles: **PASS.** 4 of 4 `task-title` on fast, 0 spills.
+2. Architect and Orchestrator: **PASS** for the rule (2 of 2 `planning-mode` on smart); the switch
+   to `paced` **not verified** (not reached).
+3. Code, Debug, Ask, `code-reviewer`: **PASS.** No rule matched any of them (`pace-upgrade` or
+   `spill`, rule NULL). The Copilot turn matched no rule either.
+4. **PASS.** `qr_state_errors_total` 0. One Copilot turn ended in 429 (row 36, `last_status`
+   429), caused by a block, not by a rule; see below.
+5. **PASS.** `turn_starts_today_by_reason` {pace-upgrade 4, planning-mode 2, spill 3,
+   task-title 4} equals the turn rows for 2026-11-23 (including rows 24–25 from before the recreate).
+
+**The failed Copilot turn.** The turn was pinned to 3.5 Flash-Lite after its spill. At 05:04:31
+the next step hit Flash-Lite's `tpm` limit (`ready_in_s` 32); the user retried at 05:06:01, four
+steps passed, then `tpm` again (52 s). Copilot retried three times within 6 s, ignoring
+`retry_after_s`, and showed "request failed". 2.5 Flash-Lite, a `handoff_targets` model in the
+same tier, was not tried, because each wait was below `handoff_after_s: 60` (DESIGN §16.8). That
+is the designed behaviour, but for a client that doesn't wait, a large turn on Flash-Lite cannot
+finish; this is a candidate DESIGN proposal, not a change.
+
+**4 Hydrogen** (open `first_byte_ms` item): reached 4 times, all as a fallback after 3.6 Flash.
+One success, the Debug turn start: `first_byte_ms` 9,433. Three `unavailable` 503s, at 5.9, 3.3
+and 3.4 s.
+
+- Result: **PASS** for checks 1, 3, 4 and 5 and for check 2's rule match; check 2's switch to
+  `paced` is not verified and needs a session that drains smart to `rule_above`.

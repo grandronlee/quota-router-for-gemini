@@ -31,7 +31,7 @@ their own status. Code and docs cite sections as "DESIGN §N".
 | 16 | [After v1: automatic routing (`gemini-auto`)](#16-after-v1-automatic-routing-gemini-auto--proposed-pending-approval) | proposed; step 1 (§16.8) approved and implemented; step 2 (§16.9) approved; step 3 (§16.10) approved |
 | 16.8 | ↳ [Step 1 in detail: `gemini-smart`, handoffs and the decision log](#168-step-1-in-detail-gemini-smart-handoffs-and-the-decision-log--approved-2026-11-21) |  |
 | 16.9 | ↳ [Step 2 in detail: `gemini-auto` with tiers, spill and pacing](#169-step-2-in-detail-gemini-auto-with-tiers-spill-and-pacing--approved-2026-11-22) | approved 2026-11-22; amendment §16.9.8 deferred |
-| 16.10 | ↳ [Step 3 in detail: a client probe, then rules for `gemini-auto`](#1610-step-3-in-detail-a-client-probe-then-rules-for-gemini-auto--approved-2026-11-23) | approved 2026-11-23; 3a done; 3b implemented 2026-11-24, live check pending |
+| 16.10 | ↳ [Step 3 in detail: a client probe, then rules for `gemini-auto`](#1610-step-3-in-detail-a-client-probe-then-rules-for-gemini-auto--approved-2026-11-23) | approved 2026-11-23; 3a done; 3b implemented 2026-11-24, live check done (probe-results "Live run 3"; switch to `paced` not yet seen) |
 | 17 | [Observability](#17-observability--layers-15-and-local-collection-approved-2026-11-21-21-alerts-and-remote-rows-proposed) | layers 1–5 approved; alerts and remote rows proposed |
 | 18 | [Hosting](#18-hosting--local-docker-and-tailscale-approved-2026-11-21-21-remote-hosting-proposed) | local Docker and Tailscale approved; remote hosting proposed |
 | 19 | [Other accounts and billing](#19-other-accounts-and-billing--approved-2026-11-21) | approved |

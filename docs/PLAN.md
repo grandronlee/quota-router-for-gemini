@@ -298,6 +298,11 @@ requests count in the demand curve, `user_matches` decided after the probe), in 
 7. Validation: `.venv/bin/python -m pytest -q`, `docker compose run --build --rm test`, then
    `code-reviewer` (routing, a migration).
 8. Live check: one working day on `gemini-auto` with the rules set.
+   Done 2026-11-23 20:49–21:06 PT (probe-results.md, "Live run 3"), a short session rather than a
+   day: checks 1, 3, 4 and 5 pass and both planning-mode turns matched. The switch to `paced` was
+   not reached (`left` 25 against `rule_above` 4.6), so it stays to be seen on a heavier day. One
+   Copilot turn failed on a `tpm` block shorter than `handoff_after_s`; a DESIGN proposal, not yet
+   written.
 
 Steps 3–7 done 2026-11-24 (branch `step3b-rules`): `.venv/bin/python -m pytest -q` and
 `docker compose run --build --rm test` pass. The readings settled while implementing are in
