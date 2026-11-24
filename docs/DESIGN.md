@@ -2041,6 +2041,12 @@ prevent that. The session now lives in the page, scoped to its exact origin.
   `GRAFANA_ADMIN_PASSWORD` in `.env` (compose refuses to start the profile without it). A
   provisioned data source and one dashboard (requests by status and reason, attempts by
   outcome, RPD used against limit, model state, first-byte latency).
+- Memory caps (added 2026-11-24): `mem_limit: 256m` for Prometheus (idles at about 35 MB) and
+  `512m` for Grafana (about 245 MB once warmed up), alongside the proxy's 512m (§21.2). Without
+  them Docker Desktop reports each container's limit as the whole VM's memory, and the
+  project as about 24 GB. A container that hits its cap is restarted; both keep their data on
+  their volumes.
+
 ### 21.7 `scripts/init_config.py`
 
 - Reads `GEMINI_API_KEY` from the environment or `.env`; calls `models.list` (the same call

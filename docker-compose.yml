@@ -73,6 +73,9 @@ services:
     cap_drop: [ALL]
     security_opt:
       - no-new-privileges:true
+    # Idles at ~30 MB with this repo's few series. Without a limit Docker Desktop shows the
+    # whole VM's memory as this container's limit.
+    mem_limit: 256m
     restart: unless-stopped
     logging: *logging
 
@@ -104,6 +107,7 @@ services:
     cap_drop: [ALL]
     security_opt:
       - no-new-privileges:true
+    mem_limit: 512m          # about 245 MB once warmed up
     restart: unless-stopped
     logging: *logging
 
