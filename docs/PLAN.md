@@ -346,6 +346,27 @@ metric, Gemini's `finish_reason` values checked live), in order:
 Steps 1–3 done 2026-11-24 (branch `short-wait-holds`, `tests/test_stream_end.py`):
 `.venv/bin/python -m pytest -q` and `docker compose run --build --rm test` pass (754);
 `code-reviewer` found nothing significant, and its two test gaps are closed.
+Step 4, first reading 2026-11-24 (probe-results "Live run 5"): `stream_end` on all 32 streams
+that reached a first byte, all `done`; Gemini sent `stop` and `tool_calls` only. Keep reading
+for an ending other than `done`. The run also showed streamed output tokens are undercounted
+(DESIGN §27).
+
+Stream token counts (DESIGN §27, approved 2026-11-24: keep the last `usage` chunk; settling
+unchanged), in order:
+
+1. `StreamSession`: every `usage` chunk updates the counts; the finaliser adds the output
+   difference to the turn row through `Turns.add_output`.
+2. Docs: §7, §11 and §26.2 as §27.2 item 5 says.
+3. Offline tests from DESIGN §27.4, with the regression test failing on the old code.
+4. Validation: `.venv/bin/python -m pytest -q`, `docker compose run --build --rm test`, then
+   `code-reviewer` (data integrity: request log, turn rows, metrics).
+5. Live: save the log, recreate, and check one long streamed answer's `output_tokens` against
+   its length.
+
+Steps 1–4 done 2026-11-24 (branch `short-wait-holds`, `tests/test_stream_tokens.py`; the
+regression test fails on the old code): `.venv/bin/python -m pytest -q` and
+`docker compose run --build --rm test` pass (766); `code-reviewer` found no defect, and its test
+gaps (`read_error`, a shared turn row, the metric on every ending) are closed.
 
 Also after v1: alerts (DESIGN §17.2 layer 6), a remote-hosting design (DESIGN §18)
 if the proxy is to run somewhere other than the user's machine.

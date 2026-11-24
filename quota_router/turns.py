@@ -88,6 +88,13 @@ class TurnLog:
              turn.reason, turn.tools, prompt_tokens or 0, output_tokens or 0,
              int(step), int(not step), int(handoff), status, turn.tier, turn.rule))
 
+    def add_output(self, turn_id: str, delta: int) -> None:
+        """Add a stream's output tokens that came after its row was written (DESIGN §27.2):
+        the counters only, never a step. A missing row stays missing. Raises sqlite3.Error."""
+        if delta > 0:
+            self._conn.execute("UPDATE turns SET output_tokens = output_tokens + ? WHERE turn_id = ?",
+                               (delta, turn_id))
+
     def starts_today_by_reason(self, route: str) -> dict[str, int]:
         """Turn starts today (PT) on `route`, by reason, for /status (DESIGN §16.9.5). Rows a
         follow-up created are left out, as in the demand curve (found in review)."""

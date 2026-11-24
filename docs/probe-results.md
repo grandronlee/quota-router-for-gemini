@@ -411,3 +411,56 @@ shared Flash-Lite's TPM window with the Copilot turn; neither was refused.
 - Result: **PASS** for the hold itself (8 held, 8 served, 0 refused). Open: a Copilot turn that
   finishes end to end; mid-stream truncation on 3.5 Flash-Lite (one case, outcome
   `stream_incomplete`) is a separate item.
+
+### Live run 5: `stream_end` (DESIGN §26, PLAN stream-ending step 4), 2026-11-23 23:19–23:24 PT
+
+- Setup: proxy on `60c2755`, rebuilt and recreated 2026-11-24 07:15 UTC with `hold_max_s: 60`.
+  Zoo Code on `gemini-auto` (a Code-mode task with tool reads, one Architect-mode question, one
+  summary task), then VS Code Copilot Chat: one `gemini-fast` question with about 66 k tokens of
+  attached files, and one agent-mode turn on `gemini-auto`. **About 5 minutes of use.**
+- Evidence: request log `data/request-log-2026-11-24T071530Z.jsonl` (35 requests). Metadata only.
+
+Requests: 34 × 200 (`served`), 1 × 499 (`client_disconnected`, a Copilot `gemini-fast` request
+dropped by the client 1.8 s in, before any byte). 33 streamed, 2 not (task titles).
+
+- **`stream_end` on every streamed line that reached a first byte: 32 of 32.** The 499 has none,
+  as §26.2 specifies.
+- **Every ending was `done`**, with `usage_seen: true` and `idle_ms: 0`. No `eof`, `read_error`,
+  `error_event` or `client_gone`.
+- **`finish_reason` values Gemini sent: `stop` (18) and `tool_calls` (14).** No `other`; `length`
+  and `content_filter` did not occur, so they remain unchecked.
+- Tool calls usually came in one chunk (12 of 14); the longest was 12 chunks.
+- Holds: 5, all served (`rpm` 8.5 s on 4 Hydrogen, then served by 3.5 Flash-Lite; `rpm` 16.1 s,
+  `rpm`+`tpm` 1.9 s and `tpm` 3.2 s on 2.5 Flash-Lite; `tpm` 14.5 s on 3.5 Flash-Lite). No 429
+  to either client.
+- **The Copilot agent turn finished end to end with holds on** (user's report: full answer,
+  turn finished). This closes the open item from live run 4.
+- The 3.5 Flash-Lite truncation from live run 4 did not recur at 66,407 prompt tokens (`done`,
+  `stop`).
+- **Output tokens are undercounted on streams.** The user saw full Copilot answers, yet the
+  log has 16–54 output tokens for them, and one 23-chunk stream (`86c2277f`) has 2. See the next
+  entry.
+
+### `usage` on each stream chunk (DESIGN §7, §11), 2026-11-23 23:27 PT
+
+- Setup: an ad hoc probe outside `scripts/` (standard library), one streamed request each to 3.5
+  Flash-Lite and 2.5 Flash-Lite with `stream_options.include_usage`, asking for about 600 words.
+  Per chunk only index, time, content length, `finish_reason` and `usage` numbers were kept.
+- Evidence: `data/probe/usage-per-chunk-2026-11-24T0727Z.json`.
+
+| Model | Chunks | Chunks with `usage` | `completion_tokens`, first → last | `finish_reason` |
+|---|---|---|---|---|
+| 3.5 Flash-Lite | 29 | 29 | 16 → 669 | `stop` on the last (an empty-content chunk) |
+| 2.5 Flash-Lite | 23 | 23 | 1 → 1,019 | `stop` on the last (with content) |
+
+- **Every chunk carries `usage`, as a running total.** `prompt_tokens` is the same on all of
+  them. Both ended with `[DONE]`.
+- This contradicts DESIGN §7 and §11 ("on the last content chunk", from Phase 0, where the
+  probe answers were short). The proxy settles at the first `usage` chunk and ignores later
+  ones, so a stream's `output_tokens` is its first chunk's count.
+- Consequences: `output_tokens` in the request log, the turn rows and
+  `qr_tokens_total{kind="output"}` are low for any stream of more than one chunk, back to the
+  start. Quota is not affected: TPM counts input, and `prompt_tokens` is right from the first
+  chunk. **`usage_seen: true` does not mean the stream finished**, so the live run 4 reading
+  ("ended after one output token", "a usage chunk arrived, so Google probably finished") does
+  not hold: that stream may have stopped mid-answer.

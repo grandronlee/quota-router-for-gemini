@@ -416,8 +416,9 @@ The day key is the PT calendar date.
 - **Local counts are only a hint.** Usage outside the proxy (AI Studio, other scripts)
   shares the same project quota. A 429 from Google always overrides the local state.
 - **Actual usage**: from `usage` in non-streaming responses. For streams the proxy asks
-  for `stream_options.include_usage`; every model in Phase 0 sent it, on the last content
-  chunk. If upstream leaves it out, the proxy keeps the estimate.
+  for `stream_options.include_usage`. Google sends it on every chunk as a running total
+  (probe, 2026-11-24; Phase 0 saw only short answers), and the proxy keeps the last counts
+  (§27). If upstream leaves it out, the proxy keeps the estimate.
 - **Reasoning tokens** are not listed separately: `total_tokens` is larger than
   `prompt_tokens + completion_tokens` (for example 8 + 1 against 70). They don't count
   against TPM. `/status` and the log report output as `total_tokens − prompt_tokens`.
@@ -1837,8 +1838,8 @@ layer is closed before the callable returns.
 - Non-stream: `Router.complete()` (usage, then tool-call IDs from
   `choices[].message.tool_calls[].id`) runs before the response is returned.
 - Stream: chunks are forwarded as they arrive, each parsed for tool-call IDs and `usage`.
-  `complete()` runs before forwarding the chunk that carries `usage` (Phase 0: the last
-  content chunk), or else before `[DONE]`. If the stream ends any other way (upstream error,
+  `complete()` runs before forwarding the first chunk that carries `usage` (every chunk does,
+  §27), or else before `[DONE]`. Later chunks update the logged counts only. If the stream ends any other way (upstream error,
   client disconnect), `complete()` still runs once, with the estimate kept.
 - **(decide)** Mid-stream upstream failure: send one `data: {"error": {...}}` event (OpenAI
   format, scrubbed) and close without `[DONE]`, so clients don't take a cut-off answer as
@@ -2984,6 +2985,8 @@ only (§10, §20.7):
   `other`, and null means none came. The values Gemini's OpenAI layer sends are an assumption,
   to be checked against a live log (§26.5).
 - **`usage_seen`**: whether a chunk had `usage`. Today a null `prompt_tokens` can mean either case.
+  Google sends `usage` on every chunk (§27), so this is true on any stream that reached a chunk;
+  it does not show the stream finished.
 - **`idle_ms`**: milliseconds from the last upstream event to the moment the ending was seen.
   It's measured on the monotonic clock, as `latency_ms` is. It separates a connection that hung
   and then dropped from one that closed at once.
@@ -3028,3 +3031,84 @@ Deploy, then keep reading `stream_end` across live runs. Before §26.1's possibl
 missing `[DONE]` after a `finish_reason` counts as a clean end), there must be at least one
 ending other than `done` that shows which case it was. That follow-up would be its own
 approved amendment.
+
+## 27. Stream token counts from the last `usage` chunk — approved 2026-11-24
+
+### 27.1 What failed
+
+§7 and §11 say Google sends `usage` once, on a stream's last content chunk (Phase 0). The
+per-chunk probe (probe-results, "`usage` on each stream chunk", 2026-11-24) shows otherwise:
+on 3.5 Flash-Lite (29 chunks) and 2.5 Flash-Lite (23 chunks), **every chunk carries `usage`**,
+a running total. `completion_tokens` climbs (16 → 669, 1 → 1,019) and `prompt_tokens` stays
+the same.
+
+`StreamSession._handle` takes the first `usage` chunk and skips the rest once `settled`. So
+for any stream longer than one chunk, `output_tokens` is the first chunk's count. Live run 5
+shows it: full Copilot answers logged as 16–54 output tokens, and a 23-chunk stream as 2.
+
+Affected, back to the start: `output_tokens` in the request log, the turn rows
+(`turns.output_tokens`), and `qr_tokens_total{kind="output"}`. Not affected: quota, since TPM
+counts input (§7) and `prompt_tokens` is right from the first chunk. No routing decision reads
+`output_tokens`.
+
+It also weakens §26.1's reading of the live run 4 truncation. A `usage` chunk arriving proves
+nothing about the end, so "Google probably finished" and "one output token" do not follow.
+That stream may have stopped mid-answer. `finish_reason` is the signal that counts.
+
+### 27.2 Change
+
+1. **Keep the last `usage`.** In `_handle`, every chunk with a `usage` dict updates
+   `prompt_tokens` and `output_tokens` (via `usage_tokens`), not only the first.
+2. **Settling is unchanged.** `_complete()` still runs once, before forwarding the first
+   `usage` chunk, with that chunk's `prompt_tokens`. The reservation, the turn row's first
+   write and tool-call ID recording keep their current order (§11, §16.8 1d, §23.8).
+3. **Request log and metric** already read the session's values in the finaliser, so they get
+   the last counts with no other change.
+4. **Turn row.** It is written at settle time with the first chunk's output. In the finaliser,
+   if the final `output_tokens` is larger than the value written then, add the difference with
+   a new `Turns.add_output(turn_id, delta)` (`UPDATE turns SET output_tokens = output_tokens +
+   ? WHERE turn_id = ?`). It goes through a `Proxy` wrapper that, like `note_turn`, never raises:
+   a failure is logged and counted in `state_errors`. Calling `note` again isn't an option: its
+   upsert would add a second step.
+5. **Docs.** §7 and §11 say `usage` comes on every chunk as a running total (probe, 2026-11-24).
+   §26.2 `usage_seen` adds: "true on any stream that reached a chunk; it does not show the
+   stream finished."
+
+Not changed: non-streamed responses, `stream_end`'s fields, the request log's field names, the
+client's bytes. No `usage_chunks` field: the probe already answered the question it would have
+asked.
+
+### 27.3 Failure paths
+
+- **Stream ends any way other than `[DONE]`** (error event, EOF, read error, client gone): the
+  last `usage` seen is what Google generated up to then. It is logged and added to the turn row
+  the same way.
+- **No `usage` at all:** as today, the estimate is kept, the turn row has 0 output, and nothing
+  is added.
+- **`usage` that goes down or is malformed:** `usage_tokens` returns `None` for bad values, and
+  a `None` never replaces a number already seen. The session keeps the largest output count
+  seen, and the turn row adds only a positive difference, never subtracts.
+- **`prompt_tokens` differing between chunks** (not seen; an assumption from two probes): the
+  log shows the last value, and the reservation and turn row keep the first.
+- **Turn row write fails at settle:** the add in the finaliser updates no row, and nothing is
+  inserted. The row stays missing, as today.
+- **Concurrency:** one writer process (§7). `UPDATE … +` is a single statement, and requests of
+  the same turn each add only their own difference.
+- **Existing data:** old log files and turn rows keep their low counts and are not rewritten.
+  probe-results records the date of the fix.
+- **Rollback:** an older image goes back to first-chunk counts. No schema change.
+
+### 27.4 Tests
+
+- Fake upstream with three cumulative `usage` chunks (completion 5, 40, 90): the request log's
+  `output_tokens` and `qr_tokens_total{kind="output"}` are 90 (fails today: 5). The turn row has
+  90.
+- `_complete` / `Router.complete` runs once, at the first `usage` chunk, with its
+  `prompt_tokens`. The existing ordering tests (settle before the usage chunk is forwarded; IDs
+  after usage) still pass.
+- Ending with an error event or EOF after two `usage` chunks: the log and turn row have the
+  second count.
+- Falling or malformed `usage` on a later chunk: no decrease in the turn row, and no exception.
+- `Turns.add_output` raising: the stream and the log line are unaffected, and `state_errors` goes
+  up by 1.
+- A single-chunk stream and a non-streamed request: unchanged counts.

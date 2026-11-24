@@ -352,6 +352,16 @@ class Proxy:
             self.router.state_errors += 1
             log.exception("could not write the turn log")
 
+    def add_turn_output(self, turn: TurnRef | None, delta: int) -> None:
+        """Add a stream's later output tokens to its turn row (DESIGN §27.2). Never raises."""
+        if turn is None or delta <= 0:
+            return
+        try:
+            self.turns.add_output(turn.turn_id, delta)
+        except Exception:
+            self.router.state_errors += 1
+            log.exception("could not add output tokens to the turn log")
+
     def prune_once(self) -> None:
         try:
             self.store.prune()
@@ -485,6 +495,7 @@ class StreamSession:
         self.calls_by_id: dict[str, _StreamCall] = {}
         self.prompt_tokens: int | None = None
         self.output_tokens: int | None = None
+        self.turn_output: int | None = None  # output written with the turn row; None: not written
         self.first_byte_s: float | None = None
         # How the served call ended, for its `attempts` entry (DESIGN §22.4); None: still open.
         self.outcome: tuple[str, int | None] | None = None
@@ -518,6 +529,15 @@ class StreamSession:
                 if fr is not None:
                     self.finish_reason = fr if isinstance(fr, str) and fr in FINISH_REASONS else "other"
 
+    def _see_usage(self, usage: dict) -> None:
+        """Google sends `usage` on every chunk as a running total (DESIGN §27.1): keep the
+        latest prompt count and the largest output count; a bad value never replaces one."""
+        prompt, output = usage_tokens(usage)
+        if prompt is not None:
+            self.prompt_tokens = prompt
+        if output is not None and (self.output_tokens is None or output > self.output_tokens):
+            self.output_tokens = output
+
     def stream_end(self) -> dict:
         out: dict[str, Any] = {"end": self.end}
         if self.end == "read_error":
@@ -535,6 +555,7 @@ class StreamSession:
             self.p.note_turn(self.served.turn, route=self.route, status=200,
                              served_model=self.served.model.id, prompt_tokens=self.prompt_tokens,
                              output_tokens=self.output_tokens, handoff_from=self.served.handoff_from)
+            self.turn_output = self.output_tokens or 0  # as note() stores it
         # Every call is recorded as unknown (NULL): a value is written only once the stream
         # ends with [DONE] (DESIGN §23.8 amendment 1), and counted then.
         recorded = self.p.router.complete(self.served, prompt_tokens, ids or None, None, count=False)
@@ -654,8 +675,9 @@ class StreamSession:
                     self.seen_ids.add(i)
                     self.pending_ids.append(i)
             usage = obj.get("usage")
+            if isinstance(usage, dict):
+                self._see_usage(usage)
             if isinstance(usage, dict) and not self.settled:
-                self.prompt_tokens, self.output_tokens = usage_tokens(usage)
                 self._complete(self.prompt_tokens)  # before the usage chunk is forwarded
             elif self.settled and self.pending_ids:
                 self._complete(None)  # IDs that arrived after usage
@@ -706,6 +728,8 @@ class StreamSession:
             self._complete_if_needed()  # estimate kept
         except Exception:
             log.exception("settling a stream failed")
+        if self.turn_output is not None and self.output_tokens is not None:
+            self.p.add_turn_output(self.served.turn, self.output_tokens - self.turn_output)  # never raises
         try:
             await self.stream.aclose()
         except Exception:
