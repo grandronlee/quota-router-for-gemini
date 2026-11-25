@@ -383,6 +383,12 @@ Log summarizer sections (DESIGN §28, approved 2026-11-25), in order:
    reviewer (a read-only script).
 4. Use: run it over the saved logs and check the counts against the readings in probe-results.
 
+Steps 1–4 done 2026-11-25 (`tests/test_summarize_log.py`): `.venv/bin/python -m pytest -q` and
+`docker compose run --build --rm test` pass (790). Over the 2026-11-24 saved logs it gives 13
+holds, all served, 4 Hydrogen's 6 first bytes, and 33 streams, all `done`, matching the hand
+readings. `first_byte_ms` counts from the request's start, so a model reached after another's
+timeout shows that wait (2.5 Flash's 122 s maximum is 4 Hydrogen's 120 s timeout first).
+
 Turn-row output after a failed write (DESIGN §27 amendment, approved 2026-11-25), in order:
 
 1. `note_turn` returns whether it wrote; `_complete` sets `turn_output` only then.
