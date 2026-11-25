@@ -163,3 +163,51 @@ def test_single_chunk_stream_and_non_stream_unchanged():
 def test_no_usage_keeps_the_estimate_and_adds_nothing():
     p, [line], turns = run(streamed(sse(chunk("a"), chunk("b", finish="stop"))))
     assert line["output_tokens"] is None and turns == [0]
+
+
+def _two_step_turn(fail_second_write: bool):
+    """Two streamed steps of one turn; the second step's row write fails if asked
+    (DESIGN §27 amendment, 2026-11-25). (steps, input, output) of the row, and state_errors."""
+    first = streamed(sse(chunk(tool_ids=["c1"], usage=usage(70, 5)), chunk(usage=usage(70, 25), finish="tool_calls")))
+    second = streamed(sse(chunk("a", usage=usage(90, 3)), chunk("b", usage=usage(90, 50), finish="stop")))
+    p = make_proxy()
+    up = Upstream({"model-a": [first, second]})
+    follow = chat_body(model="model-a", stream=True)
+    follow["messages"] += [{"role": "assistant", "tool_calls": [{"id": "c1", "type": "function",
+                            "function": {"name": "f", "arguments": "{}"}}]},
+                           {"role": "tool", "tool_call_id": "c1", "content": "done"}]
+    with mocked(up), running(p) as c, captured_logs() as logs:
+        assert c.post("/v1/chat/completions", json=chat_body(model="model-a", stream=True),
+                      headers=AUTH).status_code == 200
+        if fail_second_write:
+            p.turns._conn = FailingConn(p.conn, fail_on="INSERT INTO turns", times=1)
+        assert c.post("/v1/chat/completions", json=follow, headers=AUTH).status_code == 200
+        row = p.conn.execute("SELECT steps, input_tokens, output_tokens FROM turns").fetchall()
+    lines = [json.loads(l) for l in logs.getvalue().splitlines() if l.startswith("{")]
+    second_line = [l for l in lines if l.get("event") == "request"][-1]
+    return row, p.router.state_errors, second_line
+
+
+def test_failed_turn_write_adds_no_later_output_to_the_row():
+    """The regression test: the old code added the second step's later 47 tokens (50 - 3) to the
+    first step's row, though the second step's own write had failed."""
+    row, errors, line = _two_step_turn(fail_second_write=True)
+    assert row == [(1, 70, 25)]  # the first step alone
+    assert errors == 1
+    assert line["reason"] == "served" and line["output_tokens"] == 50  # the log keeps the full count
+
+
+def test_successful_turn_write_still_gets_the_later_output():
+    row, errors, _ = _two_step_turn(fail_second_write=False)
+    assert row == [(2, 160, 75)]
+    assert errors == 0
+
+
+def test_failed_first_write_leaves_no_row():
+    """No row yet: nothing to add to, before and after the amendment."""
+    p = make_proxy()
+    p.turns._conn = FailingConn(p.conn, fail_on="INSERT INTO turns", times=1)
+    body = sse(chunk("a", usage=usage(70, 5)), chunk("b", usage=usage(70, 40), finish="stop"))
+    _, [line], turns = run(streamed(body), proxy=p)
+    assert turns == [] and p.router.state_errors == 1
+    assert line["output_tokens"] == 40

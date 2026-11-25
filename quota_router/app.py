@@ -339,11 +339,12 @@ class Proxy:
 
     def note_turn(self, turn: TurnRef | None, *, route: str, status: int, served_model: str | None = None,
                   prompt_tokens: int | None = None, output_tokens: int | None = None,
-                  handoff_from: str | None = None) -> None:
+                  handoff_from: str | None = None) -> bool:
         """Write the request's decision-log row (DESIGN §16.8 1d). Never raises: a failed
-        write is logged and counted, and never fails the request (§5.2)."""
+        write is logged and counted, and never fails the request (§5.2). Returns whether the
+        row was written (DESIGN §27 amendment)."""
         if turn is None:
-            return
+            return False
         try:
             self.turns.note(turn, route=route, status=status, served_model=served_model,
                             prompt_tokens=prompt_tokens, output_tokens=output_tokens,
@@ -351,6 +352,8 @@ class Proxy:
         except Exception:
             self.router.state_errors += 1
             log.exception("could not write the turn log")
+            return False
+        return True
 
     def add_turn_output(self, turn: TurnRef | None, delta: int) -> None:
         """Add a stream's later output tokens to its turn row (DESIGN §27.2). Never raises."""
@@ -552,10 +555,13 @@ class StreamSession:
             # The turn row is written before any of this response's tool calls are recorded,
             # so a follow-up (which finds the turn only through them) always writes after it
             # (DESIGN §16.8 1d). The first settle comes with usage, or at the end without it.
-            self.p.note_turn(self.served.turn, route=self.route, status=200,
-                             served_model=self.served.model.id, prompt_tokens=self.prompt_tokens,
-                             output_tokens=self.output_tokens, handoff_from=self.served.handoff_from)
-            self.turn_output = self.output_tokens or 0  # as note() stores it
+            written = self.p.note_turn(self.served.turn, route=self.route, status=200,
+                                       served_model=self.served.model.id,
+                                       prompt_tokens=self.prompt_tokens,
+                                       output_tokens=self.output_tokens,
+                                       handoff_from=self.served.handoff_from)
+            if written:  # else finish() adds nothing: this step isn't in the row (§27 amendment)
+                self.turn_output = self.output_tokens or 0  # as note() stores it
         # Every call is recorded as unknown (NULL): a value is written only once the stream
         # ends with [DONE] (DESIGN §23.8 amendment 1), and counted then.
         recorded = self.p.router.complete(self.served, prompt_tokens, ids or None, None, count=False)

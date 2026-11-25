@@ -397,6 +397,12 @@ Turn-row output after a failed write (DESIGN §27 amendment, approved 2026-11-25
    `code-reviewer` (turn-row data integrity) with a Codex adversarial review (a bug the §27
    review missed).
 
+Steps 1–3 done 2026-11-25 (`tests/test_stream_tokens.py`; the regression test fails on the old
+code with 72 output tokens for 25): `.venv/bin/python -m pytest -q` and
+`docker compose run --build --rm test` pass (793). `code-reviewer` and a Codex adversarial review
+found no defects; the reviewer's optional test (a failed first write leaves no row) is added. The
+live container still runs `76da6a3` until the next recreate.
+
 Also after v1: alerts (DESIGN §17.2 layer 6), a remote-hosting design (DESIGN §18)
 if the proxy is to run somewhere other than the user's machine.
 
