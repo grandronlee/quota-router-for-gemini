@@ -374,6 +374,23 @@ gaps (`read_error`, a shared turn row, the metric on every ending) are closed.
 Step 5 done 2026-11-24 (probe-results "Live check of DESIGN §27"): a 61-chunk answer logged
 1,438 output tokens, and its turn row has the same.
 
+Log summarizer sections (DESIGN §28, approved 2026-11-25), in order:
+
+1. `scripts/summarize_log.py`: `holds` (outcome from `reason` and `status`), `first_byte` per
+   model, `stream_end` counts and the non-`done` list, each with `skipped`; JSON and text.
+2. Offline tests from DESIGN §28.4 in `tests/test_summarize_log.py`.
+3. Validation: `.venv/bin/python -m pytest -q`, `docker compose run --build --rm test`. No
+   reviewer (a read-only script).
+4. Use: run it over the saved logs and check the counts against the readings in probe-results.
+
+Turn-row output after a failed write (DESIGN §27 amendment, approved 2026-11-25), in order:
+
+1. `note_turn` returns whether it wrote; `_complete` sets `turn_output` only then.
+2. Regression test from the amendment, failing on the old code.
+3. Validation: `.venv/bin/python -m pytest -q`, `docker compose run --build --rm test`, then
+   `code-reviewer` (turn-row data integrity) with a Codex adversarial review (a bug the §27
+   review missed).
+
 Also after v1: alerts (DESIGN §17.2 layer 6), a remote-hosting design (DESIGN §18)
 if the proxy is to run somewhere other than the user's machine.
 

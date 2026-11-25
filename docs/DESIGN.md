@@ -3112,3 +3112,103 @@ asked.
 - `Turns.add_output` raising: the stream and the log line are unaffected, and `state_errors` goes
   up by 1.
 - A single-chunk stream and a non-streamed request: unchanged counts.
+
+**Amendment: add the later output only after a written row — approved 2026-11-25.** Found in
+review (2026-11-25): the first settle sets `turn_output` whether or not `note_turn` wrote the row.
+`note_turn` logs and counts a failed write and returns nothing, so when an earlier step of the same
+turn already made the row, `finish` adds this step's later output to it with `add_output`: the row
+gains output for a step whose step, input and model were never written. (For a turn's first step
+there is no row, and the `UPDATE` changes nothing.)
+
+- `note_turn` returns whether it wrote the row (`True`, or `False` for no turn or a failed write).
+- `_complete` sets `turn_output` only when the write succeeded, so `finish` adds nothing after a
+  failed one. The request log and `qr_tokens_total` keep the full count, as before.
+- Test: a two-step turn whose second `Turns.note` raises; after the stream ends with a larger last
+  `usage`, the row's `output_tokens` is the first step's alone and `state_errors` is up by 1 (fails
+  on the old code: the later difference is added). A successful second write still gets it.
+
+## 28. Holds, first bytes and stream endings in the log summarizer — approved 2026-11-25
+
+### 28.1 Why
+
+Three readings are done by hand over the saved logs after every live run: how holds went
+(§25.6), first-byte times per model (§24.1, the open 4 Hydrogen item), and whether any stream
+ended other than `done` (§26.5, the open truncation item). `scripts/summarize_log.py` reports
+only routes, status codes and `retry_after_s`. This adds the three, so each reading is one
+command over a saved log. Reporting only: nothing in the proxy, its log or its config changes.
+
+### 28.2 Change
+
+Three sections in `summarize()`, over the same `quota_router.request` lines, each in the JSON
+output under a new key and in the text output after the existing sections:
+
+- **`holds`:** lines with a `hold` object. Count; waited `ms` as min, median and max; a count per
+  entry of `limits` (`rpm`, `tpm`); and a count by outcome with the labels of `qr_holds_total`
+  (§25.6). The outcome is read from the line's `reason` together with its `status`, following
+  the branch in `app.py` that counts the metric, not from the status alone: a status can't tell
+  them apart, since a passthrough may be any upstream status (a 501 included) and a refusal may
+  be the proxy's own 400 or 404.
+
+  | `reason` | `status` | Outcome |
+  |---|---|---|
+  | `served` | any | `served` |
+  | `stream_error`, `client_disconnected` | 200 (a stream line) | `served` |
+  | `passthrough` | any | `passthrough` |
+  | `quota`, `unavailable`, `context_length_exceeded`, `model_not_found`, `no_enabled_model` | any | `refused` |
+  | `client_disconnected` | 499 | `cancelled` |
+  | `internal_error` | any | `error` |
+  | anything else | | `unknown` |
+
+  A held stream that breaks or loses its client after it started is `served`, as in the metric,
+  which counts before the stream starts. `unknown` is not a metric label: it shows a log line
+  this table doesn't cover (a newer proxy, a hand-edited file) instead of hiding it.
+- **`first_byte`:** per `served_model`, over lines with a numeric `first_byte_ms` and a non-empty
+  string `served_model`: count, min, median, p90 and max. Medians and p90 are nearest-rank over the values present, so one value
+  gives itself. Sorted by model name.
+- **`stream_end`:** lines with a `stream_end` object whose `end` is a non-empty string. A count per
+  (`end`, `finish_reason`), where `finish_reason` is a string or, absent or null, `none`; and a list of every line whose `end` is not `done`, with `ts`,
+  `request_id`, `served_model`, `end`, `error`, `chunks`, `finish_reason`, `usage_seen` and
+  `idle_ms`. The list is not cut by `--top`, which stays for the route table only.
+
+No new options. Only fields already in the log are read; no prompt text is in it (§17.1).
+
+### 28.3 Failure paths
+
+- **Older logs** lack `hold`, `stream_end` or `first_byte_ms`: those lines add nothing, and an
+  empty section prints "none" (text) or zero counts and an empty list (JSON).
+- **Malformed values.** Only values of the expected type are used, at every level, so a bad line
+  never raises and never mixes into valid rows:
+  - `hold` or `stream_end` not an object: the line adds nothing to that section;
+  - grouping fields must be hashable values of one type: `served_model` and `stream_end.end` a
+    non-empty string, `stream_end.finish_reason` a string or absent or null (`none`), each
+    `limits` entry a string. A line whose grouping field is anything else (a list, an object, a
+    number) adds nothing to that section; a bad `limits` entry alone is skipped;
+  - numbers (`hold.ms`, `first_byte_ms`) must be an int or float and not a boolean; otherwise the
+    value is left out of the statistics, and a hold is still counted with its outcome;
+  - the list of non-`done` endings copies the named fields as they are, since it only prints them.
+  Each section reports `skipped`, the number of lines it left out for a malformed value, so a
+  bad log shows up instead of reading as a quiet one.
+- **Existing output:** the current JSON keys and text sections are unchanged; the new ones are
+  added after them, so a reader of the old keys keeps working.
+
+### 28.4 Tests
+
+In `tests/test_summarize_log.py`, offline, from built log lines:
+
+- holds: every row of the outcome table, including the cases a status alone gets wrong (a
+  passthrough 501 is `passthrough`, a refused 400 `context_length_exceeded` and a refused 404
+  are `refused`), a held stream line with `stream_error` or `client_disconnected` and status 200
+  is `served`, a 499 is `cancelled`, and an unlisted reason is `unknown`; `limits` counts;
+  min/median/max of `ms`;
+- first bytes: two models, nearest-rank median and p90 with one, two and ten values, a missing
+  or non-numeric `first_byte_ms` skipped;
+- stream endings: counts per (`end`, `finish_reason`), a null `finish_reason` as `none`, a
+  non-`done` line listed with its fields, `--top` not cutting the list;
+- an old-format log (none of the fields) gives empty sections and the same route table as today;
+- malformed values next to valid rows in one log: `hold` and `stream_end` not objects, a
+  list-valued `finish_reason`, an object-valued `end`, a null or numeric `served_model` with a
+  numeric `first_byte_ms`, a boolean `ms`, and a non-string `limits` entry. The valid rows give
+  the same results as without them, nothing raises, and `skipped` counts each bad line.
+
+Validation: `.venv/bin/python -m pytest -q` and `docker compose run --build --rm test`. No
+reviewer: a read-only script, outside signals, data integrity and the proxy's paths.
