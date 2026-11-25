@@ -472,3 +472,29 @@ dropped by the client 1.8 s in, before any byte). 33 streamed, 2 not (task title
 - Result: 3.5 Flash-Lite, 61 chunks, `done` / `stop`, prompt 41,774, **output 1,438** in the
   request log, and the same 1,438 in its turn row. Under the old code the turn row before it
   (5 steps, written by `60c2755`) has 186 output tokens. **PASS.**
+
+### Saved-log reading: §22 cooldown and 4 Hydrogen first bytes, 2026-11-24 (no new traffic)
+
+- Setup: read-only pass over the saved request logs `data/request-log-2026-11-24T044339Z.jsonl`
+  (live run 3) and `data/request-log-2026-11-24T071530Z.jsonl` (live run 5), using `attempts`,
+  `route_tier`, `route_reason` and `affinity`. Times are UTC. The cooldown state itself is in
+  `/status` only, so streaks below are inferred from the attempts and DESIGN §22.2.
+- **A soft-cooldown skip, then a retry after the cooldown ended (live run 3).** 4 Hydrogen
+  served at 04:56:26 (streak 0), failed with 503 at 04:56:37 (streak 1, 30 s) and again at
+  05:00:12 (streak 2, 2 min, to about 05:02:12). At 05:01:09 a `smart` spill, an unpinned turn
+  start, tried 2.5 Flash (503) and was served by 3.5 Flash-Lite without trying Hydrogen: inside
+  the soft part, where Hydrogen is tried only after the normal pass fails, which it didn't. At
+  05:04:05, after the cooldown ended, the next `smart` spill tried Hydrogen first again (503,
+  streak 3). **Consistent with §22.2.**
+- **Recovery (live run 5).** Hydrogen failed with 503 at 07:19:43 (spill; streak 1, 30 s). The
+  next `smart` turn start, 07:20:48 (the `planning-mode` rule, 65 s later), went to Hydrogen and
+  streamed to `done`; its next four pinned steps were served by it too. **Recovery seen.**
+- **Not seen:** a candidate skipped during the hard 30 s. Every other request that passed over
+  Hydrogen inside a cooldown was a `fast` request or a turn pinned to another model, so Hydrogen
+  was never a candidate. Also not seen: two requests contending for the one recovery slot.
+- **4 Hydrogen `first_byte_ms`, every success in the saved logs (6):** 9,433, 4,044, 3,615,
+  4,245, 4,289 and 8,175 ms. Its failures are fast 503s (3–6 s) or a hang to the 120 s timeout
+  (live run 1, and 06:48:54 on 2026-11-24). A `first_byte_timeout_s` of about 20 s on Hydrogen
+  would cut the hangs without losing any success seen; a candidate, not a change.
+- `reasoning_effort`: nothing new; Zoo Code sends `"low"` on every request (DESIGN §16.10, 3a), so
+  no live check is open for it.

@@ -191,6 +191,9 @@ Partial evidence (2026-11-21, during the first Copilot Chat live test on `gemini
 `gemini-4-hydrogen` answered one request with a 503 after 17 s and hung on another until the
 120 s timeout. `attempts` told the two apart, both counted, and the cooldown held it at streak 2
 (2 min). Still open: seeing later requests skip it during the cooldown and its recovery.
+Read from the saved logs 2026-11-24 (probe-results, "Saved-log reading"): a skip during the soft
+part, a retry once the cooldown ended, and a recovery are seen. A skip during the hard 30 s and
+contention for the recovery slot are not; they stay to be seen on a busier overload.
 
 Done 2026-11-22 (steps 1–7): restoring thought signatures
 that clients drop (DESIGN §23, approved 2026-11-21), found in the first Copilot Chat live test
@@ -274,7 +277,8 @@ Done 2026-11-22: DESIGN §24 (approved 2026-11-22):
   next request came 10–29 ms after the hint ran out. The waits added up to 223 s.
 - **Live run 2, other findings:** the upgraded turn moved 3.6 Flash → 2.5 Flash (an upstream
   429) → 3.5 Flash Lite (a later handoff), so 4 Hydrogen, outside `handoff_targets` and second
-  in the tier, got no requests and its `first_byte_ms` is still unknown. Two task-title requests
+  in the tier, got no requests and its `first_byte_ms` is still unknown (since read: 6 successes,
+  3.6–9.4 s, probe-results "Saved-log reading"). Two task-title requests
   (54 and 88 prompt tokens) were upgraded to 3.6 Flash, waited 19 s and 31 s for a first byte,
   and took 2 of its 5 RPM while the task's own turn needed them. That is the case the
   `task-title` rule (§16.10) is for.
