@@ -498,3 +498,12 @@ dropped by the client 1.8 s in, before any byte). 33 streamed, 2 not (task title
   would cut the hangs without losing any success seen; a candidate, not a change.
 - `reasoning_effort`: nothing new; Zoo Code sends `"low"` on every request (DESIGN §16.10, 3a), so
   no live check is open for it.
+
+### Deploy of `56e90a0` (DESIGN §27 amendment, §28), 2026-11-24 20:29 PT
+
+- Setup: `main` at `56e90a0`, log saved first, rebuilt and recreated 2026-11-25 04:29 UTC; healthy,
+  no error lines at start. One streamed request on `gemini-fast` asking for about 150 words.
+- Result: 200 from 3.5 Flash-Lite, first byte 878 ms, `stream_end` `done` / `stop` over 10
+  chunks, output 188 in the request log and 188 in its turn row (1 step, 14 input).
+  `scripts/summarize_log.py` over the live log shows the same stream and first byte, and no holds.
+  **PASS.** The amendment's own path (a failed turn-row write) is covered offline only.
